@@ -4,26 +4,26 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 362 / 21862  (1.66% of the entire PHP test suite)**
+**`.phpt` pass rate: 503 / 21862  (2.30% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 1.66%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 2.31%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 362 | 21434 | 66 | 21862 |
+| 503 | 21293 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 46/46 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 49/49 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 57 | 5329 | 1.1% |
+| `Zend` | 142 | 5329 | 2.7% |
 | `ext/standard` | 75 | 3877 | 1.9% |
-| `ext/opcache` | 167 | 916 | 18.2% |
-| `core` | 38 | 868 | 4.4% |
+| `ext/opcache` | 192 | 916 | 21.0% |
+| `core` | 67 | 868 | 7.7% |
 | `ext/dom` | 6 | 868 | 0.7% |
-| `ext/spl` | 0 | 796 | 0.0% |
+| `ext/spl` | 1 | 796 | 0.1% |
 | `ext/date` | 0 | 689 | 0.0% |
 | `ext/soap` | 0 | 593 | 0.0% |
 | `ext/phar` | 13 | 574 | 2.3% |
@@ -39,7 +39,7 @@ _Curated smoke tests (dev guards, **not** in the number above): 46/46 passing._
 | `ext/bcmath` | 0 | 168 | 0.0% |
 | `ext/pcre` | 0 | 168 | 0.0% |
 | `ext/pdo_mysql` | 0 | 167 | 0.0% |
-| `ext/zend_test` | 0 | 159 | 0.0% |
+| `ext/zend_test` | 1 | 159 | 0.6% |
 | `ext/zlib` | 1 | 157 | 0.6% |
 | `ext/simplexml` | 0 | 156 | 0.0% |
 | `sapi/fpm` | 0 | 141 | 0.0% |
@@ -115,7 +115,7 @@ The ladder to **"WordPress boots in the browser"**. Each rung is measured agains
 - [ ] **🎯 WordPress boots in the browser** (compiled to WASM, smaller than the Emscripten build).
 
 - [x] **v7 — Constants + more builtins.** `PHP_EOL`/`PHP_INT_MAX`/`M_PI`/`STR_PAD_*`/…, `str_contains`/`str_starts_with`/`str_ends_with`, `str_pad`, `str_split`, `ucwords`, `number_format`, `dechex`/`hexdec`/…, `htmlspecialchars`, variadic/array `max`/`min`.
-- [ ] **v8 — Classes.** Objects, `$this`, `new`, `->`, methods, properties, visibility, inheritance, static. (Big — next major rung.)
+- [x] **v8 — Classes (core).** `class`/`interface`/`trait` decls, properties (+defaults), methods, `$this`, `new`, `->` (read/method/assign), `__construct`, single inheritance + polymorphic dispatch. (TODO: `static`/`::`, visibility enforcement, `__toString`, interfaces semantics.)
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)

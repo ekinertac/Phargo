@@ -13,9 +13,11 @@
 //! next rungs; anything unsupported returns an [`EngineError`] so the matching
 //! `.phpt` fails honestly.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
+use std::rc::Rc;
 
 #[derive(Debug)]
 pub struct EngineError(pub String);
@@ -49,31 +51,84 @@ struct Param {
 #[derive(Clone)]
 struct FuncDef {
     params: Vec<Param>,
-    /// Position of the body's opening `{`.
+    /// Position of the body's opening `{` (usize::MAX for an abstract/no-body method).
     body_start: usize,
 }
 
+#[derive(Clone)]
+struct ClassDef {
+    parent: Option<String>,
+    /// (property name, default-expression position).
+    props: Vec<(String, Option<usize>)>,
+    /// Methods keyed by lowercased name.
+    methods: HashMap<String, FuncDef>,
+}
+
+/// A PHP object instance. Objects are reference types, so [`Value::Object`]
+/// wraps this in `Rc<RefCell<…>>` for shared, mutable handles.
+#[derive(Debug)]
+pub struct Obj {
+    class: String,
+    props: Vec<(String, Value)>,
+}
+
+impl Obj {
+    fn get(&self, k: &str) -> Option<Value> {
+        self.props.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+    }
+    fn set(&mut self, k: &str, v: Value) {
+        if let Some(slot) = self.props.iter_mut().find(|(n, _)| n == k) {
+            slot.1 = v;
+        } else {
+            self.props.push((k.to_string(), v));
+        }
+    }
+}
+
+type ObjRef = Rc<RefCell<Obj>>;
+
 /// A PHP array key (after normalization): integer or string.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AKey {
     Int(i64),
     Str(String),
 }
 
-/// A PHP array: an insertion-ordered map. Linear lookup (corpus arrays are
-/// small); correctness first.
+/// A PHP array: an insertion-ordered map. Small arrays use a linear scan (no
+/// per-array `HashMap` overhead — the corpus has millions of tiny arrays);
+/// once an array grows past a threshold we build a key→index map for O(1)
+/// lookup (avoids O(n²) when building large arrays in a loop).
 #[derive(Clone, Debug, Default)]
 pub struct PArray {
     entries: Vec<(AKey, Value)>,
+    index: Option<HashMap<AKey, usize>>,
     next_index: i64,
 }
 
+const ARRAY_INDEX_THRESHOLD: usize = 32;
+
 impl PArray {
+    fn find(&self, k: &AKey) -> Option<usize> {
+        match &self.index {
+            Some(m) => m.get(k).copied(),
+            None => self.entries.iter().position(|(ek, _)| ek == k),
+        }
+    }
     fn get(&self, k: &AKey) -> Option<&Value> {
-        self.entries.iter().find(|(ek, _)| ek == k).map(|(_, v)| v)
+        self.find(k).map(|i| &self.entries[i].1)
     }
     fn get_mut(&mut self, k: &AKey) -> Option<&mut Value> {
-        self.entries.iter_mut().find(|(ek, _)| ek == k).map(|(_, v)| v)
+        let i = self.find(k)?;
+        Some(&mut self.entries[i].1)
+    }
+    fn ensure_index(&mut self) {
+        if self.index.is_none() && self.entries.len() >= ARRAY_INDEX_THRESHOLD {
+            let mut m = HashMap::with_capacity(self.entries.len() * 2);
+            for (i, (k, _)) in self.entries.iter().enumerate() {
+                m.insert(k.clone(), i);
+            }
+            self.index = Some(m);
+        }
     }
     fn set(&mut self, k: AKey, v: Value) {
         if let AKey::Int(i) = &k {
@@ -81,16 +136,26 @@ impl PArray {
                 self.next_index = *i + 1;
             }
         }
-        if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| *ek == k) {
-            slot.1 = v;
-        } else {
-            self.entries.push((k, v));
+        if let Some(idx) = self.find(&k) {
+            self.entries[idx].1 = v;
+            return;
         }
+        let idx = self.entries.len();
+        if let Some(m) = &mut self.index {
+            m.insert(k.clone(), idx);
+        }
+        self.entries.push((k, v));
+        self.ensure_index();
     }
     fn push(&mut self, v: Value) {
-        let i = self.next_index;
-        self.entries.push((AKey::Int(i), v));
-        self.next_index = i + 1;
+        let k = AKey::Int(self.next_index);
+        let idx = self.entries.len();
+        if let Some(m) = &mut self.index {
+            m.insert(k.clone(), idx);
+        }
+        self.entries.push((k, v));
+        self.next_index += 1;
+        self.ensure_index();
     }
 }
 
@@ -103,6 +168,7 @@ pub enum Value {
     Float(f64),
     Str(String),
     Array(PArray),
+    Object(ObjRef),
 }
 
 impl Value {
@@ -116,6 +182,7 @@ impl Value {
             Value::Float(x) => format_php_float(*x),
             Value::Str(s) => s.clone(),
             Value::Array(_) => "Array".to_string(), // PHP emits a notice and "Array"
+            Value::Object(_) => String::new(),      // no __toString support yet
         }
     }
 }
@@ -144,6 +211,7 @@ fn to_bool(v: &Value) -> bool {
         Value::Float(x) => *x != 0.0,
         Value::Str(s) => !(s.is_empty() || s == "0"),
         Value::Array(a) => !a.entries.is_empty(),
+        Value::Object(_) => true,
     }
 }
 
@@ -175,6 +243,7 @@ fn to_num(v: &Value) -> Num {
             }
         }
         Value::Array(a) => Num::I(if a.entries.is_empty() { 0 } else { 1 }),
+        Value::Object(_) => Num::I(1),
     }
 }
 
@@ -218,6 +287,7 @@ fn strict_eq(a: &Value, b: &Value) -> bool {
                     .zip(&y.entries)
                     .all(|((ka, va), (kb, vb))| ka == kb && strict_eq(va, vb))
         }
+        (Object(x), Object(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }
@@ -234,6 +304,17 @@ fn loose_eq(a: &Value, b: &Value) -> bool {
                     .all(|(k, v)| matches!(y.get(k), Some(w) if loose_eq(v, w)))
         }
         (Array(_), _) | (_, Array(_)) => false,
+        (Object(x), Object(y)) => {
+            Rc::ptr_eq(x, y) || {
+                let (a, b) = (x.borrow(), y.borrow());
+                a.class == b.class
+                    && a.props.len() == b.props.len()
+                    && a.props
+                        .iter()
+                        .all(|(n, v)| matches!(b.get(n), Some(w) if loose_eq(v, &w)))
+            }
+        }
+        (Object(_), _) | (_, Object(_)) => false,
         (Str(x), Str(y)) => {
             if is_numeric_str(x) && is_numeric_str(y) {
                 to_f64(a) == to_f64(b)
@@ -308,6 +389,7 @@ pub fn run(source: &str) -> R<String> {
         live: true,
         steps: 0,
         funcs: HashMap::new(),
+        classes: HashMap::new(),
         return_val: None,
         call_depth: 0,
     };
@@ -327,6 +409,8 @@ struct Engine {
     steps: u64,
     /// User-defined functions, keyed by lowercased name (PHP is case-insensitive).
     funcs: HashMap<String, FuncDef>,
+    /// User-defined classes, keyed by lowercased name.
+    classes: HashMap<String, ClassDef>,
     /// Value stashed by `return`, picked up by the active call frame.
     return_val: Option<Value>,
     /// Current function-call nesting depth (guards against stack overflow).
@@ -455,6 +539,19 @@ impl Engine {
                 "for" => return self.for_statement(),
                 "foreach" => return self.foreach_statement(),
                 "switch" => return self.switch_statement(),
+                "class" | "interface" | "trait" => return self.class_decl(),
+                "abstract" | "final" | "readonly" => {
+                    self.skip_ws();
+                    let mut k = self.try_identifier().map(|s| s.to_ascii_lowercase());
+                    while matches!(k.as_deref(), Some("abstract") | Some("final") | Some("readonly")) {
+                        self.skip_ws();
+                        k = self.try_identifier().map(|s| s.to_ascii_lowercase());
+                    }
+                    if matches!(k.as_deref(), Some("class") | Some("interface") | Some("trait")) {
+                        return self.class_decl();
+                    }
+                    return Err(EngineError("expected class after modifier".into()));
+                }
                 "function" => return self.function_decl(),
                 "return" => return self.return_statement(),
                 "break" => return self.break_continue(true),
@@ -1033,6 +1130,22 @@ impl Engine {
                 }
                 return self.assign_indexed(name, indices, aop, rhs);
             }
+            // object property lvalue: $obj->prop = ...
+            if indices.is_empty() && self.starts_with("->") {
+                let s2 = self.pos;
+                self.pos += 2;
+                self.skip_ws();
+                if let Some(prop) = self.try_identifier() {
+                    self.skip_ws();
+                    if let Some(aop) = self.peek_assign_op() {
+                        self.pos += aop.len();
+                        self.skip_ws();
+                        let rhs = self.parse_assignment()?;
+                        return self.assign_property(&name, &prop, aop, rhs);
+                    }
+                }
+                self.pos = s2;
+            }
             self.pos = save; // not an assignment
         }
         self.parse_ternary()
@@ -1132,18 +1245,24 @@ impl Engine {
     }
 
     fn read_indexed(&self, name: &str, indices: &[Option<Value>]) -> Value {
-        let mut cur = self.vars.get(name).cloned().unwrap_or(Value::Null);
+        let mut cur = match self.vars.get(name) {
+            Some(v) => v,
+            None => return Value::Null,
+        };
         for idx in indices {
             let key = match idx {
                 None => return Value::Null,
                 Some(v) => key_from_value(v),
             };
-            cur = match &cur {
-                Value::Array(a) => a.get(&key).cloned().unwrap_or(Value::Null),
-                _ => Value::Null,
+            cur = match cur {
+                Value::Array(a) => match a.get(&key) {
+                    Some(v) => v,
+                    None => return Value::Null,
+                },
+                _ => return Value::Null,
             };
         }
-        cur
+        cur.clone()
     }
 
     fn peek_assign_op(&self) -> Option<&'static str> {
@@ -1720,6 +1839,9 @@ impl Engine {
             "range" => {
                 let lo = to_long(&arg(0));
                 let hi = to_long(&arg(1));
+                if ((hi as i128) - (lo as i128)).unsigned_abs() > 10_000_000 {
+                    return Err(EngineError("range(): too many elements".into()));
+                }
                 let mut r = PArray::default();
                 if lo <= hi {
                     for i in lo..=hi {
@@ -1735,7 +1857,7 @@ impl Engine {
             _ => {
                 let key = name.to_ascii_lowercase();
                 if let Some(func) = self.funcs.get(&key).cloned() {
-                    return self.call_user_function(func, args.clone());
+                    return self.call_user_function(func, args.clone(), None);
                 }
                 return Err(EngineError(format!("unknown function `{name}()`")));
             }
@@ -1750,61 +1872,19 @@ impl Engine {
             Some(n) => n,
             None => return Err(EngineError("expected function name".into())),
         };
-        self.expect_char('(')?;
-        let mut params = Vec::new();
-        self.skip_ws();
-        if self.peek() != Some(')') {
-            loop {
-                self.skip_ws();
-                if self.peek() == Some('?') {
-                    self.pos += 1; // nullable type
-                    self.skip_ws();
-                }
-                // type hint (incl. unions and namespaces) — parsed and ignored
-                if matches!(self.peek(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '\\') {
-                    while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '\\' || c == '|') {
-                        self.pos += 1;
-                    }
-                    self.skip_ws();
-                }
-                if self.peek() == Some('&') {
-                    self.pos += 1; // by-reference — treated as by-value for now
-                    self.skip_ws();
-                }
-                if self.starts_with("...") {
-                    self.pos += 3; // variadic — treated as a single param for now
-                    self.skip_ws();
-                }
-                if self.peek() != Some('$') {
-                    return Err(EngineError("expected parameter variable".into()));
-                }
-                let pname = self.parse_variable_name()?;
-                self.skip_ws();
-                let mut default = None;
-                if self.peek() == Some('=') && self.peek_at(1) != Some('=') {
-                    self.pos += 1;
-                    self.skip_ws();
-                    default = Some(self.pos);
-                    let prev = self.live;
-                    self.live = false;
-                    let _ = self.expression()?; // skip past the default expression
-                    self.live = prev;
-                }
-                params.push(Param { name: pname, default });
-                self.skip_ws();
-                match self.peek() {
-                    Some(',') => self.pos += 1,
-                    Some(')') => break,
-                    other => {
-                        return Err(EngineError(format!(
-                            "expected `,` or `)` in parameters, found {other:?}"
-                        )))
-                    }
-                }
-            }
+        let def = self.parse_callable_def()?;
+        if self.live {
+            self.funcs.insert(name.to_ascii_lowercase(), def);
         }
+        Ok(Flow::Normal)
+    }
+
+    /// Parse `( params ) [: type] { body }` (or `;` for an abstract method),
+    /// positioned just before the `(`. Records the body span and skips it.
+    fn parse_callable_def(&mut self) -> R<FuncDef> {
+        self.expect_char('(')?;
+        let params = self.parse_params()?;
         self.expect_char(')')?;
-        // optional `: returnType`
         self.skip_ws();
         if self.peek() == Some(':') {
             self.pos += 1;
@@ -1818,15 +1898,196 @@ impl Engine {
             }
             self.skip_ws();
         }
+        if self.peek() == Some(';') {
+            self.pos += 1;
+            return Ok(FuncDef {
+                params,
+                body_start: usize::MAX, // abstract / interface method: no body
+            });
+        }
         if self.peek() != Some('{') {
             return Err(EngineError("expected `{` for function body".into()));
         }
         let body_start = self.pos;
         self.pos += 1; // consume {
         self.skip_to_block_end()?;
+        Ok(FuncDef { params, body_start })
+    }
+
+    /// Parse a parameter list, positioned just after `(`, stopping at `)`.
+    fn parse_params(&mut self) -> R<Vec<Param>> {
+        let mut params = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(')') {
+            return Ok(params);
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() == Some('?') {
+                self.pos += 1; // nullable type
+                self.skip_ws();
+            }
+            // type hint (incl. unions/namespaces) — parsed and ignored
+            if matches!(self.peek(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '\\') {
+                while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '\\' || c == '|') {
+                    self.pos += 1;
+                }
+                self.skip_ws();
+            }
+            if self.peek() == Some('&') {
+                self.pos += 1; // by-reference — treated as by-value for now
+                self.skip_ws();
+            }
+            if self.starts_with("...") {
+                self.pos += 3; // variadic — treated as a single param for now
+                self.skip_ws();
+            }
+            if self.peek() != Some('$') {
+                return Err(EngineError("expected parameter variable".into()));
+            }
+            let pname = self.parse_variable_name()?;
+            self.skip_ws();
+            let mut default = None;
+            if self.peek() == Some('=') && self.peek_at(1) != Some('=') {
+                self.pos += 1;
+                self.skip_ws();
+                default = Some(self.pos);
+                let prev = self.live;
+                self.live = false;
+                let _ = self.expression()?; // skip past the default expression
+                self.live = prev;
+            }
+            params.push(Param { name: pname, default });
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => self.pos += 1,
+                Some(')') => break,
+                other => {
+                    return Err(EngineError(format!(
+                        "expected `,` or `)` in parameters, found {other:?}"
+                    )))
+                }
+            }
+        }
+        Ok(params)
+    }
+
+    /// `class Name [extends Parent] [implements …] { members }`. Also used for
+    /// `interface`/`trait` (members may be abstract).
+    fn class_decl(&mut self) -> R<Flow> {
+        self.skip_ws();
+        let name = match self.try_identifier() {
+            Some(n) => n,
+            None => return Err(EngineError("expected class name".into())),
+        };
+        let mut parent = None;
+        // optional `extends Parent` / `implements ...` (skip up to `{`)
+        loop {
+            self.skip_ws();
+            match self.try_identifier().as_deref() {
+                Some("extends") => {
+                    self.skip_ws();
+                    parent = self.try_identifier();
+                }
+                Some("implements") => {
+                    // skip interface list
+                    while !matches!(self.peek(), Some('{') | None) {
+                        self.pos += 1;
+                    }
+                }
+                Some(_) => {}
+                None => break,
+            }
+            self.skip_ws();
+            if matches!(self.peek(), Some('{') | None) {
+                break;
+            }
+        }
+        self.expect_char('{')?;
+        let mut props: Vec<(String, Option<usize>)> = Vec::new();
+        let mut methods: HashMap<String, FuncDef> = HashMap::new();
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some('}') => {
+                    self.pos += 1;
+                    break;
+                }
+                None => return Err(EngineError("unterminated class body".into())),
+                _ => {}
+            }
+            // consume modifiers / type tokens until we reach function/const/$prop
+            let kind: &str = loop {
+                self.skip_ws();
+                if self.peek() == Some('$') {
+                    break "prop";
+                }
+                if self.peek() == Some('?') {
+                    self.pos += 1;
+                    continue;
+                }
+                match self.try_identifier().map(|s| s.to_ascii_lowercase()).as_deref() {
+                    Some("function") => break "function",
+                    Some("const") => break "const",
+                    Some(_) => continue, // modifier or type name — ignore
+                    None => return Err(EngineError("unexpected token in class body".into())),
+                }
+            };
+            match kind {
+                "function" => {
+                    self.skip_ws();
+                    let mname = self
+                        .try_identifier()
+                        .ok_or_else(|| EngineError("expected method name".into()))?;
+                    let def = self.parse_callable_def()?;
+                    methods.insert(mname.to_ascii_lowercase(), def);
+                }
+                "const" => {
+                    // const NAME = expr;  (parsed and ignored for now)
+                    while !matches!(self.peek(), Some(';') | None) {
+                        self.pos += 1;
+                    }
+                    if self.peek() == Some(';') {
+                        self.pos += 1;
+                    }
+                }
+                "prop" => loop {
+                    let pname = self.parse_variable_name()?;
+                    self.skip_ws();
+                    let mut default = None;
+                    if self.peek() == Some('=') && self.peek_at(1) != Some('=') {
+                        self.pos += 1;
+                        self.skip_ws();
+                        default = Some(self.pos);
+                        let prev = self.live;
+                        self.live = false;
+                        let _ = self.expression()?;
+                        self.live = prev;
+                    }
+                    props.push((pname, default));
+                    self.skip_ws();
+                    if self.peek() == Some(',') {
+                        self.pos += 1;
+                        self.skip_ws();
+                        continue; // public $a, $b;
+                    }
+                    if self.peek() == Some(';') {
+                        self.pos += 1;
+                    }
+                    break;
+                },
+                _ => return Err(EngineError("unexpected class member".into())),
+            }
+        }
         if self.live {
-            self.funcs
-                .insert(name.to_ascii_lowercase(), FuncDef { params, body_start });
+            self.classes.insert(
+                name.to_ascii_lowercase(),
+                ClassDef {
+                    parent,
+                    props,
+                    methods,
+                },
+            );
         }
         Ok(Flow::Normal)
     }
@@ -1849,7 +2110,7 @@ impl Engine {
 
     /// Call a user function: bind params in a fresh scope, run the body
     /// (re-entrant via pos save/restore), and pick up the `return` value.
-    fn call_user_function(&mut self, func: FuncDef, args: Vec<Value>) -> R<Value> {
+    fn call_user_function(&mut self, func: FuncDef, args: Vec<Value>, this: Option<Value>) -> R<Value> {
         self.tick()?;
         self.call_depth += 1;
         if self.call_depth > 2000 {
@@ -1873,18 +2134,126 @@ impl Engine {
         for (n, v) in bound {
             self.vars.insert(n, v);
         }
-        self.pos = func.body_start;
-        let flow = self.block()?;
-        let ret = if matches!(flow, Flow::Return) {
-            self.return_val.take().unwrap_or(Value::Null)
+        if let Some(t) = this {
+            self.vars.insert("this".to_string(), t);
+        }
+        let ret = if func.body_start == usize::MAX {
+            Value::Null // abstract / no body
         } else {
-            Value::Null
+            self.pos = func.body_start;
+            let flow = self.block()?;
+            if matches!(flow, Flow::Return) {
+                self.return_val.take().unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            }
         };
         self.vars = saved_vars;
         self.return_val = saved_ret;
         self.pos = saved_pos;
         self.call_depth -= 1;
         Ok(ret)
+    }
+
+    /// Resolve a method by walking the class → parent chain.
+    fn lookup_method(&self, class: &str, method: &str) -> Option<FuncDef> {
+        let mlow = method.to_ascii_lowercase();
+        let mut cur = Some(class.to_ascii_lowercase());
+        while let Some(cn) = cur {
+            let cd = self.classes.get(&cn)?;
+            if let Some(m) = cd.methods.get(&mlow) {
+                return Some(m.clone());
+            }
+            cur = cd.parent.as_ref().map(|p| p.to_ascii_lowercase());
+        }
+        None
+    }
+
+    /// `new Class(args)` → allocate, set property defaults, run `__construct`.
+    fn instantiate(&mut self, cname: &str, args: Vec<Value>) -> R<Value> {
+        if !self.live {
+            return Ok(Value::Null);
+        }
+        let bare = cname.trim_start_matches('\\');
+        let cd = match self.classes.get(&bare.to_ascii_lowercase()).cloned() {
+            Some(c) => c,
+            None => return Err(EngineError(format!("class `{cname}` not found"))),
+        };
+        let mut obj = Obj {
+            class: bare.to_string(),
+            props: Vec::new(),
+        };
+        self.init_props(&cd, &mut obj)?;
+        let oref = Rc::new(RefCell::new(obj));
+        if let Some(ctor) = self.lookup_method(bare, "__construct") {
+            self.call_user_function(ctor, args, Some(Value::Object(oref.clone())))?;
+        }
+        Ok(Value::Object(oref))
+    }
+
+    /// Set property defaults (parents first, so child defaults win).
+    fn init_props(&mut self, cd: &ClassDef, obj: &mut Obj) -> R<()> {
+        if let Some(p) = &cd.parent {
+            if let Some(pd) = self.classes.get(&p.to_ascii_lowercase()).cloned() {
+                self.init_props(&pd, obj)?;
+            }
+        }
+        for (pname, defpos) in &cd.props {
+            let v = match defpos {
+                Some(pos) => {
+                    let save = self.pos;
+                    self.pos = *pos;
+                    let val = self.expression()?;
+                    self.pos = save;
+                    val
+                }
+                None => Value::Null,
+            };
+            obj.set(pname, v);
+        }
+        Ok(())
+    }
+
+    fn call_method(&mut self, recv: &Value, method: &str, args: Vec<Value>) -> R<Value> {
+        if !self.live {
+            return Ok(Value::Null);
+        }
+        let oref = match recv {
+            Value::Object(o) => o.clone(),
+            _ => {
+                return Err(EngineError(format!(
+                    "call to method `{method}()` on a non-object"
+                )))
+            }
+        };
+        let class = oref.borrow().class.clone();
+        match self.lookup_method(&class, method) {
+            Some(def) => self.call_user_function(def, args, Some(Value::Object(oref))),
+            None => Err(EngineError(format!(
+                "call to undefined method {class}::{method}()"
+            ))),
+        }
+    }
+
+    fn assign_property(&mut self, name: &str, prop: &str, aop: &str, rhs: Value) -> R<Value> {
+        if !self.live {
+            return Ok(rhs);
+        }
+        match self.vars.get(name).cloned().unwrap_or(Value::Null) {
+            Value::Object(o) => {
+                let newval = if aop == "=" {
+                    rhs
+                } else {
+                    let cur = o.borrow().get(prop).unwrap_or(Value::Null);
+                    self.apply_binary(&aop[..aop.len() - 1], cur, rhs)?
+                };
+                o.borrow_mut().set(prop, newval.clone());
+                Ok(newval)
+            }
+            _ => Err(EngineError(format!(
+                "attempt to assign property `{prop}` on a non-object"
+            ))),
+        }
     }
 
     fn primary(&mut self) -> R<Value> {
@@ -1915,6 +2284,22 @@ impl Engine {
                     "true" => Ok(Value::Bool(true)),
                     "false" => Ok(Value::Bool(false)),
                     "null" => Ok(Value::Null),
+                    "new" => {
+                        self.skip_ws();
+                        if self.peek() == Some('\\') {
+                            self.pos += 1;
+                        }
+                        let cname = self
+                            .try_identifier()
+                            .ok_or_else(|| EngineError("expected class name after `new`".into()))?;
+                        self.skip_ws();
+                        let args = if self.peek() == Some('(') {
+                            self.parse_args()?
+                        } else {
+                            Vec::new()
+                        };
+                        self.instantiate(&cname, args)
+                    }
                     "array" => {
                         self.skip_ws();
                         if self.peek() == Some('(') {
@@ -1950,14 +2335,17 @@ impl Engine {
     /// A `$var` reference, with optional index reads (`$a[k]`, string offsets)
     /// and post `++`/`--`.
     fn variable(&mut self) -> R<Value> {
+        enum Acc {
+            Index(Value),
+            Prop(String),
+            Method(String, Vec<Value>),
+        }
         let name = self.parse_variable_name()?;
-        let mut cur = self.vars.get(&name).cloned().unwrap_or(Value::Null);
-        let mut indexed = false;
+        let mut accs: Vec<Acc> = Vec::new();
         loop {
             let after = self.pos;
             self.skip_ws();
             if self.peek() == Some('[') {
-                indexed = true;
                 self.pos += 1;
                 self.skip_ws();
                 if self.peek() == Some(']') {
@@ -1965,25 +2353,31 @@ impl Engine {
                 }
                 let k = self.expression()?;
                 self.expect_char(']')?;
-                let key = key_from_value(&k);
-                cur = match &cur {
-                    Value::Array(a) => a.get(&key).cloned().unwrap_or(Value::Null),
-                    Value::Str(s) => match &key {
-                        AKey::Int(i) => s
-                            .chars()
-                            .nth(*i as usize)
-                            .map(|c| Value::Str(c.to_string()))
-                            .unwrap_or(Value::Str(String::new())),
-                        _ => Value::Null,
-                    },
-                    _ => Value::Null,
-                };
+                accs.push(Acc::Index(k));
+            } else if self.starts_with("->") {
+                self.pos += 2;
+                self.skip_ws();
+                let member = self
+                    .try_identifier()
+                    .ok_or_else(|| EngineError("expected name after `->`".into()))?;
+                let a2 = self.pos;
+                self.skip_ws();
+                if self.peek() == Some('(') {
+                    let args = self.parse_args()?;
+                    accs.push(Acc::Method(member, args));
+                } else {
+                    self.pos = a2;
+                    accs.push(Acc::Prop(member));
+                }
             } else {
                 self.pos = after;
                 break;
             }
         }
-        if !indexed {
+
+        // Plain variable: maybe post-increment/decrement.
+        if accs.is_empty() {
+            let cur = self.vars.get(&name).cloned().unwrap_or(Value::Null);
             let after = self.pos;
             self.skip_ws();
             if self.starts_with("++") || self.starts_with("--") {
@@ -1996,8 +2390,70 @@ impl Engine {
                 return Ok(cur); // post-inc/dec yields the OLD value
             }
             self.pos = after;
+            return Ok(cur);
+        }
+
+        // Resolve the *leading* run of `[index]` accesses by reference so we
+        // never clone a whole array container — only the small leaf element.
+        let mut i = 0;
+        let mut keys: Vec<AKey> = Vec::new();
+        while let Some(Acc::Index(k)) = accs.get(i) {
+            keys.push(key_from_value(k));
+            i += 1;
+        }
+        let mut cur = self.read_keys(&name, &keys);
+        // Apply any remaining accesses (after a `->`) on the now-small value.
+        while i < accs.len() {
+            cur = match &accs[i] {
+                Acc::Index(k) => {
+                    let key = key_from_value(k);
+                    match &cur {
+                        Value::Array(a) => a.get(&key).cloned().unwrap_or(Value::Null),
+                        Value::Str(s) => match key {
+                            AKey::Int(n) => s
+                                .chars()
+                                .nth(n as usize)
+                                .map(|c| Value::Str(c.to_string()))
+                                .unwrap_or(Value::Str(String::new())),
+                            _ => Value::Null,
+                        },
+                        _ => Value::Null,
+                    }
+                }
+                Acc::Prop(p) => read_property(&cur, p),
+                Acc::Method(m, args) => self.call_method(&cur, m, args.clone())?,
+            };
+            i += 1;
         }
         Ok(cur)
+    }
+
+    /// Read `$name` then a run of index keys by reference, cloning only the leaf.
+    fn read_keys(&self, name: &str, keys: &[AKey]) -> Value {
+        let mut cur = match self.vars.get(name) {
+            Some(v) => v,
+            None => return Value::Null,
+        };
+        for key in keys {
+            cur = match cur {
+                Value::Array(a) => match a.get(key) {
+                    Some(v) => v,
+                    None => return Value::Null,
+                },
+                Value::Str(s) => {
+                    return match key {
+                        AKey::Int(n) => s
+                            .chars()
+                            .nth(*n as usize)
+                            .map(|c| Value::Str(c.to_string()))
+                            .unwrap_or(Value::Str(String::new())),
+                        _ => Value::Null,
+                    }
+                }
+                _ => return Value::Null,
+            };
+        }
+        cur.clone()
     }
 
     fn parse_array_items(&mut self, close: char) -> R<Value> {
@@ -2222,6 +2678,7 @@ fn key_from_value(v: &Value) -> AKey {
             AKey::Str(s.clone())
         }
         Value::Array(_) => AKey::Str(String::new()),
+        Value::Object(_) => AKey::Str(String::new()),
     }
 }
 
@@ -2261,6 +2718,13 @@ fn set_path(slot: &mut Value, indices: &[Option<Value>], val: Value) {
     }
 }
 
+fn read_property(v: &Value, name: &str) -> Value {
+    match v {
+        Value::Object(o) => o.borrow().get(name).unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
+}
+
 // ---- built-in output / formatting helpers ----------------------------------
 
 fn php_type_name(v: &Value) -> &'static str {
@@ -2271,12 +2735,16 @@ fn php_type_name(v: &Value) -> &'static str {
         Value::Float(_) => "double",
         Value::Str(_) => "string",
         Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
 /// `var_dump` output (with trailing newline). `indent` is the leading space
 /// count for this value's line — arrays recurse with `indent + 2`.
 fn var_dump_str(v: &Value, indent: usize) -> String {
+    if indent > 256 {
+        return format!("{}*RECURSION*\n", " ".repeat(indent)); // cyclic object guard
+    }
     let pad = " ".repeat(indent);
     match v {
         Value::Int(n) => format!("{pad}int({n})\n"),
@@ -2298,6 +2766,17 @@ fn var_dump_str(v: &Value, indent: usize) -> String {
             out.push_str(&format!("{pad}}}\n"));
             out
         }
+        Value::Object(o) => {
+            let ob = o.borrow();
+            let mut out = format!("{pad}object({})#1 ({}) {{\n", ob.class, ob.props.len());
+            let kp = " ".repeat(indent + 2);
+            for (n, v) in &ob.props {
+                out.push_str(&format!("{kp}[\"{n}\"]=>\n"));
+                out.push_str(&var_dump_str(v, indent + 2));
+            }
+            out.push_str(&format!("{pad}}}\n"));
+            out
+        }
     }
 }
 
@@ -2306,6 +2785,9 @@ fn print_r_str(v: &Value) -> String {
 }
 
 fn print_r_inner(v: &Value, depth: usize) -> String {
+    if depth > 128 {
+        return " *RECURSION*".to_string();
+    }
     match v {
         Value::Array(a) => {
             let paren = " ".repeat(depth * 8);
@@ -2322,6 +2804,18 @@ fn print_r_inner(v: &Value, depth: usize) -> String {
             s.push_str(&format!("{paren})\n"));
             s
         }
+        Value::Object(o) => {
+            let ob = o.borrow();
+            let paren = " ".repeat(depth * 8);
+            let item = " ".repeat(depth * 8 + 4);
+            let mut s = format!("{} Object\n", ob.class);
+            s.push_str(&format!("{paren}(\n"));
+            for (n, v) in &ob.props {
+                s.push_str(&format!("{item}[{n}] => {}\n", print_r_inner(v, depth + 1)));
+            }
+            s.push_str(&format!("{paren})\n"));
+            s
+        }
         _ => v.to_php_string(),
     }
 }
@@ -2331,6 +2825,9 @@ fn var_export_str(v: &Value) -> String {
 }
 
 fn var_export_inner(v: &Value, indent: usize) -> String {
+    if indent > 256 {
+        return "NULL".to_string(); // cyclic object guard
+    }
     match v {
         Value::Null => "NULL".to_string(),
         Value::Bool(b) => if *b { "true".into() } else { "false".into() },
@@ -2362,6 +2859,17 @@ fn var_export_inner(v: &Value, indent: usize) -> String {
                 }
             }
             s.push_str(&format!("{pad})"));
+            s
+        }
+        Value::Object(o) => {
+            let ob = o.borrow();
+            let pad = " ".repeat(indent);
+            let ipad = " ".repeat(indent + 2);
+            let mut s = format!("\\{}::__set_state(array(\n", ob.class);
+            for (n, v) in &ob.props {
+                s.push_str(&format!("{ipad}'{n}' => {},\n", var_export_inner(v, indent + 2)));
+            }
+            s.push_str(&format!("{pad}))"));
             s
         }
     }

@@ -71,7 +71,9 @@ fn run_scoreboard() {
     let mut curated: Tally = [0; 4]; // smoke tests, not counted
 
     let n = tests.len();
+    let breadcrumb = Path::new(root).join("target").join("current_test.txt");
     for (i, (group, path)) in tests.iter().enumerate() {
+        let _ = fs::write(&breadcrumb, path.to_string_lossy().as_bytes());
         let bytes = fs::read(path).unwrap_or_default();
         let text = String::from_utf8_lossy(&bytes);
         let t = parse_phpt(&text);
@@ -428,7 +430,7 @@ const ROADMAP: &str = r#"The ladder to **"WordPress boots in the browser"**. Eac
 - [ ] **🎯 WordPress boots in the browser** (compiled to WASM, smaller than the Emscripten build).
 
 - [x] **v7 — Constants + more builtins.** `PHP_EOL`/`PHP_INT_MAX`/`M_PI`/`STR_PAD_*`/…, `str_contains`/`str_starts_with`/`str_ends_with`, `str_pad`, `str_split`, `ucwords`, `number_format`, `dechex`/`hexdec`/…, `htmlspecialchars`, variadic/array `max`/`min`.
-- [ ] **v8 — Classes.** Objects, `$this`, `new`, `->`, methods, properties, visibility, inheritance, static. (Big — next major rung.)
+- [x] **v8 — Classes (core).** `class`/`interface`/`trait` decls, properties (+defaults), methods, `$this`, `new`, `->` (read/method/assign), `__construct`, single inheritance + polymorphic dispatch. (TODO: `static`/`::`, visibility enforcement, `__toString`, interfaces semantics.)
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)
