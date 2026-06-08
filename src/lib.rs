@@ -105,6 +105,13 @@ impl Obj {
 
 type ObjRef = Rc<RefCell<Obj>>;
 
+/// A destructuring-assignment target element (`[$a, , [$b, $c]] = …`).
+enum DTarget {
+    Skip,
+    Var(String),
+    Nest(Vec<DTarget>),
+}
+
 /// A PHP array key (after normalization): integer or string.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AKey {
@@ -1342,6 +1349,24 @@ impl Engine {
     /// Assignment is right-associative and lowest precedence: `$a = $b = expr`,
     /// plus compound `+= -= *= /= %= .= **=`. Falls through to binary parsing.
     fn parse_assignment(&mut self) -> R<Value> {
+        // list()/[...] destructuring assignment
+        self.skip_ws();
+        if self.peek() == Some('[') || self.starts_with("list") {
+            let save = self.pos;
+            if let Some(targets) = self.try_destructure_targets()? {
+                self.skip_ws();
+                if self.peek() == Some('=') && self.peek_at(1) != Some('=') {
+                    self.pos += 1;
+                    self.skip_ws();
+                    let rhs = self.parse_assignment()?;
+                    if self.live {
+                        self.bind_destructure(&targets, &rhs);
+                    }
+                    return Ok(rhs);
+                }
+            }
+            self.pos = save;
+        }
         if self.peek() == Some('$') {
             let save = self.pos;
             let name = self.parse_variable_name()?;
@@ -1518,6 +1543,88 @@ impl Engine {
             };
         }
         cur.clone()
+    }
+
+    /// Parse a `[...]` or `list(...)` destructuring pattern. Returns None (so the
+    /// caller rewinds to normal expression parsing) if it isn't a valid pattern.
+    fn try_destructure_targets(&mut self) -> R<Option<Vec<DTarget>>> {
+        let close = if self.peek() == Some('[') {
+            self.pos += 1;
+            ']'
+        } else {
+            if self.try_identifier().map(|s| s.to_ascii_lowercase()).as_deref() != Some("list") {
+                return Ok(None);
+            }
+            self.skip_ws();
+            if self.peek() != Some('(') {
+                return Ok(None);
+            }
+            self.pos += 1;
+            ')'
+        };
+        let mut targets = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.peek() == Some(close) {
+                self.pos += 1;
+                break;
+            }
+            if self.peek() == Some(',') {
+                self.pos += 1;
+                targets.push(DTarget::Skip);
+                continue;
+            }
+            match self.peek() {
+                Some('$') => {
+                    let name = self.parse_variable_name()?;
+                    targets.push(DTarget::Var(name));
+                }
+                Some('[') => match self.try_destructure_targets()? {
+                    Some(t) => targets.push(DTarget::Nest(t)),
+                    None => return Ok(None),
+                },
+                Some(c) if c.is_ascii_alphabetic() => {
+                    let save = self.pos;
+                    if self.try_identifier().map(|s| s.to_ascii_lowercase()).as_deref() == Some("list") {
+                        self.pos = save;
+                        match self.try_destructure_targets()? {
+                            Some(t) => targets.push(DTarget::Nest(t)),
+                            None => return Ok(None),
+                        }
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                _ => return Ok(None),
+            }
+            self.skip_ws();
+            if self.peek() == Some(',') {
+                self.pos += 1;
+                continue;
+            }
+            if self.peek() == Some(close) {
+                self.pos += 1;
+                break;
+            }
+            return Ok(None);
+        }
+        Ok(Some(targets))
+    }
+
+    fn bind_destructure(&mut self, targets: &[DTarget], rhs: &Value) {
+        for (i, t) in targets.iter().enumerate() {
+            let v = match rhs {
+                Value::Array(a) => a.get(&AKey::Int(i as i64)).cloned().unwrap_or(Value::Null),
+                _ => Value::Null,
+            };
+            match t {
+                DTarget::Skip => {}
+                DTarget::Var(name) => {
+                    self.vars.insert(name.clone(), v);
+                }
+                DTarget::Nest(sub) => self.bind_destructure(sub, &v),
+            }
+        }
     }
 
     fn peek_assign_op(&self) -> Option<&'static str> {

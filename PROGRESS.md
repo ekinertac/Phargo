@@ -4,23 +4,23 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 832 / 21862  (3.81% of the entire PHP test suite)**
+**`.phpt` pass rate: 839 / 21862  (3.84% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 3.82%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 3.85%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 832 | 20964 | 66 | 21862 |
+| 839 | 20957 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 62/62 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 63/63 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 272 | 5329 | 5.1% |
+| `Zend` | 277 | 5329 | 5.2% |
 | `ext/standard` | 219 | 3877 | 5.6% |
-| `ext/opcache` | 221 | 916 | 24.1% |
+| `ext/opcache` | 223 | 916 | 24.3% |
 | `core` | 81 | 868 | 9.3% |
 | `ext/dom` | 6 | 868 | 0.7% |
 | `ext/spl` | 3 | 796 | 0.4% |
@@ -129,6 +129,7 @@ The ladder to **"WordPress boots in the browser"**. Each rung is measured agains
 - [x] **v19 — More builtins.** `array_chunk`/`array_merge_recursive`, `str_ireplace`/`substr_replace`/`nl2br`/`addslashes`/`stripslashes`, `vsprintf`/`vprintf`.
 - [x] **v20 — More builtins.** `strtr` (both forms), `chunk_split`, `compact`, `levenshtein`, `array_is_list`, `quotemeta`.
 - [x] **v21 — Heredoc / nowdoc.** `<<<EOT` (interpolated) and `<<<'EOT'` (raw), with flexible (indented) closing markers.
+- [x] **v22 — Array destructuring.** `[$a, $b] = …` / `list($a, , $c) = …`, with skipped slots and nesting.
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)
