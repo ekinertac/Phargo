@@ -50,6 +50,12 @@ fn run_scoreboard() {
     let curated_dir = Path::new(root).join("tests").join("phpt");
     let corpus_dir = Path::new(root).join("vendor").join("php-src");
 
+    // Corpus tests do real file I/O with relative paths; run them in a throwaway
+    // scratch dir so they can never write junk into the repo working tree.
+    let scratch = std::env::temp_dir().join("phargo_scratch");
+    let _ = fs::create_dir_all(&scratch);
+    let _ = std::env::set_current_dir(&scratch);
+
     let mut tests: Vec<(String, PathBuf)> = Vec::new();
     let mut cu = Vec::new();
     collect_phpt(&curated_dir, &mut cu);

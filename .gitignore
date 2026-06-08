@@ -4,3 +4,6 @@ Cargo.lock.bak
 
 # Vendored upstream PHP test corpus — reproduce with: scripts/fetch-corpus.sh
 /vendor
+
+# Harness runtime artifacts
+.claude/scheduled_tasks.lock
