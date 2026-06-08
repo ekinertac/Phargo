@@ -41,11 +41,22 @@ enum Flow {
     Return,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Param {
     name: String,
     /// Source position of the default-value expression, if the param has one.
     default: Option<usize>,
+}
+
+/// An anonymous function / arrow function. `captures` snapshots the outer
+/// variables it closes over (by value). For arrow functions `body_start` points
+/// at the single expression after `=>`; otherwise at the body's `{`.
+#[derive(Debug)]
+pub struct Closure {
+    params: Vec<Param>,
+    body_start: usize,
+    captures: Vec<(String, Value)>,
+    arrow: bool,
 }
 
 #[derive(Clone)]
@@ -183,6 +194,7 @@ pub enum Value {
     Str(String),
     Array(PArray),
     Object(ObjRef),
+    Closure(Rc<Closure>),
 }
 
 impl Value {
@@ -197,6 +209,7 @@ impl Value {
             Value::Str(s) => s.clone(),
             Value::Array(_) => "Array".to_string(), // PHP emits a notice and "Array"
             Value::Object(_) => String::new(),      // no __toString support yet
+            Value::Closure(_) => "Closure".to_string(),
         }
     }
 }
@@ -226,6 +239,7 @@ fn to_bool(v: &Value) -> bool {
         Value::Str(s) => !(s.is_empty() || s == "0"),
         Value::Array(a) => !a.entries.is_empty(),
         Value::Object(_) => true,
+        Value::Closure(_) => true,
     }
 }
 
@@ -258,6 +272,7 @@ fn to_num(v: &Value) -> Num {
         }
         Value::Array(a) => Num::I(if a.entries.is_empty() { 0 } else { 1 }),
         Value::Object(_) => Num::I(1),
+        Value::Closure(_) => Num::I(1),
     }
 }
 
@@ -309,6 +324,7 @@ fn strict_eq_d(a: &Value, b: &Value, depth: usize) -> bool {
                     .all(|((ka, va), (kb, vb))| ka == kb && strict_eq_d(va, vb, depth + 1))
         }
         (Object(x), Object(y)) => Rc::ptr_eq(x, y),
+        (Closure(x), Closure(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }
@@ -343,6 +359,8 @@ fn loose_eq_d(a: &Value, b: &Value, depth: usize) -> bool {
             }
         }
         (Object(_), _) | (_, Object(_)) => false,
+        (Closure(x), Closure(y)) => Rc::ptr_eq(x, y),
+        (Closure(_), _) | (_, Closure(_)) => false,
         (Str(x), Str(y)) => {
             if is_numeric_str(x) && is_numeric_str(y) {
                 to_f64(a) == to_f64(b)
@@ -2745,6 +2763,10 @@ impl Engine {
     /// Invoke a PHP callable: a function-name string, or `[receiver, "method"]`.
     fn call_callable(&mut self, callable: &Value, args: Vec<Value>) -> R<Value> {
         match callable {
+            Value::Closure(c) => {
+                let c = c.clone();
+                self.call_closure(&c, args)
+            }
             Value::Str(name) => self.call_function(name, args),
             Value::Array(a) if a.entries.len() == 2 => {
                 let recv = a.get(&AKey::Int(0)).cloned().unwrap_or(Value::Null);
@@ -2764,6 +2786,137 @@ impl Engine {
             }
             _ => Err(EngineError("value is not callable".into())),
         }
+    }
+
+    fn call_closure(&mut self, c: &Rc<Closure>, args: Vec<Value>) -> R<Value> {
+        self.tick()?;
+        self.call_depth += 1;
+        if self.call_depth > 2000 {
+            return Err(EngineError("maximum function nesting level reached".into()));
+        }
+        let saved_pos = self.pos;
+        let mut bound: Vec<(String, Value)> = Vec::with_capacity(c.params.len());
+        for (i, p) in c.params.iter().enumerate() {
+            let v = if let Some(a) = args.get(i) {
+                a.clone()
+            } else if let Some(d) = p.default {
+                self.pos = d;
+                self.expression()?
+            } else {
+                Value::Null
+            };
+            bound.push((p.name.clone(), v));
+        }
+        let saved_vars = std::mem::take(&mut self.vars);
+        let saved_ret = self.return_val.take();
+        for (n, v) in &c.captures {
+            self.vars.insert(n.clone(), v.clone());
+        }
+        for (n, v) in bound {
+            self.vars.insert(n, v); // params override captures
+        }
+        let result: R<Value> = if c.arrow {
+            self.pos = c.body_start;
+            self.expression()
+        } else {
+            self.pos = c.body_start;
+            match self.block() {
+                Ok(Flow::Return) => Ok(self.return_val.take().unwrap_or(Value::Null)),
+                Ok(_) => Ok(Value::Null),
+                Err(e) => Err(e),
+            }
+        };
+        self.vars = saved_vars;
+        self.return_val = saved_ret;
+        self.pos = saved_pos;
+        self.call_depth -= 1;
+        result
+    }
+
+    /// Parse a closure literal: `function (params) [use (...)] { body }` or an
+    /// arrow `fn (params) => expr`. Captures are snapshotted by value.
+    fn parse_closure(&mut self, arrow: bool) -> R<Value> {
+        self.skip_ws();
+        self.expect_char('(')?;
+        let params = self.parse_params()?;
+        self.expect_char(')')?;
+        let mut captures: Vec<(String, Value)> = Vec::new();
+        if arrow {
+            // arrow functions auto-capture the entire current scope by value
+            for (k, v) in &self.vars {
+                captures.push((k.clone(), v.clone()));
+            }
+        } else {
+            self.skip_ws();
+            let save = self.pos;
+            if self.try_identifier().map(|s| s.to_ascii_lowercase()).as_deref() == Some("use") {
+                self.expect_char('(')?;
+                loop {
+                    self.skip_ws();
+                    if self.peek() == Some('&') {
+                        self.pos += 1;
+                        self.skip_ws();
+                    }
+                    if self.peek() != Some('$') {
+                        break;
+                    }
+                    let name = self.parse_variable_name()?;
+                    let val = self.vars.get(&name).cloned().unwrap_or(Value::Null);
+                    captures.push((name, val));
+                    self.skip_ws();
+                    if self.peek() == Some(',') {
+                        self.pos += 1;
+                        continue;
+                    }
+                    break;
+                }
+                self.expect_char(')')?;
+            } else {
+                self.pos = save;
+            }
+        }
+        // optional return type
+        self.skip_ws();
+        if self.peek() == Some(':') {
+            self.pos += 1;
+            self.skip_ws();
+            if self.peek() == Some('?') {
+                self.pos += 1;
+                self.skip_ws();
+            }
+            while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '\\' || c == '|') {
+                self.pos += 1;
+            }
+            self.skip_ws();
+        }
+        let body_start;
+        if arrow {
+            self.skip_ws();
+            if !self.starts_with("=>") {
+                return Err(EngineError("expected `=>` in arrow function".into()));
+            }
+            self.pos += 2;
+            self.skip_ws();
+            body_start = self.pos;
+            let prev = self.live;
+            self.live = false;
+            let _ = self.expression()?; // skip past the expression body
+            self.live = prev;
+        } else {
+            self.skip_ws();
+            if self.peek() != Some('{') {
+                return Err(EngineError("expected `{` for closure body".into()));
+            }
+            body_start = self.pos;
+            self.pos += 1;
+            self.skip_to_block_end()?;
+        }
+        Ok(Value::Closure(Rc::new(Closure {
+            params,
+            body_start,
+            captures,
+            arrow,
+        })))
     }
 
     /// `Class::member` — class constants, `::class`, and static/`self`/`parent`
@@ -3004,6 +3157,8 @@ impl Engine {
                         self.expect_char(')')?;
                         Ok(Value::Null)
                     }
+                    "function" => self.parse_closure(false),
+                    "fn" => self.parse_closure(true),
                     "new" => {
                         self.skip_ws();
                         if self.peek() == Some('\\') {
@@ -3062,6 +3217,7 @@ impl Engine {
             Index(Value),
             Prop(String),
             Method(String, Vec<Value>),
+            Call(Vec<Value>),
         }
         let name = self.parse_variable_name()?;
         let mut accs: Vec<Acc> = Vec::new();
@@ -3092,6 +3248,9 @@ impl Engine {
                     self.pos = a2;
                     accs.push(Acc::Prop(member));
                 }
+            } else if self.peek() == Some('(') {
+                let args = self.parse_args()?;
+                accs.push(Acc::Call(args));
             } else {
                 self.pos = after;
                 break;
@@ -3145,6 +3304,7 @@ impl Engine {
                 }
                 Acc::Prop(p) => read_property(&cur, p),
                 Acc::Method(m, args) => self.call_method(&cur, m, args.clone())?,
+                Acc::Call(args) => self.call_callable(&cur, args.clone())?,
             };
             i += 1;
         }
@@ -3484,6 +3644,7 @@ fn key_from_value(v: &Value) -> AKey {
         }
         Value::Array(_) => AKey::Str(String::new()),
         Value::Object(_) => AKey::Str(String::new()),
+        Value::Closure(_) => AKey::Str(String::new()),
     }
 }
 
@@ -3541,6 +3702,7 @@ fn php_type_name(v: &Value) -> &'static str {
         Value::Str(_) => "string",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+        Value::Closure(_) => "object",
     }
 }
 
@@ -3582,6 +3744,7 @@ fn var_dump_str(v: &Value, indent: usize) -> String {
             out.push_str(&format!("{pad}}}\n"));
             out
         }
+        Value::Closure(_) => format!("{pad}object(Closure)#1 (0) {{\n{pad}}}\n"),
     }
 }
 
@@ -3677,6 +3840,7 @@ fn var_export_inner(v: &Value, indent: usize) -> String {
             s.push_str(&format!("{pad}))"));
             s
         }
+        Value::Closure(_) => "NULL".to_string(),
     }
 }
 

@@ -4,24 +4,24 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 634 / 21862  (2.90% of the entire PHP test suite)**
+**`.phpt` pass rate: 652 / 21862  (2.98% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 2.91%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 2.99%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 634 | 21162 | 66 | 21862 |
+| 652 | 21144 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 53/53 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 54/54 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 222 | 5329 | 4.2% |
-| `ext/standard` | 101 | 3877 | 2.6% |
-| `ext/opcache` | 209 | 916 | 22.8% |
-| `core` | 72 | 868 | 8.3% |
+| `Zend` | 235 | 5329 | 4.4% |
+| `ext/standard` | 103 | 3877 | 2.7% |
+| `ext/opcache` | 211 | 916 | 23.0% |
+| `core` | 73 | 868 | 8.4% |
 | `ext/dom` | 6 | 868 | 0.7% |
 | `ext/spl` | 3 | 796 | 0.4% |
 | `ext/date` | 0 | 689 | 0.0% |
@@ -119,7 +119,8 @@ The ladder to **"WordPress boots in the browser"**. Each rung is measured agains
 - [x] **v9 — `isset` / `empty` / `unset`** on variables, array elements, and object properties.
 - [x] **v10 — `::` + `__toString`.** Class constants (inherited), `self::`/`parent::`/`Class::` constants & static/method calls (with `$this` preserved), `::class`, and `__toString` for echo/interpolation. (TODO: static properties, late static binding.)
 - [x] **v11 — Exceptions + `instanceof`.** `throw`/`try`/`catch`/`finally`, the Exception/Error/SPL hierarchy (via a parsed PHP prelude), `getMessage`/`getCode`/etc., and `instanceof` over classes + interfaces.
-- [x] **v12 — Callables + higher-order builtins.** String/`[obj,method]` callables; `array_map`/`array_filter`/`array_reduce`/`call_user_func`(`_array`); `array_search`/`array_key_exists`/`array_flip`/`array_unique`/`array_slice`; `strcmp`/`strcasecmp`; `fmod`/`log`/`exp`/trig. (TODO: closures, by-ref `sort`/`usort`.)
+- [x] **v12 — Callables + higher-order builtins.** String/`[obj,method]` callables; `array_map`/`array_filter`/`array_reduce`/`call_user_func`(`_array`); `array_search`/`array_key_exists`/`array_flip`/`array_unique`/`array_slice`; `strcmp`/`strcasecmp`; `fmod`/`log`/`exp`/trig. (TODO: by-ref `sort`/`usort`.)
+- [x] **v13 — Closures.** Anonymous `function(...) use(...) {}` (by-value capture), arrow `fn(...) => expr` (auto-capture), and direct `$f(...)` invocation.
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)
