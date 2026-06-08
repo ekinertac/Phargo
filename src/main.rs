@@ -443,6 +443,7 @@ const ROADMAP: &str = r#"The ladder to **"WordPress boots in the browser"**. Eac
 - [x] **v18 — Static class properties.** `public static $x = …`; `Class::$x` / `self::$x` read, write, and compound assignment (inherited via the class chain).
 - [x] **v19 — More builtins.** `array_chunk`/`array_merge_recursive`, `str_ireplace`/`substr_replace`/`nl2br`/`addslashes`/`stripslashes`, `vsprintf`/`vprintf`.
 - [x] **v20 — More builtins.** `strtr` (both forms), `chunk_split`, `compact`, `levenshtein`, `array_is_list`, `quotemeta`.
+- [x] **v21 — Heredoc / nowdoc.** `<<<EOT` (interpolated) and `<<<'EOT'` (raw), with flexible (indented) closing markers.
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)

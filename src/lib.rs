@@ -3917,6 +3917,9 @@ impl Engine {
 
     fn primary(&mut self) -> R<Value> {
         self.skip_ws();
+        if self.starts_with("<<<") {
+            return self.parse_heredoc();
+        }
         match self.peek() {
             Some('(') => {
                 self.pos += 1;
@@ -4408,6 +4411,134 @@ impl Engine {
             self.pos += 1;
         }
         Err(EngineError("unterminated double-quoted string".into()))
+    }
+
+    fn read_label(&mut self) -> String {
+        let start = self.pos;
+        while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == '_') {
+            self.pos += 1;
+        }
+        self.src[start..self.pos].iter().collect()
+    }
+
+    /// `<<<EOT … EOT` (heredoc, interpolated) or `<<<'EOT' … EOT` (nowdoc, raw),
+    /// with PHP 7.3 flexible (indented) closing markers.
+    fn parse_heredoc(&mut self) -> R<Value> {
+        self.pos += 3; // <<<
+        while matches!(self.peek(), Some(' ') | Some('\t')) {
+            self.pos += 1;
+        }
+        let nowdoc = match self.peek() {
+            Some('\'') => {
+                self.pos += 1;
+                true
+            }
+            Some('"') => {
+                self.pos += 1;
+                false
+            }
+            _ => false,
+        };
+        let label = self.read_label();
+        if label.is_empty() {
+            return Err(EngineError("invalid heredoc label".into()));
+        }
+        if matches!(self.peek(), Some('\'') | Some('"')) {
+            self.pos += 1;
+        }
+        // consume the rest of the opening line
+        while matches!(self.peek(), Some(c) if c != '\n') {
+            self.pos += 1;
+        }
+        if self.peek() == Some('\n') {
+            self.pos += 1;
+        }
+        let label_len = label.chars().count();
+        let mut lines: Vec<String> = Vec::new();
+        let mut closing_indent = 0;
+        loop {
+            let line_start = self.pos;
+            let mut ws = 0;
+            while matches!(self.peek(), Some(' ') | Some('\t')) {
+                self.pos += 1;
+                ws += 1;
+            }
+            if self.starts_with(&label) {
+                let after = self.pos + label_len;
+                let next = self.src.get(after).copied();
+                if !matches!(next, Some(c) if c.is_ascii_alphanumeric() || c == '_') {
+                    self.pos = after; // consume the label; leave the rest (`;` etc.)
+                    closing_indent = ws;
+                    break;
+                }
+            }
+            // not the closing marker — take the whole line as content
+            self.pos = line_start;
+            let mut line = String::new();
+            while matches!(self.peek(), Some(c) if c != '\n') {
+                line.push(self.src[self.pos]);
+                self.pos += 1;
+            }
+            if self.peek() == Some('\n') {
+                self.pos += 1;
+            }
+            lines.push(line);
+            if self.pos >= self.src.len() {
+                break;
+            }
+        }
+        let mut content = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                content.push('\n');
+            }
+            content.extend(line.chars().skip(closing_indent)); // strip closing indent (7.3+)
+        }
+        if nowdoc {
+            Ok(Value::Str(content))
+        } else {
+            Ok(Value::Str(self.interpolate(&content)?))
+        }
+    }
+
+    /// Process `$var` interpolation and escape sequences in a string (used by
+    /// heredoc; mirrors double-quoted semantics minus `\"`).
+    fn interpolate(&mut self, s: &str) -> R<String> {
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\\' && i + 1 < chars.len() {
+                let (ch, adv) = match chars[i + 1] {
+                    'n' => ('\n', 2),
+                    't' => ('\t', 2),
+                    'r' => ('\r', 2),
+                    '\\' => ('\\', 2),
+                    '$' => ('$', 2),
+                    _ => ('\\', 1),
+                };
+                out.push(ch);
+                i += adv;
+                continue;
+            }
+            if c == '$' && matches!(chars.get(i + 1), Some(d) if d.is_ascii_alphabetic() || *d == '_') {
+                let start = i + 1;
+                let mut j = start;
+                while matches!(chars.get(j), Some(d) if d.is_ascii_alphanumeric() || *d == '_') {
+                    j += 1;
+                }
+                let name: String = chars[start..j].iter().collect();
+                let v = self.vars.get(&name).cloned().unwrap_or(Value::Null);
+                let sv = self.stringify(&v)?;
+                out.push_str(&sv);
+                i = j;
+                continue;
+            }
+            out.push(c);
+            i += 1;
+        }
+        Ok(out)
     }
 
     fn try_identifier(&mut self) -> Option<String> {
