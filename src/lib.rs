@@ -516,6 +516,7 @@ pub fn run_with_path(source: &str, path: Option<PathBuf>) -> R<String> {
         ob_stack: Vec::new(),
         cur_file: path,
         included: HashSet::new(),
+        enum_cases: HashMap::new(),
     };
     // Bound the main run by the length captured now: `include`/`eval` append to
     // `src` during execution, and the top-level loop must not run into them.
@@ -552,6 +553,8 @@ struct Engine {
     consts: HashMap<String, Value>,
     /// Output-buffering watermarks into `out` (one per active `ob_start`).
     ob_stack: Vec<usize>,
+    /// Enum cases, keyed by lowercased enum name → ordered (case name, singleton object).
+    enum_cases: HashMap<String, Vec<(String, Value)>>,
     /// The file currently executing (for `__FILE__`/`__DIR__` and relative includes).
     cur_file: Option<PathBuf>,
     /// Canonical paths already pulled in via `include_once`/`require_once`.
@@ -763,7 +766,8 @@ impl Engine {
                 "switch" => return self.switch_statement(),
                 "throw" => return self.throw_statement(),
                 "try" => return self.try_statement(),
-                "class" | "interface" | "trait" => return self.class_decl(),
+                "class" | "interface" | "trait" => return self.class_decl(false),
+                "enum" => return self.class_decl(true),
                 "abstract" | "final" | "readonly" => {
                     self.skip_ws();
                     let mut k = self.try_identifier().map(|s| s.to_ascii_lowercase());
@@ -772,7 +776,10 @@ impl Engine {
                         k = self.try_identifier().map(|s| s.to_ascii_lowercase());
                     }
                     if matches!(k.as_deref(), Some("class") | Some("interface") | Some("trait")) {
-                        return self.class_decl();
+                        return self.class_decl(false);
+                    }
+                    if k.as_deref() == Some("enum") {
+                        return self.class_decl(true);
                     }
                     return Err(EngineError("expected class after modifier".into()));
                 }
@@ -3939,7 +3946,7 @@ impl Engine {
 
     /// `class Name [extends Parent] [implements …] { members }`. Also used for
     /// `interface`/`trait` (members may be abstract).
-    fn class_decl(&mut self) -> R<Flow> {
+    fn class_decl(&mut self, is_enum: bool) -> R<Flow> {
         self.skip_ws();
         let name = match self.try_identifier() {
             Some(n) => n,
@@ -3947,7 +3954,15 @@ impl Engine {
         };
         let mut parent = None;
         let mut interfaces: Vec<String> = Vec::new();
+        let mut enum_cases: Vec<(String, Value)> = Vec::new();
         self.skip_ws();
+        // backed enum: `enum E: string { ... }` — note and skip the backing type
+        if is_enum && self.peek() == Some(':') {
+            self.pos += 1;
+            self.skip_ws();
+            let _ = self.try_identifier();
+            self.skip_ws();
+        }
         {
             let save = self.pos;
             if self.try_identifier().map(|s| s.to_ascii_lowercase()).as_deref() == Some("extends") {
@@ -4036,6 +4051,7 @@ impl Engine {
                     Some(ref m) if m == "function" => break "function",
                     Some(ref m) if m == "const" => break "const",
                     Some(ref m) if m == "use" => break "use",
+                    Some(ref m) if is_enum && m == "case" => break "case",
                     Some(m) => {
                         if m == "static" {
                             is_static = true;
@@ -4049,6 +4065,30 @@ impl Engine {
                 "end" => {
                     self.expect_char('}')?;
                     break;
+                }
+                "case" => {
+                    self.skip_ws();
+                    let cname = self
+                        .try_identifier()
+                        .ok_or_else(|| EngineError("expected enum case name".into()))?;
+                    self.skip_ws();
+                    let mut props = vec![("name".to_string(), Value::Str(cname.clone()))];
+                    if self.peek() == Some('=') && self.peek_at(1) != Some('=') {
+                        self.pos += 1;
+                        let v = self.expression()?;
+                        props.push(("value".to_string(), v));
+                    }
+                    if self.live {
+                        let obj = Value::Object(Rc::new(RefCell::new(Obj {
+                            class: name.clone(),
+                            props,
+                        })));
+                        enum_cases.push((cname, obj));
+                    }
+                    self.skip_ws();
+                    if self.peek() == Some(';') {
+                        self.pos += 1;
+                    }
                 }
                 "use" => {
                     // trait use: merge the named traits' members into this class
@@ -4194,7 +4234,7 @@ impl Engine {
                 self.static_props.insert((clower.clone(), pn.clone()), v);
             }
             self.classes.insert(
-                clower,
+                clower.clone(),
                 ClassDef {
                     parent,
                     props,
@@ -4203,6 +4243,9 @@ impl Engine {
                     methods,
                 },
             );
+            if is_enum {
+                self.enum_cases.insert(clower, enum_cases);
+            }
         }
         Ok(Flow::Normal)
     }
@@ -4688,6 +4731,52 @@ impl Engine {
         }
     }
 
+    /// Apply any trailing `->prop` / `->method()` / `?->` chain to an already
+    /// computed value (used after `Enum::Case`, `(expr)`, `new X`, … which the
+    /// `$var` path doesn't cover).
+    fn chain_access(&mut self, mut val: Value) -> R<Value> {
+        loop {
+            let save = self.pos;
+            self.skip_ws();
+            if self.starts_with("?->") || self.starts_with("->") {
+                let nullsafe = self.starts_with("?->");
+                self.pos += if nullsafe { 3 } else { 2 };
+                if nullsafe && matches!(val, Value::Null) {
+                    // consume the member (and any call) but yield null
+                    self.skip_ws();
+                    let _ = self.try_identifier();
+                    self.skip_ws();
+                    if self.peek() == Some('(') {
+                        let _ = self.parse_args()?;
+                    }
+                    val = Value::Null;
+                    continue;
+                }
+                self.skip_ws();
+                let member = self
+                    .try_identifier()
+                    .ok_or_else(|| EngineError("expected name after `->`".into()))?;
+                self.skip_ws();
+                if self.peek() == Some('(') {
+                    let args = self.parse_args()?;
+                    if !self.live {
+                        val = Value::Null;
+                        continue;
+                    }
+                    val = self.call_method(&val, &member, args)?;
+                } else {
+                    val = match &val {
+                        Value::Object(o) => o.borrow().get(&member).unwrap_or(Value::Null),
+                        _ => Value::Null,
+                    };
+                }
+            } else {
+                self.pos = save;
+                return Ok(val);
+            }
+        }
+    }
+
     /// Invoke a PHP callable: a function-name string, or `[receiver, "method"]`.
     fn call_callable(&mut self, callable: &Value, args: Vec<Value>) -> R<Value> {
         match callable {
@@ -4893,17 +4982,57 @@ impl Engine {
             if !self.live {
                 return Ok(Value::Null);
             }
+            // enum built-in static methods: cases() / from() / tryFrom()
+            let clower = class.to_ascii_lowercase();
+            if self.enum_cases.contains_key(&clower) {
+                let ml = member.to_ascii_lowercase();
+                if ml == "cases" {
+                    let mut a = PArray::default();
+                    for (_, obj) in &self.enum_cases[&clower] {
+                        a.push(obj.clone());
+                    }
+                    return Ok(Value::Array(a));
+                }
+                if ml == "from" || ml == "tryfrom" {
+                    let target = args.first().cloned().unwrap_or(Value::Null);
+                    for (_, obj) in &self.enum_cases[&clower] {
+                        if let Value::Object(o) = obj {
+                            let val = o.borrow().get("value");
+                            if let Some(v) = val {
+                                if loose_eq_d(&v, &target, 0) {
+                                    return Ok(obj.clone());
+                                }
+                            }
+                        }
+                    }
+                    if ml == "tryfrom" {
+                        return Ok(Value::Null);
+                    }
+                    return Err(EngineError(format!(
+                        "{}::from(): no case matches the given value",
+                        class
+                    )));
+                }
+            }
             let def = self.lookup_method(&class, &member).ok_or_else(|| {
                 EngineError(format!("call to undefined method {class}::{member}()"))
             })?;
             // preserve the current $this for self::/parent:: calls in instance context
             let this = self.vars.get("this").cloned();
-            return self.call_user_function(def, args, this, Some(class));
+            let r = self.call_user_function(def, args, this, Some(class))?;
+            return self.chain_access(r);
         }
         // class constant
         self.pos = after;
         if !self.live {
             return Ok(Value::Null);
+        }
+        // enum case access: `EnumName::CaseName`
+        if let Some(cases) = self.enum_cases.get(&class.to_ascii_lowercase()) {
+            if let Some((_, obj)) = cases.iter().find(|(n, _)| n == &member) {
+                let obj = obj.clone();
+                return self.chain_access(obj);
+            }
         }
         let cpos = match self.lookup_const(&class, &member) {
             Some(pos) => pos,
@@ -5173,7 +5302,7 @@ impl Engine {
                 self.skip_ws();
                 if self.peek() == Some(')') {
                     self.pos += 1;
-                    Ok(v)
+                    self.chain_access(v)
                 } else {
                     Err(EngineError("expected `)`".into()))
                 }
