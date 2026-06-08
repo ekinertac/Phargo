@@ -275,7 +275,8 @@ const ROADMAP: &str = r#"The ladder to **"WordPress boots in the browser"**. Eac
 - [ ] **v3c — `switch`** and **`foreach`** (`foreach` needs arrays, v5).
 - [x] **v4a — Built-in function calls.** `var_dump`/`print_r`/`var_export`, `gettype`, `is_*`, `intval`/`strval`/…, core string & math builtins (scalars).
 - [x] **v4b — User-defined functions.** `function` decls, params (+ defaults), `return`, isolated call scope, recursion.
-- [ ] **v5 — Arrays & strings.** PHP arrays (ordered maps) + the core built-ins WordPress leans on.
+- [x] **v5 — Arrays.** Ordered-map arrays, `[...]`/`array()` literals, index read/write/append, `foreach`, `var_dump`/`print_r`/`var_export` of arrays, and `count`/`in_array`/`implode`/`explode`/`array_keys`/`array_values`/`array_merge`/`range`/… builtins.
+- [ ] **v3c — `switch`.** Deferred from v3.
 - [ ] **v6 — Classes.** Classes, interfaces, traits — the OOP WordPress actually uses.
 - [ ] **v7 — pcre / mbstring.** Regex + Unicode. (Here be dragons.)
 - [ ] **v8 — Request lifecycle.** Superglobals, output buffering, the Playground host interface.

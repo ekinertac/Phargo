@@ -53,7 +53,48 @@ struct FuncDef {
     body_start: usize,
 }
 
-/// A PHP value — the engine's "zval". Scalars only, so far.
+/// A PHP array key (after normalization): integer or string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AKey {
+    Int(i64),
+    Str(String),
+}
+
+/// A PHP array: an insertion-ordered map. Linear lookup (corpus arrays are
+/// small); correctness first.
+#[derive(Clone, Debug, Default)]
+pub struct PArray {
+    entries: Vec<(AKey, Value)>,
+    next_index: i64,
+}
+
+impl PArray {
+    fn get(&self, k: &AKey) -> Option<&Value> {
+        self.entries.iter().find(|(ek, _)| ek == k).map(|(_, v)| v)
+    }
+    fn get_mut(&mut self, k: &AKey) -> Option<&mut Value> {
+        self.entries.iter_mut().find(|(ek, _)| ek == k).map(|(_, v)| v)
+    }
+    fn set(&mut self, k: AKey, v: Value) {
+        if let AKey::Int(i) = &k {
+            if *i >= self.next_index {
+                self.next_index = *i + 1;
+            }
+        }
+        if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| *ek == k) {
+            slot.1 = v;
+        } else {
+            self.entries.push((k, v));
+        }
+    }
+    fn push(&mut self, v: Value) {
+        let i = self.next_index;
+        self.entries.push((AKey::Int(i), v));
+        self.next_index = i + 1;
+    }
+}
+
+/// A PHP value — the engine's "zval".
 #[derive(Clone, Debug)]
 pub enum Value {
     Null,
@@ -61,6 +102,7 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Str(String),
+    Array(PArray),
 }
 
 impl Value {
@@ -73,6 +115,7 @@ impl Value {
             Value::Int(n) => n.to_string(),
             Value::Float(x) => format_php_float(*x),
             Value::Str(s) => s.clone(),
+            Value::Array(_) => "Array".to_string(), // PHP emits a notice and "Array"
         }
     }
 }
@@ -100,6 +143,7 @@ fn to_bool(v: &Value) -> bool {
         Value::Int(n) => *n != 0,
         Value::Float(x) => *x != 0.0,
         Value::Str(s) => !(s.is_empty() || s == "0"),
+        Value::Array(a) => !a.entries.is_empty(),
     }
 }
 
@@ -130,6 +174,7 @@ fn to_num(v: &Value) -> Num {
                 Num::I(0)
             }
         }
+        Value::Array(a) => Num::I(if a.entries.is_empty() { 0 } else { 1 }),
     }
 }
 
@@ -166,6 +211,13 @@ fn strict_eq(a: &Value, b: &Value) -> bool {
         (Int(x), Int(y)) => x == y,
         (Float(x), Float(y)) => x == y,
         (Str(x), Str(y)) => x == y,
+        (Array(x), Array(y)) => {
+            x.entries.len() == y.entries.len()
+                && x.entries
+                    .iter()
+                    .zip(&y.entries)
+                    .all(|((ka, va), (kb, vb))| ka == kb && strict_eq(va, vb))
+        }
         _ => false,
     }
 }
@@ -175,6 +227,13 @@ fn loose_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Null, Null) => true,
         (Bool(_), _) | (_, Bool(_)) | (Null, _) | (_, Null) => to_bool(a) == to_bool(b),
+        (Array(x), Array(y)) => {
+            x.entries.len() == y.entries.len()
+                && x.entries
+                    .iter()
+                    .all(|(k, v)| matches!(y.get(k), Some(w) if loose_eq(v, w)))
+        }
+        (Array(_), _) | (_, Array(_)) => false,
         (Str(x), Str(y)) => {
             if is_numeric_str(x) && is_numeric_str(y) {
                 to_f64(a) == to_f64(b)
@@ -393,6 +452,7 @@ impl Engine {
                 "while" => return self.while_statement(),
                 "do" => return self.do_while_statement(),
                 "for" => return self.for_statement(),
+                "foreach" => return self.foreach_statement(),
                 "function" => return self.function_decl(),
                 "return" => return self.return_statement(),
                 "break" => return self.break_continue(true),
@@ -728,6 +788,66 @@ impl Engine {
         }
     }
 
+    fn foreach_statement(&mut self) -> R<Flow> {
+        self.expect_char('(')?;
+        let iterable = self.expression()?;
+        self.skip_ws();
+        let as_kw = self.try_identifier().map(|s| s.to_ascii_lowercase());
+        if as_kw.as_deref() != Some("as") {
+            return Err(EngineError("expected `as` in foreach".into()));
+        }
+        self.skip_ws();
+        if self.peek() != Some('$') {
+            return Err(EngineError("expected variable in foreach".into()));
+        }
+        let v1 = self.parse_variable_name()?;
+        self.skip_ws();
+        let (key_var, val_var) = if self.starts_with("=>") {
+            self.pos += 2;
+            self.skip_ws();
+            if self.peek() != Some('$') {
+                return Err(EngineError("expected value variable in foreach".into()));
+            }
+            (Some(v1), self.parse_variable_name()?)
+        } else {
+            (None, v1)
+        };
+        self.expect_char(')')?;
+        let body_start = self.pos;
+
+        let entries: Vec<(AKey, Value)> = match &iterable {
+            Value::Array(a) => a.entries.clone(),
+            _ => Vec::new(),
+        };
+
+        // Empty/skipped: parse the body once (not live) to move past it.
+        if !self.live || entries.is_empty() {
+            let prev = self.live;
+            self.live = false;
+            let _ = self.block_or_statement()?;
+            self.live = prev;
+            return Ok(Flow::Normal);
+        }
+
+        for (k, v) in entries {
+            self.tick()?;
+            if let Some(kv) = &key_var {
+                self.vars.insert(kv.clone(), akey_to_value(&k));
+            }
+            self.vars.insert(val_var.clone(), v);
+            self.pos = body_start;
+            match self.block_or_statement()? {
+                Flow::Break(n) => {
+                    return Ok(if n > 1 { Flow::Break(n - 1) } else { Flow::Normal });
+                }
+                Flow::Continue(n) if n > 1 => return Ok(Flow::Continue(n - 1)),
+                Flow::Return => return Ok(Flow::Return),
+                _ => {}
+            }
+        }
+        Ok(Flow::Normal)
+    }
+
     // ---- expression parsing ------------------------------------------------
 
     fn expression(&mut self) -> R<Value> {
@@ -740,25 +860,85 @@ impl Engine {
         if self.peek() == Some('$') {
             let save = self.pos;
             let name = self.parse_variable_name()?;
+            // optional index chain → array-element lvalue ($a[i], $a[], $a[i][j])
+            let mut indices: Vec<Option<Value>> = Vec::new();
+            loop {
+                let after = self.pos;
+                self.skip_ws();
+                if self.peek() == Some('[') {
+                    self.pos += 1;
+                    self.skip_ws();
+                    if self.peek() == Some(']') {
+                        self.pos += 1;
+                        indices.push(None);
+                    } else {
+                        let k = self.expression()?;
+                        self.expect_char(']')?;
+                        indices.push(Some(k));
+                    }
+                } else {
+                    self.pos = after;
+                    break;
+                }
+            }
             self.skip_ws();
             if let Some(aop) = self.peek_assign_op() {
                 self.pos += aop.len();
                 self.skip_ws();
                 let rhs = self.parse_assignment()?;
-                let newval = if aop == "=" {
-                    rhs
-                } else {
-                    let cur = self.vars.get(&name).cloned().unwrap_or(Value::Null);
-                    self.apply_binary(&aop[..aop.len() - 1], cur, rhs)?
-                };
-                if self.live {
-                    self.vars.insert(name, newval.clone());
+                if indices.is_empty() {
+                    let newval = if aop == "=" {
+                        rhs
+                    } else {
+                        let cur = self.vars.get(&name).cloned().unwrap_or(Value::Null);
+                        self.apply_binary(&aop[..aop.len() - 1], cur, rhs)?
+                    };
+                    if self.live {
+                        self.vars.insert(name, newval.clone());
+                    }
+                    return Ok(newval);
                 }
-                return Ok(newval);
+                return self.assign_indexed(name, indices, aop, rhs);
             }
             self.pos = save; // not an assignment
         }
         self.parse_binary(0)
+    }
+
+    fn assign_indexed(
+        &mut self,
+        name: String,
+        indices: Vec<Option<Value>>,
+        aop: &str,
+        rhs: Value,
+    ) -> R<Value> {
+        if !self.live {
+            return Ok(rhs);
+        }
+        let newval = if aop == "=" {
+            rhs
+        } else {
+            let cur = self.read_indexed(&name, &indices);
+            self.apply_binary(&aop[..aop.len() - 1], cur, rhs)?
+        };
+        let slot = self.vars.entry(name).or_insert(Value::Null);
+        set_path(slot, &indices, newval.clone());
+        Ok(newval)
+    }
+
+    fn read_indexed(&self, name: &str, indices: &[Option<Value>]) -> Value {
+        let mut cur = self.vars.get(name).cloned().unwrap_or(Value::Null);
+        for idx in indices {
+            let key = match idx {
+                None => return Value::Null,
+                Some(v) => key_from_value(v),
+            };
+            cur = match &cur {
+                Value::Array(a) => a.get(&key).cloned().unwrap_or(Value::Null),
+                _ => Value::Null,
+            };
+        }
+        cur
     }
 
     fn peek_assign_op(&self) -> Option<&'static str> {
@@ -979,7 +1159,7 @@ impl Engine {
             "var_dump" => {
                 let mut s = String::new();
                 for a in &args {
-                    s.push_str(&var_dump_str(a));
+                    s.push_str(&var_dump_str(a, 0));
                 }
                 self.out.push_str(&s);
                 Value::Null
@@ -1075,7 +1255,113 @@ impl Engine {
                 arg(0),
                 Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_)
             )),
-            "is_array" | "is_object" | "is_callable" => Value::Bool(false),
+            "is_array" => Value::Bool(matches!(arg(0), Value::Array(_))),
+            "is_object" | "is_callable" => Value::Bool(false),
+            "count" | "sizeof" => match arg(0) {
+                Value::Array(a) => Value::Int(a.entries.len() as i64),
+                _ => Value::Int(1),
+            },
+            "in_array" => match arg(1) {
+                Value::Array(a) => {
+                    let needle = arg(0);
+                    Value::Bool(a.entries.iter().any(|(_, v)| loose_eq(&needle, v)))
+                }
+                _ => Value::Bool(false),
+            },
+            "array_keys" => match arg(0) {
+                Value::Array(a) => {
+                    let mut r = PArray::default();
+                    for (k, _) in &a.entries {
+                        r.push(akey_to_value(k));
+                    }
+                    Value::Array(r)
+                }
+                _ => Value::Array(PArray::default()),
+            },
+            "array_values" => match arg(0) {
+                Value::Array(a) => {
+                    let mut r = PArray::default();
+                    for (_, v) in &a.entries {
+                        r.push(v.clone());
+                    }
+                    Value::Array(r)
+                }
+                _ => Value::Array(PArray::default()),
+            },
+            "array_reverse" => match arg(0) {
+                Value::Array(a) => {
+                    let mut r = PArray::default();
+                    for (_, v) in a.entries.iter().rev() {
+                        r.push(v.clone());
+                    }
+                    Value::Array(r)
+                }
+                _ => Value::Array(PArray::default()),
+            },
+            "array_sum" => match arg(0) {
+                Value::Array(a) => {
+                    let mut acc = Value::Int(0);
+                    for (_, v) in &a.entries {
+                        acc = arith("+", &acc, v);
+                    }
+                    acc
+                }
+                _ => Value::Int(0),
+            },
+            "array_merge" => {
+                let mut r = PArray::default();
+                for a in &args {
+                    if let Value::Array(arr) = a {
+                        for (k, v) in &arr.entries {
+                            match k {
+                                AKey::Int(_) => r.push(v.clone()),
+                                AKey::Str(s) => r.set(AKey::Str(s.clone()), v.clone()),
+                            }
+                        }
+                    }
+                }
+                Value::Array(r)
+            }
+            "implode" | "join" => {
+                let (glue, arr) = if let Value::Array(a) = arg(0) {
+                    (String::new(), a)
+                } else {
+                    match arg(1) {
+                        Value::Array(a) => (arg(0).to_php_string(), a),
+                        _ => (arg(0).to_php_string(), PArray::default()),
+                    }
+                };
+                let parts: Vec<String> =
+                    arr.entries.iter().map(|(_, v)| v.to_php_string()).collect();
+                Value::Str(parts.join(&glue))
+            }
+            "explode" => {
+                let d = arg(0).to_php_string();
+                let s = arg(1).to_php_string();
+                if d.is_empty() {
+                    return Err(EngineError("explode(): empty delimiter".into()));
+                }
+                let mut r = PArray::default();
+                for part in s.split(&d) {
+                    r.push(Value::Str(part.to_string()));
+                }
+                Value::Array(r)
+            }
+            "range" => {
+                let lo = to_long(&arg(0));
+                let hi = to_long(&arg(1));
+                let mut r = PArray::default();
+                if lo <= hi {
+                    for i in lo..=hi {
+                        r.push(Value::Int(i));
+                    }
+                } else {
+                    for i in (hi..=lo).rev() {
+                        r.push(Value::Int(i));
+                    }
+                }
+                Value::Array(r)
+            }
             _ => {
                 let key = name.to_ascii_lowercase();
                 if let Some(func) = self.funcs.get(&key).cloned() {
@@ -1245,6 +1531,10 @@ impl Engine {
                     Err(EngineError("expected `)`".into()))
                 }
             }
+            Some('[') => {
+                self.pos += 1;
+                self.parse_array_items(']')
+            }
             Some('"') => Ok(Value::Str(self.double_quoted()?)),
             Some('\'') => Ok(Value::Str(self.single_quoted()?)),
             Some('$') => self.variable(),
@@ -1255,6 +1545,15 @@ impl Engine {
                     "true" => Ok(Value::Bool(true)),
                     "false" => Ok(Value::Bool(false)),
                     "null" => Ok(Value::Null),
+                    "array" => {
+                        self.skip_ws();
+                        if self.peek() == Some('(') {
+                            self.pos += 1;
+                            self.parse_array_items(')')
+                        } else {
+                            Err(EngineError("expected `(` after `array`".into()))
+                        }
+                    }
                     _ => {
                         let after = self.pos;
                         self.skip_ws();
@@ -1277,23 +1576,99 @@ impl Engine {
         }
     }
 
-    /// A `$var` reference, with optional post `++`/`--`.
+    /// A `$var` reference, with optional index reads (`$a[k]`, string offsets)
+    /// and post `++`/`--`.
     fn variable(&mut self) -> R<Value> {
         let name = self.parse_variable_name()?;
-        let cur = self.vars.get(&name).cloned().unwrap_or(Value::Null);
-        let after = self.pos;
-        self.skip_ws();
-        if self.starts_with("++") || self.starts_with("--") {
-            let inc = self.starts_with("++");
-            self.pos += 2;
-            let nv = self.inc_dec(&cur, inc);
-            if self.live {
-                self.vars.insert(name, nv);
+        let mut cur = self.vars.get(&name).cloned().unwrap_or(Value::Null);
+        let mut indexed = false;
+        loop {
+            let after = self.pos;
+            self.skip_ws();
+            if self.peek() == Some('[') {
+                indexed = true;
+                self.pos += 1;
+                self.skip_ws();
+                if self.peek() == Some(']') {
+                    return Err(EngineError("cannot use [] for reading".into()));
+                }
+                let k = self.expression()?;
+                self.expect_char(']')?;
+                let key = key_from_value(&k);
+                cur = match &cur {
+                    Value::Array(a) => a.get(&key).cloned().unwrap_or(Value::Null),
+                    Value::Str(s) => match &key {
+                        AKey::Int(i) => s
+                            .chars()
+                            .nth(*i as usize)
+                            .map(|c| Value::Str(c.to_string()))
+                            .unwrap_or(Value::Str(String::new())),
+                        _ => Value::Null,
+                    },
+                    _ => Value::Null,
+                };
+            } else {
+                self.pos = after;
+                break;
             }
-            return Ok(cur); // post-inc/dec yields the OLD value
         }
-        self.pos = after;
+        if !indexed {
+            let after = self.pos;
+            self.skip_ws();
+            if self.starts_with("++") || self.starts_with("--") {
+                let inc = self.starts_with("++");
+                self.pos += 2;
+                let nv = self.inc_dec(&cur, inc);
+                if self.live {
+                    self.vars.insert(name, nv);
+                }
+                return Ok(cur); // post-inc/dec yields the OLD value
+            }
+            self.pos = after;
+        }
         Ok(cur)
+    }
+
+    fn parse_array_items(&mut self, close: char) -> R<Value> {
+        let mut arr = PArray::default();
+        self.skip_ws();
+        if self.peek() == Some(close) {
+            self.pos += 1;
+            return Ok(Value::Array(arr));
+        }
+        loop {
+            let first = self.expression()?;
+            self.skip_ws();
+            if self.starts_with("=>") {
+                self.pos += 2;
+                self.skip_ws();
+                let val = self.expression()?;
+                arr.set(key_from_value(&first), val);
+            } else {
+                arr.push(first);
+            }
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.pos += 1;
+                    self.skip_ws();
+                    if self.peek() == Some(close) {
+                        self.pos += 1;
+                        break;
+                    }
+                }
+                Some(c) if c == close => {
+                    self.pos += 1;
+                    break;
+                }
+                other => {
+                    return Err(EngineError(format!(
+                        "expected `,` or `{close}` in array literal, found {other:?}"
+                    )))
+                }
+            }
+        }
+        Ok(Value::Array(arr))
     }
 
     fn parse_variable_name(&mut self) -> R<String> {
@@ -1459,6 +1834,62 @@ fn apply_f(op: &str, x: f64, y: f64) -> f64 {
     }
 }
 
+/// Normalize a value used as an array key (PHP: "5" -> int 5, bools/floats ->
+/// int, null -> "").
+fn key_from_value(v: &Value) -> AKey {
+    match v {
+        Value::Int(n) => AKey::Int(*n),
+        Value::Bool(b) => AKey::Int(*b as i64),
+        Value::Float(x) => AKey::Int(*x as i64),
+        Value::Null => AKey::Str(String::new()),
+        Value::Str(s) => {
+            if let Ok(n) = s.parse::<i64>() {
+                if n.to_string() == *s {
+                    return AKey::Int(n);
+                }
+            }
+            AKey::Str(s.clone())
+        }
+        Value::Array(_) => AKey::Str(String::new()),
+    }
+}
+
+fn akey_to_value(k: &AKey) -> Value {
+    match k {
+        AKey::Int(i) => Value::Int(*i),
+        AKey::Str(s) => Value::Str(s.clone()),
+    }
+}
+
+/// Write `val` into `slot` following an index path, auto-vivifying arrays.
+/// `None` in the path means append (`$a[] = …`).
+fn set_path(slot: &mut Value, indices: &[Option<Value>], val: Value) {
+    if indices.is_empty() {
+        *slot = val;
+        return;
+    }
+    if !matches!(slot, Value::Array(_)) {
+        *slot = Value::Array(PArray::default());
+    }
+    let arr = match slot {
+        Value::Array(a) => a,
+        _ => unreachable!(),
+    };
+    let (first, rest) = indices.split_first().unwrap();
+    let key = match first {
+        None => AKey::Int(arr.next_index),
+        Some(v) => key_from_value(v),
+    };
+    if rest.is_empty() {
+        arr.set(key, val);
+    } else {
+        if arr.get(&key).is_none() {
+            arr.set(key.clone(), Value::Array(PArray::default()));
+        }
+        set_path(arr.get_mut(&key).unwrap(), rest, val);
+    }
+}
+
 // ---- built-in output / formatting helpers ----------------------------------
 
 fn php_type_name(v: &Value) -> &'static str {
@@ -1468,26 +1899,67 @@ fn php_type_name(v: &Value) -> &'static str {
         Value::Int(_) => "integer",
         Value::Float(_) => "double",
         Value::Str(_) => "string",
+        Value::Array(_) => "array",
     }
 }
 
-/// `var_dump` output for one scalar value (with trailing newline).
-fn var_dump_str(v: &Value) -> String {
+/// `var_dump` output (with trailing newline). `indent` is the leading space
+/// count for this value's line — arrays recurse with `indent + 2`.
+fn var_dump_str(v: &Value, indent: usize) -> String {
+    let pad = " ".repeat(indent);
     match v {
-        Value::Int(n) => format!("int({n})\n"),
-        Value::Float(x) => format!("float({})\n", format_php_float(*x)),
-        Value::Bool(b) => format!("bool({})\n", if *b { "true" } else { "false" }),
-        Value::Str(s) => format!("string({}) \"{}\"\n", s.len(), s),
-        Value::Null => "NULL\n".to_string(),
+        Value::Int(n) => format!("{pad}int({n})\n"),
+        Value::Float(x) => format!("{pad}float({})\n", format_php_float(*x)),
+        Value::Bool(b) => format!("{pad}bool({})\n", if *b { "true" } else { "false" }),
+        Value::Str(s) => format!("{pad}string({}) \"{}\"\n", s.len(), s),
+        Value::Null => format!("{pad}NULL\n"),
+        Value::Array(a) => {
+            let mut out = format!("{pad}array({}) {{\n", a.entries.len());
+            let kp = " ".repeat(indent + 2);
+            for (k, val) in &a.entries {
+                let ks = match k {
+                    AKey::Int(i) => format!("[{i}]"),
+                    AKey::Str(s) => format!("[\"{s}\"]"),
+                };
+                out.push_str(&format!("{kp}{ks}=>\n"));
+                out.push_str(&var_dump_str(val, indent + 2));
+            }
+            out.push_str(&format!("{pad}}}\n"));
+            out
+        }
     }
 }
 
-/// `print_r` of a scalar is just its string form.
 fn print_r_str(v: &Value) -> String {
-    v.to_php_string()
+    print_r_inner(v, 0)
+}
+
+fn print_r_inner(v: &Value, depth: usize) -> String {
+    match v {
+        Value::Array(a) => {
+            let paren = " ".repeat(depth * 8);
+            let item = " ".repeat(depth * 8 + 4);
+            let mut s = String::from("Array\n");
+            s.push_str(&format!("{paren}(\n"));
+            for (k, val) in &a.entries {
+                let ks = match k {
+                    AKey::Int(i) => i.to_string(),
+                    AKey::Str(st) => st.clone(),
+                };
+                s.push_str(&format!("{item}[{ks}] => {}\n", print_r_inner(val, depth + 1)));
+            }
+            s.push_str(&format!("{paren})\n"));
+            s
+        }
+        _ => v.to_php_string(),
+    }
 }
 
 fn var_export_str(v: &Value) -> String {
+    var_export_inner(v, 0)
+}
+
+fn var_export_inner(v: &Value, indent: usize) -> String {
     match v {
         Value::Null => "NULL".to_string(),
         Value::Bool(b) => if *b { "true".into() } else { "false".into() },
@@ -1501,6 +1973,26 @@ fn var_export_str(v: &Value) -> String {
             }
         }
         Value::Str(s) => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'")),
+        Value::Array(a) => {
+            let pad = " ".repeat(indent);
+            let ipad = " ".repeat(indent + 2);
+            let mut s = String::from("array (\n");
+            for (k, val) in &a.entries {
+                let ks = match k {
+                    AKey::Int(i) => i.to_string(),
+                    AKey::Str(st) => format!("'{}'", st.replace('\\', "\\\\").replace('\'', "\\'")),
+                };
+                match val {
+                    Value::Array(_) => s.push_str(&format!(
+                        "{ipad}{ks} => \n{ipad}{},\n",
+                        var_export_inner(val, indent + 2)
+                    )),
+                    _ => s.push_str(&format!("{ipad}{ks} => {},\n", var_export_inner(val, indent + 2))),
+                }
+            }
+            s.push_str(&format!("{pad})"));
+            s
+        }
     }
 }
 

@@ -4,24 +4,24 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 216 / 21862  (0.99% of the entire PHP test suite)**
+**`.phpt` pass rate: 299 / 21862  (1.37% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (13750): 1.57%. The 8112 "not-yet-gradeable" tests mostly use `--EXPECTF--`, which the runner doesn't match yet._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (13750): 2.17%. The 8112 "not-yet-gradeable" tests mostly use `--EXPECTF--`, which the runner doesn't match yet._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 216 | 13534 | 8112 | 21862 |
+| 299 | 13451 | 8112 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 34/34 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 39/39 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 34 | 5329 | 0.6% |
-| `ext/standard` | 10 | 3877 | 0.3% |
-| `ext/opcache` | 119 | 916 | 13.0% |
-| `core` | 28 | 868 | 3.2% |
+| `Zend` | 47 | 5329 | 0.9% |
+| `ext/standard` | 38 | 3877 | 1.0% |
+| `ext/opcache` | 151 | 916 | 16.5% |
+| `core` | 38 | 868 | 4.4% |
 | `ext/dom` | 6 | 868 | 0.7% |
 | `ext/spl` | 0 | 796 | 0.0% |
 | `ext/date` | 0 | 689 | 0.0% |
@@ -105,7 +105,8 @@ The ladder to **"WordPress boots in the browser"**. Each rung is measured agains
 - [ ] **v3c — `switch`** and **`foreach`** (`foreach` needs arrays, v5).
 - [x] **v4a — Built-in function calls.** `var_dump`/`print_r`/`var_export`, `gettype`, `is_*`, `intval`/`strval`/…, core string & math builtins (scalars).
 - [x] **v4b — User-defined functions.** `function` decls, params (+ defaults), `return`, isolated call scope, recursion.
-- [ ] **v5 — Arrays & strings.** PHP arrays (ordered maps) + the core built-ins WordPress leans on.
+- [x] **v5 — Arrays.** Ordered-map arrays, `[...]`/`array()` literals, index read/write/append, `foreach`, `var_dump`/`print_r`/`var_export` of arrays, and `count`/`in_array`/`implode`/`explode`/`array_keys`/`array_values`/`array_merge`/`range`/… builtins.
+- [ ] **v3c — `switch`.** Deferred from v3.
 - [ ] **v6 — Classes.** Classes, interfaces, traits — the OOP WordPress actually uses.
 - [ ] **v7 — pcre / mbstring.** Regex + Unicode. (Here be dragons.)
 - [ ] **v8 — Request lifecycle.** Superglobals, output buffering, the Playground host interface.
