@@ -420,7 +420,7 @@ const ROADMAP: &str = r#"The ladder to **"WordPress boots in the browser"**. Eac
 - [x] **v4b — User-defined functions.** `function` decls, params (+ defaults), `return`, isolated call scope, recursion.
 - [x] **v5 — Arrays.** Ordered-map arrays, `[...]`/`array()` literals, index read/write/append, `foreach`, `var_dump`/`print_r`/`var_export` of arrays, and `count`/`in_array`/`implode`/`explode`/`array_keys`/`array_values`/`array_merge`/`range`/… builtins.
 - [x] **v6 — Ternary `?:` / null-coalescing `??` + string builtins** (`sprintf`/`printf`, `substr`, `str_replace`).
-- [ ] **v3c — `switch`.** Deferred from v3.
+- [x] **v3c — `switch`.** case/default with fall-through.
 - [ ] **v6 — Classes.** Classes, interfaces, traits — the OOP WordPress actually uses.
 - [ ] **v7 — pcre / mbstring.** Regex + Unicode. (Here be dragons.)
 - [ ] **v8 — Request lifecycle.** Superglobals, output buffering, the Playground host interface.

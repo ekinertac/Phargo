@@ -4,24 +4,24 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 322 / 21862  (1.47% of the entire PHP test suite)**
+**`.phpt` pass rate: 338 / 21862  (1.55% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 1.48%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 1.55%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 322 | 21474 | 66 | 21862 |
+| 338 | 21458 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 44/44 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 45/45 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 51 | 5329 | 1.0% |
+| `Zend` | 56 | 5329 | 1.1% |
 | `ext/standard` | 57 | 3877 | 1.5% |
-| `ext/opcache` | 157 | 916 | 17.1% |
-| `core` | 32 | 868 | 3.7% |
+| `ext/opcache` | 163 | 916 | 17.8% |
+| `core` | 37 | 868 | 4.3% |
 | `ext/dom` | 6 | 868 | 0.7% |
 | `ext/spl` | 0 | 796 | 0.0% |
 | `ext/date` | 0 | 689 | 0.0% |
@@ -107,7 +107,7 @@ The ladder to **"WordPress boots in the browser"**. Each rung is measured agains
 - [x] **v4b — User-defined functions.** `function` decls, params (+ defaults), `return`, isolated call scope, recursion.
 - [x] **v5 — Arrays.** Ordered-map arrays, `[...]`/`array()` literals, index read/write/append, `foreach`, `var_dump`/`print_r`/`var_export` of arrays, and `count`/`in_array`/`implode`/`explode`/`array_keys`/`array_values`/`array_merge`/`range`/… builtins.
 - [x] **v6 — Ternary `?:` / null-coalescing `??` + string builtins** (`sprintf`/`printf`, `substr`, `str_replace`).
-- [ ] **v3c — `switch`.** Deferred from v3.
+- [x] **v3c — `switch`.** case/default with fall-through.
 - [ ] **v6 — Classes.** Classes, interfaces, traits — the OOP WordPress actually uses.
 - [ ] **v7 — pcre / mbstring.** Regex + Unicode. (Here be dragons.)
 - [ ] **v8 — Request lifecycle.** Superglobals, output buffering, the Playground host interface.

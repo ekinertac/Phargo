@@ -454,6 +454,7 @@ impl Engine {
                 "do" => return self.do_while_statement(),
                 "for" => return self.for_statement(),
                 "foreach" => return self.foreach_statement(),
+                "switch" => return self.switch_statement(),
                 "function" => return self.function_decl(),
                 "return" => return self.return_statement(),
                 "break" => return self.break_continue(true),
@@ -847,6 +848,137 @@ impl Engine {
             }
         }
         Ok(Flow::Normal)
+    }
+
+    fn switch_statement(&mut self) -> R<Flow> {
+        let subject = self.paren_expr()?;
+        self.skip_ws();
+        if self.peek() != Some('{') {
+            return Err(EngineError("expected `{` after switch(...)".into()));
+        }
+        self.pos += 1;
+        let mut matched = false;
+        let mut default_pos: Option<usize> = None;
+        loop {
+            self.tick()?;
+            self.skip_ws();
+            match self.peek() {
+                Some('}') => {
+                    self.pos += 1;
+                    break;
+                }
+                None => return Err(EngineError("unterminated switch".into())),
+                _ => {}
+            }
+            let save = self.pos;
+            let kw = self.try_identifier().map(|s| s.to_ascii_lowercase());
+            match kw.as_deref() {
+                Some("case") => {
+                    // Only evaluate the case value while still looking for a match.
+                    if !matched && self.live {
+                        let cv = self.expression()?;
+                        self.consume_case_colon()?;
+                        if loose_eq(&subject, &cv) {
+                            matched = true;
+                        }
+                    } else {
+                        let prev = self.live;
+                        self.live = false;
+                        let _ = self.expression()?;
+                        self.live = prev;
+                        self.consume_case_colon()?;
+                    }
+                }
+                Some("default") => {
+                    self.consume_case_colon()?;
+                    default_pos = Some(self.pos);
+                }
+                _ => {
+                    self.pos = save;
+                    let prev = self.live;
+                    self.live = prev && matched;
+                    let f = self.statement()?;
+                    self.live = prev;
+                    if let Some(flow) = self.switch_flow(f)? {
+                        return Ok(flow);
+                    }
+                }
+            }
+        }
+        // No case matched → run default (with fall-through) if there is one.
+        if !matched && self.live {
+            if let Some(dp) = default_pos {
+                return self.run_switch_from(dp);
+            }
+        }
+        Ok(Flow::Normal)
+    }
+
+    /// Execute switch statements from `pos` (used for `default` on no match),
+    /// skipping any `case`/`default` labels, until `break`/`}`.
+    fn run_switch_from(&mut self, pos: usize) -> R<Flow> {
+        self.pos = pos;
+        loop {
+            self.tick()?;
+            self.skip_ws();
+            match self.peek() {
+                Some('}') => {
+                    self.pos += 1;
+                    return Ok(Flow::Normal);
+                }
+                None => return Err(EngineError("unterminated switch".into())),
+                _ => {}
+            }
+            let save = self.pos;
+            let kw = self.try_identifier().map(|s| s.to_ascii_lowercase());
+            match kw.as_deref() {
+                Some("case") => {
+                    let prev = self.live;
+                    self.live = false;
+                    let _ = self.expression()?;
+                    self.live = prev;
+                    self.consume_case_colon()?;
+                }
+                Some("default") => self.consume_case_colon()?,
+                _ => {
+                    self.pos = save;
+                    let f = self.statement()?;
+                    if let Some(flow) = self.switch_flow(f)? {
+                        return Ok(flow);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Map a body statement's Flow inside a switch: Some(flow) exits the switch
+    /// (consuming the rest of the block), None continues.
+    fn switch_flow(&mut self, f: Flow) -> R<Option<Flow>> {
+        match f {
+            Flow::Normal => Ok(None),
+            Flow::Break(n) => {
+                self.skip_to_block_end()?;
+                Ok(Some(if n > 1 { Flow::Break(n - 1) } else { Flow::Normal }))
+            }
+            Flow::Continue(n) => {
+                self.skip_to_block_end()?;
+                Ok(Some(if n > 1 { Flow::Continue(n - 1) } else { Flow::Normal }))
+            }
+            Flow::Return => {
+                self.skip_to_block_end()?;
+                Ok(Some(Flow::Return))
+            }
+        }
+    }
+
+    fn consume_case_colon(&mut self) -> R<()> {
+        self.skip_ws();
+        if self.peek() == Some(':') || self.peek() == Some(';') {
+            self.pos += 1;
+            Ok(())
+        } else {
+            Err(EngineError("expected `:` after case/default".into()))
+        }
     }
 
     // ---- expression parsing ------------------------------------------------
