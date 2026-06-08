@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Vendored upstream PHP test corpus — reproduce with: scripts/fetch-corpus.sh
+/vendor
