@@ -83,6 +83,9 @@ impl Obj {
             self.props.push((k.to_string(), v));
         }
     }
+    fn remove(&mut self, k: &str) {
+        self.props.retain(|(n, _)| n != k);
+    }
 }
 
 type ObjRef = Rc<RefCell<Obj>>;
@@ -156,6 +159,13 @@ impl PArray {
         self.entries.push((k, v));
         self.next_index += 1;
         self.ensure_index();
+    }
+    fn remove(&mut self, k: &AKey) {
+        if let Some(pos) = self.entries.iter().position(|(ek, _)| ek == k) {
+            self.entries.remove(pos);
+            self.index = None; // entry indices shifted — rebuild lazily
+            self.ensure_index();
+        }
     }
 }
 
@@ -2284,6 +2294,44 @@ impl Engine {
                     "true" => Ok(Value::Bool(true)),
                     "false" => Ok(Value::Bool(false)),
                     "null" => Ok(Value::Null),
+                    "isset" => {
+                        self.expect_char('(')?;
+                        let mut all = true;
+                        loop {
+                            let v = self.lvalue_value()?;
+                            if !matches!(&v, Some(x) if !matches!(x, Value::Null)) {
+                                all = false;
+                            }
+                            self.skip_ws();
+                            if self.peek() == Some(',') {
+                                self.pos += 1;
+                                continue;
+                            }
+                            break;
+                        }
+                        self.expect_char(')')?;
+                        Ok(Value::Bool(self.live && all))
+                    }
+                    "empty" => {
+                        self.expect_char('(')?;
+                        let v = self.lvalue_value()?.unwrap_or(Value::Null);
+                        self.expect_char(')')?;
+                        Ok(Value::Bool(!to_bool(&v)))
+                    }
+                    "unset" => {
+                        self.expect_char('(')?;
+                        loop {
+                            self.unset_one()?;
+                            self.skip_ws();
+                            if self.peek() == Some(',') {
+                                self.pos += 1;
+                                continue;
+                            }
+                            break;
+                        }
+                        self.expect_char(')')?;
+                        Ok(Value::Null)
+                    }
                     "new" => {
                         self.skip_ws();
                         if self.peek() == Some('\\') {
@@ -2426,6 +2474,87 @@ impl Engine {
             i += 1;
         }
         Ok(cur)
+    }
+
+    /// Resolve a variable + index/prop chain for `isset`/`empty` without
+    /// erroring on undefined (returns `None` if any level is missing).
+    fn lvalue_value(&mut self) -> R<Option<Value>> {
+        self.skip_ws();
+        if self.peek() != Some('$') {
+            return Ok(Some(self.expression()?)); // empty() allows any expression
+        }
+        let name = self.parse_variable_name()?;
+        let mut cur: Option<Value> = if self.live {
+            self.vars.get(&name).cloned()
+        } else {
+            None
+        };
+        loop {
+            let after = self.pos;
+            self.skip_ws();
+            if self.peek() == Some('[') {
+                self.pos += 1;
+                self.skip_ws();
+                let k = self.expression()?;
+                self.expect_char(']')?;
+                let key = key_from_value(&k);
+                cur = match cur {
+                    Some(Value::Array(a)) => a.get(&key).cloned(),
+                    _ => None,
+                };
+            } else if self.starts_with("->") {
+                self.pos += 2;
+                self.skip_ws();
+                let prop = self
+                    .try_identifier()
+                    .ok_or_else(|| EngineError("expected property after `->`".into()))?;
+                cur = match cur {
+                    Some(Value::Object(o)) => o.borrow().get(&prop),
+                    _ => None,
+                };
+            } else {
+                self.pos = after;
+                break;
+            }
+        }
+        Ok(cur)
+    }
+
+    /// Parse and remove a single `unset()` target (`$x`, `$a[k]`, `$o->p`).
+    fn unset_one(&mut self) -> R<()> {
+        self.skip_ws();
+        if self.peek() != Some('$') {
+            let _ = self.expression()?;
+            return Ok(());
+        }
+        let name = self.parse_variable_name()?;
+        self.skip_ws();
+        if self.peek() == Some('[') {
+            self.pos += 1;
+            self.skip_ws();
+            let k = self.expression()?;
+            self.expect_char(']')?;
+            if self.live {
+                let key = key_from_value(&k);
+                if let Some(Value::Array(a)) = self.vars.get_mut(&name) {
+                    a.remove(&key);
+                }
+            }
+        } else if self.starts_with("->") {
+            self.pos += 2;
+            self.skip_ws();
+            let prop = self
+                .try_identifier()
+                .ok_or_else(|| EngineError("expected property after `->`".into()))?;
+            if self.live {
+                if let Some(Value::Object(o)) = self.vars.get(&name) {
+                    o.borrow_mut().remove(&prop);
+                }
+            }
+        } else if self.live {
+            self.vars.remove(&name);
+        }
+        Ok(())
     }
 
     /// Read `$name` then a run of index keys by reference, cloning only the leaf.
