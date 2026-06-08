@@ -911,6 +911,147 @@ impl Engine {
         Ok(v)
     }
 
+    /// Parse a `( arg, arg, … )` argument list, evaluating each argument.
+    fn parse_args(&mut self) -> R<Vec<Value>> {
+        self.expect_char('(')?;
+        let mut args = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(')') {
+            self.pos += 1;
+            return Ok(args);
+        }
+        loop {
+            args.push(self.expression()?);
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.pos += 1;
+                    self.skip_ws();
+                }
+                Some(')') => {
+                    self.pos += 1;
+                    break;
+                }
+                other => {
+                    return Err(EngineError(format!("expected `,` or `)`, found {other:?}")))
+                }
+            }
+        }
+        Ok(args)
+    }
+
+    /// Dispatch a built-in function. User-defined functions come in v4b.
+    fn call_function(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
+        if !self.live {
+            return Ok(Value::Null);
+        }
+        let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);
+        let v = match name.to_ascii_lowercase().as_str() {
+            "var_dump" => {
+                let mut s = String::new();
+                for a in &args {
+                    s.push_str(&var_dump_str(a));
+                }
+                self.out.push_str(&s);
+                Value::Null
+            }
+            "print_r" => {
+                let s = print_r_str(&arg(0));
+                if to_bool(&arg(1)) {
+                    Value::Str(s)
+                } else {
+                    self.out.push_str(&s);
+                    Value::Bool(true)
+                }
+            }
+            "var_export" => {
+                let s = var_export_str(&arg(0));
+                if to_bool(&arg(1)) {
+                    Value::Str(s)
+                } else {
+                    self.out.push_str(&s);
+                    Value::Null
+                }
+            }
+            "gettype" => Value::Str(php_type_name(&arg(0)).to_string()),
+            "strlen" => Value::Int(arg(0).to_php_string().len() as i64),
+            "strtoupper" => Value::Str(arg(0).to_php_string().to_ascii_uppercase()),
+            "strtolower" => Value::Str(arg(0).to_php_string().to_ascii_lowercase()),
+            "trim" => Value::Str(arg(0).to_php_string().trim().to_string()),
+            "ltrim" => Value::Str(arg(0).to_php_string().trim_start().to_string()),
+            "rtrim" | "chop" => Value::Str(arg(0).to_php_string().trim_end().to_string()),
+            "ucfirst" => Value::Str(ucfirst(&arg(0).to_php_string())),
+            "lcfirst" => Value::Str(lcfirst(&arg(0).to_php_string())),
+            "strrev" => Value::Str(arg(0).to_php_string().chars().rev().collect()),
+            "str_repeat" => {
+                Value::Str(arg(0).to_php_string().repeat(to_long(&arg(1)).max(0) as usize))
+            }
+            "ord" => Value::Int(arg(0).to_php_string().bytes().next().unwrap_or(0) as i64),
+            "chr" => Value::Str((to_long(&arg(0)).rem_euclid(256) as u8 as char).to_string()),
+            "strpos" => {
+                let (h, n) = (arg(0).to_php_string(), arg(1).to_php_string());
+                match h.find(&n) {
+                    Some(i) => Value::Int(i as i64),
+                    None => Value::Bool(false),
+                }
+            }
+            "abs" => match to_num(&arg(0)) {
+                Num::I(n) => Value::Int(n.wrapping_abs()),
+                Num::F(x) => Value::Float(x.abs()),
+            },
+            "floor" => Value::Float(to_f64(&arg(0)).floor()),
+            "ceil" => Value::Float(to_f64(&arg(0)).ceil()),
+            "sqrt" => Value::Float(to_f64(&arg(0)).sqrt()),
+            "round" => {
+                let f = 10f64.powi(to_long(&arg(1)) as i32);
+                Value::Float((to_f64(&arg(0)) * f).round() / f)
+            }
+            "intdiv" => {
+                let b = to_long(&arg(1));
+                if b == 0 {
+                    return Err(EngineError("Division by zero".into()));
+                }
+                Value::Int(to_long(&arg(0)) / b)
+            }
+            "pow" => self.apply_binary("**", arg(0), arg(1))?,
+            "max" => {
+                if compare(&arg(0), &arg(1)) == Ordering::Less {
+                    arg(1)
+                } else {
+                    arg(0)
+                }
+            }
+            "min" => {
+                if compare(&arg(0), &arg(1)) == Ordering::Greater {
+                    arg(1)
+                } else {
+                    arg(0)
+                }
+            }
+            "intval" => Value::Int(to_long(&arg(0))),
+            "floatval" | "doubleval" => Value::Float(to_f64(&arg(0))),
+            "strval" => Value::Str(arg(0).to_php_string()),
+            "boolval" => Value::Bool(to_bool(&arg(0))),
+            "is_int" | "is_integer" | "is_long" => Value::Bool(matches!(arg(0), Value::Int(_))),
+            "is_float" | "is_double" => Value::Bool(matches!(arg(0), Value::Float(_))),
+            "is_string" => Value::Bool(matches!(arg(0), Value::Str(_))),
+            "is_bool" => Value::Bool(matches!(arg(0), Value::Bool(_))),
+            "is_null" => Value::Bool(matches!(arg(0), Value::Null)),
+            "is_numeric" => Value::Bool(match arg(0) {
+                Value::Int(_) | Value::Float(_) => true,
+                Value::Str(s) => is_numeric_str(&s),
+                _ => false,
+            }),
+            "is_scalar" => Value::Bool(matches!(
+                arg(0),
+                Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_)
+            )),
+            "is_array" | "is_object" | "is_callable" => Value::Bool(false),
+            _ => return Err(EngineError(format!("unknown function `{name}()`"))),
+        };
+        Ok(v)
+    }
+
     fn primary(&mut self) -> R<Value> {
         self.skip_ws();
         match self.peek() {
@@ -935,9 +1076,19 @@ impl Engine {
                     "true" => Ok(Value::Bool(true)),
                     "false" => Ok(Value::Bool(false)),
                     "null" => Ok(Value::Null),
-                    _ => Err(EngineError(format!(
-                        "v3b cannot use identifier `{id}` in an expression yet"
-                    ))),
+                    _ => {
+                        let after = self.pos;
+                        self.skip_ws();
+                        if self.peek() == Some('(') {
+                            let args = self.parse_args()?;
+                            self.call_function(&id, args)
+                        } else {
+                            self.pos = after;
+                            Err(EngineError(format!(
+                                "bare identifier `{id}` (constants/user functions not yet supported)"
+                            )))
+                        }
+                    }
                 }
             }
             other => Err(EngineError(format!(
@@ -1126,5 +1277,66 @@ fn apply_f(op: &str, x: f64, y: f64) -> f64 {
         "-" => x - y,
         "*" => x * y,
         _ => f64::NAN,
+    }
+}
+
+// ---- built-in output / formatting helpers ----------------------------------
+
+fn php_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "NULL",
+        Value::Bool(_) => "boolean",
+        Value::Int(_) => "integer",
+        Value::Float(_) => "double",
+        Value::Str(_) => "string",
+    }
+}
+
+/// `var_dump` output for one scalar value (with trailing newline).
+fn var_dump_str(v: &Value) -> String {
+    match v {
+        Value::Int(n) => format!("int({n})\n"),
+        Value::Float(x) => format!("float({})\n", format_php_float(*x)),
+        Value::Bool(b) => format!("bool({})\n", if *b { "true" } else { "false" }),
+        Value::Str(s) => format!("string({}) \"{}\"\n", s.len(), s),
+        Value::Null => "NULL\n".to_string(),
+    }
+}
+
+/// `print_r` of a scalar is just its string form.
+fn print_r_str(v: &Value) -> String {
+    v.to_php_string()
+}
+
+fn var_export_str(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".to_string(),
+        Value::Bool(b) => if *b { "true".into() } else { "false".into() },
+        Value::Int(n) => n.to_string(),
+        Value::Float(x) => {
+            let s = format_php_float(*x);
+            if s.contains(['.', 'e', 'E', 'N', 'I']) {
+                s
+            } else {
+                format!("{s}.0") // var_export keeps floats float-looking: 1 -> 1.0
+            }
+        }
+        Value::Str(s) => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'")),
+    }
+}
+
+fn ucfirst(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+fn lcfirst(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
+        None => String::new(),
     }
 }
