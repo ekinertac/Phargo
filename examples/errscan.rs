@@ -79,10 +79,13 @@ fn scan() {
                 Ok(Err(e)) => format!("{e:?}"),
                 _ => continue,
             };
-            if !msg.contains(&bucket) {
+            if bucket != "RAW" && !msg.contains(&bucket) {
                 continue;
             }
-            if let (Some(a), Some(b)) = (msg.find('`'), msg.rfind('`')) {
+            if bucket == "RAW" {
+                let m = msg.replace(['\n', '\r'], " ");
+                *detail.entry(m.chars().take(75).collect()).or_insert(0) += 1;
+            } else if let (Some(a), Some(b)) = (msg.find('`'), msg.rfind('`')) {
                 if b > a {
                     *detail.entry(msg[a + 1..b].to_string()).or_insert(0) += 1;
                 }
