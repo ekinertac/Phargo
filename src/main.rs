@@ -439,6 +439,7 @@ const ROADMAP: &str = r#"The ladder to **"WordPress boots in the browser"**. Eac
 - [x] **v14 — JSON.** `json_encode` (lists→arrays, maps/objects→objects, scalars) and `json_decode` (assoc arrays, or `stdClass` objects).
 - [x] **v15 — By-reference array fns.** `sort`/`rsort`/`asort`/`arsort`/`ksort`/`krsort`/`usort`/`uasort`/`uksort` and `array_push`/`array_pop`/`array_shift`/`array_unshift` (mutate the caller's array in place).
 - [x] **v16 — More builtins.** `array_fill`/`array_fill_keys`/`array_combine`/`array_column`/`array_pad`/`array_product`/`array_key_first`/`array_key_last`/`array_diff`/`array_intersect`, `ctype_*`, `substr_count`, `str_word_count`.
+- [x] **v17 — `match` expression.** Strict `===` arms, multi-condition arms, `default`, `UnhandledMatchError` on no match.
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)

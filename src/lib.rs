@@ -3349,6 +3349,102 @@ impl Engine {
         Ok(v)
     }
 
+    /// `match (subject) { c1, c2 => r, ..., default => r }` — an expression
+    /// using strict `===`; throws UnhandledMatchError if nothing matches.
+    fn match_expression(&mut self) -> R<Value> {
+        self.expect_char('(')?;
+        let subject = self.expression()?;
+        self.expect_char(')')?;
+        self.skip_ws();
+        if self.peek() != Some('{') {
+            return Err(EngineError("expected `{` after match(...)".into()));
+        }
+        self.pos += 1;
+        let mut found = false;
+        let mut result = Value::Null;
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some('}') => {
+                    self.pos += 1;
+                    break;
+                }
+                None => return Err(EngineError("unterminated match".into())),
+                _ => {}
+            }
+            let save = self.pos;
+            let mut is_default = false;
+            if self.try_identifier().map(|s| s.to_ascii_lowercase()).as_deref() == Some("default") {
+                self.skip_ws();
+                if self.starts_with("=>") {
+                    is_default = true;
+                } else {
+                    self.pos = save;
+                }
+            } else {
+                self.pos = save;
+            }
+            let arm_matches = if is_default {
+                !found
+            } else {
+                let mut m = false;
+                loop {
+                    let cond = if found {
+                        let prev = self.live;
+                        self.live = false;
+                        let v = self.expression()?;
+                        self.live = prev;
+                        v
+                    } else {
+                        self.expression()?
+                    };
+                    if !found && self.live && strict_eq(&subject, &cond) {
+                        m = true;
+                    }
+                    self.skip_ws();
+                    if self.peek() == Some(',') {
+                        self.pos += 1;
+                        self.skip_ws();
+                        if self.starts_with("=>") {
+                            break;
+                        }
+                        continue;
+                    }
+                    break;
+                }
+                m
+            };
+            self.skip_ws();
+            if !self.starts_with("=>") {
+                return Err(EngineError("expected `=>` in match arm".into()));
+            }
+            self.pos += 2;
+            self.skip_ws();
+            if arm_matches && !found {
+                found = true;
+                result = self.expression()?;
+            } else {
+                let prev = self.live;
+                self.live = false;
+                let _ = self.expression()?;
+                self.live = prev;
+            }
+            self.skip_ws();
+            if self.peek() == Some(',') {
+                self.pos += 1;
+            }
+        }
+        if !found && self.live {
+            let exc = self.instantiate(
+                "UnhandledMatchError",
+                vec![Value::Str("Unhandled match case".to_string())],
+            )?;
+            self.thrown = Some(exc);
+            return Err(EngineError("unhandled match".into()));
+        }
+        Ok(result)
+    }
+
     fn resolve_class(&self, id: &str) -> R<String> {
         match id.to_ascii_lowercase().as_str() {
             "self" | "static" => self
@@ -3539,6 +3635,7 @@ impl Engine {
                     }
                     "function" => self.parse_closure(false),
                     "fn" => self.parse_closure(true),
+                    "match" => self.match_expression(),
                     "new" => {
                         self.skip_ws();
                         if self.peek() == Some('\\') {
