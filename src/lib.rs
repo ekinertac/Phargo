@@ -1460,6 +1460,132 @@ impl Engine {
                     Value::Str(subject.replace(&search, &replace))
                 }
             }
+            "str_contains" => {
+                Value::Bool(arg(0).to_php_string().contains(&arg(1).to_php_string()))
+            }
+            "str_starts_with" => {
+                Value::Bool(arg(0).to_php_string().starts_with(&arg(1).to_php_string()))
+            }
+            "str_ends_with" => {
+                Value::Bool(arg(0).to_php_string().ends_with(&arg(1).to_php_string()))
+            }
+            "ucwords" => {
+                let mut out = String::new();
+                let mut cap = true;
+                for c in arg(0).to_php_string().chars() {
+                    if cap && c.is_alphabetic() {
+                        out.extend(c.to_uppercase());
+                    } else {
+                        out.push(c);
+                    }
+                    cap = c.is_whitespace();
+                }
+                Value::Str(out)
+            }
+            "str_split" => {
+                let n = if args.len() >= 2 {
+                    to_long(&arg(1)).max(1) as usize
+                } else {
+                    1
+                };
+                let chars: Vec<char> = arg(0).to_php_string().chars().collect();
+                let mut r = PArray::default();
+                if chars.is_empty() {
+                    r.push(Value::Str(String::new()));
+                } else {
+                    for chunk in chars.chunks(n) {
+                        r.push(Value::Str(chunk.iter().collect()));
+                    }
+                }
+                Value::Array(r)
+            }
+            "str_pad" => {
+                let s = arg(0).to_php_string();
+                let len = (to_long(&arg(1)).max(0) as usize).min(10_000_000);
+                let padstr = if args.len() >= 3 {
+                    arg(2).to_php_string()
+                } else {
+                    " ".to_string()
+                };
+                let ptype = if args.len() >= 4 { to_long(&arg(3)) } else { 1 };
+                let cur = s.chars().count();
+                if cur >= len || padstr.is_empty() {
+                    Value::Str(s)
+                } else {
+                    let total = len - cur;
+                    let make = |n: usize| -> String { padstr.chars().cycle().take(n).collect() };
+                    match ptype {
+                        0 => Value::Str(format!("{}{}", make(total), s)), // STR_PAD_LEFT
+                        2 => {
+                            let l = total / 2;
+                            Value::Str(format!("{}{}{}", make(l), s, make(total - l)))
+                        }
+                        _ => Value::Str(format!("{}{}", s, make(total))), // STR_PAD_RIGHT
+                    }
+                }
+            }
+            "number_format" => {
+                let n = to_f64(&arg(0));
+                let dec = if args.len() >= 2 {
+                    to_long(&arg(1)).clamp(0, 100) as usize
+                } else {
+                    0
+                };
+                let dp = if args.len() >= 3 {
+                    arg(2).to_php_string()
+                } else {
+                    ".".to_string()
+                };
+                let ts = if args.len() >= 4 {
+                    arg(3).to_php_string()
+                } else {
+                    ",".to_string()
+                };
+                let formatted = format!("{:.*}", dec, n.abs());
+                let (int_part, frac_part) = match formatted.split_once('.') {
+                    Some((a, b)) => (a.to_string(), b.to_string()),
+                    None => (formatted.clone(), String::new()),
+                };
+                let digits: Vec<char> = int_part.chars().collect();
+                let mut grouped = String::new();
+                for (i, c) in digits.iter().enumerate() {
+                    if i > 0 && (digits.len() - i) % 3 == 0 {
+                        grouped.push_str(&ts);
+                    }
+                    grouped.push(*c);
+                }
+                let mut res = String::new();
+                let nonzero = grouped.chars().any(|c| c.is_ascii_digit() && c != '0')
+                    || frac_part.chars().any(|c| c != '0');
+                if n < 0.0 && nonzero {
+                    res.push('-');
+                }
+                res.push_str(&grouped);
+                if dec > 0 {
+                    res.push_str(&dp);
+                    res.push_str(&frac_part);
+                }
+                Value::Str(res)
+            }
+            "dechex" => Value::Str(format!("{:x}", to_long(&arg(0)))),
+            "decbin" => Value::Str(format!("{:b}", to_long(&arg(0)))),
+            "decoct" => Value::Str(format!("{:o}", to_long(&arg(0)))),
+            "hexdec" => Value::Int(
+                i64::from_str_radix(arg(0).to_php_string().trim_start_matches("0x"), 16).unwrap_or(0),
+            ),
+            "bindec" => Value::Int(i64::from_str_radix(&arg(0).to_php_string(), 2).unwrap_or(0)),
+            "octdec" => Value::Int(i64::from_str_radix(&arg(0).to_php_string(), 8).unwrap_or(0)),
+            "pi" => Value::Float(std::f64::consts::PI),
+            "htmlspecialchars" => {
+                let s = arg(0).to_php_string();
+                Value::Str(
+                    s.replace('&', "&amp;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;")
+                        .replace('"', "&quot;")
+                        .replace('\'', "&#039;"),
+                )
+            }
             "abs" => match to_num(&arg(0)) {
                 Num::I(n) => Value::Int(n.wrapping_abs()),
                 Num::F(x) => Value::Float(x.abs()),
@@ -1479,20 +1605,8 @@ impl Engine {
                 Value::Int(to_long(&arg(0)) / b)
             }
             "pow" => self.apply_binary("**", arg(0), arg(1))?,
-            "max" => {
-                if compare(&arg(0), &arg(1)) == Ordering::Less {
-                    arg(1)
-                } else {
-                    arg(0)
-                }
-            }
-            "min" => {
-                if compare(&arg(0), &arg(1)) == Ordering::Greater {
-                    arg(1)
-                } else {
-                    arg(0)
-                }
-            }
+            "max" => array_extreme(&args, true),
+            "min" => array_extreme(&args, false),
             "intval" => Value::Int(to_long(&arg(0))),
             "floatval" | "doubleval" => Value::Float(to_f64(&arg(0))),
             "strval" => Value::Str(arg(0).to_php_string()),
@@ -1818,9 +1932,10 @@ impl Engine {
                             self.call_function(&id, args)
                         } else {
                             self.pos = after;
-                            Err(EngineError(format!(
-                                "bare identifier `{id}` (constants/user functions not yet supported)"
-                            )))
+                            match php_constant(&id) {
+                                Some(v) => Ok(v),
+                                None => Err(EngineError(format!("undefined constant `{id}`"))),
+                            }
                         }
                     }
                 }
@@ -2266,6 +2381,70 @@ fn lcfirst(s: &str) -> String {
         Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
         None => String::new(),
     }
+}
+
+/// Well-known PHP constants (case-sensitive).
+fn php_constant(name: &str) -> Option<Value> {
+    Some(match name {
+        "PHP_EOL" => Value::Str("\n".into()),
+        "PHP_INT_MAX" => Value::Int(i64::MAX),
+        "PHP_INT_MIN" => Value::Int(i64::MIN),
+        "PHP_INT_SIZE" => Value::Int(8),
+        "PHP_FLOAT_EPSILON" => Value::Float(f64::EPSILON),
+        "PHP_FLOAT_MAX" => Value::Float(f64::MAX),
+        "PHP_FLOAT_MIN" => Value::Float(f64::MIN_POSITIVE),
+        "PHP_VERSION" => Value::Str("8.3.0".into()),
+        "PHP_MAJOR_VERSION" => Value::Int(8),
+        "PHP_OS" => Value::Str("Linux".into()),
+        "PHP_OS_FAMILY" => Value::Str("Linux".into()),
+        "M_PI" => Value::Float(std::f64::consts::PI),
+        "M_E" => Value::Float(std::f64::consts::E),
+        "M_SQRT2" => Value::Float(std::f64::consts::SQRT_2),
+        "NAN" => Value::Float(f64::NAN),
+        "INF" => Value::Float(f64::INFINITY),
+        "STR_PAD_RIGHT" => Value::Int(1),
+        "STR_PAD_LEFT" => Value::Int(0),
+        "STR_PAD_BOTH" => Value::Int(2),
+        "COUNT_NORMAL" => Value::Int(0),
+        "COUNT_RECURSIVE" => Value::Int(1),
+        "E_ALL" => Value::Int(32767),
+        "E_WARNING" => Value::Int(2),
+        "E_NOTICE" => Value::Int(8),
+        "E_ERROR" => Value::Int(1),
+        _ => return None,
+    })
+}
+
+/// `max`/`min` over either a single array argument or the full argument list.
+fn array_extreme(args: &[Value], want_max: bool) -> Value {
+    let candidates: Vec<Value> = if args.len() == 1 {
+        match &args[0] {
+            Value::Array(a) => a.entries.iter().map(|(_, v)| v.clone()).collect(),
+            other => vec![other.clone()],
+        }
+    } else {
+        args.to_vec()
+    };
+    let mut best: Option<Value> = None;
+    for v in candidates {
+        best = Some(match best {
+            None => v,
+            Some(b) => {
+                let ord = compare(&v, &b);
+                let take = if want_max {
+                    ord == Ordering::Greater
+                } else {
+                    ord == Ordering::Less
+                };
+                if take {
+                    v
+                } else {
+                    b
+                }
+            }
+        });
+    }
+    best.unwrap_or(Value::Bool(false))
 }
 
 /// A pragmatic `sprintf`: flags `-0+ '`, width, `.precision`, and the

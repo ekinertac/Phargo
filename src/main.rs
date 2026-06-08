@@ -427,6 +427,9 @@ const ROADMAP: &str = r#"The ladder to **"WordPress boots in the browser"**. Eac
 - [ ] **v9 — pdo_sqlite.** WordPress-in-Playground runs on SQLite, not MySQL.
 - [ ] **🎯 WordPress boots in the browser** (compiled to WASM, smaller than the Emscripten build).
 
+- [x] **v7 — Constants + more builtins.** `PHP_EOL`/`PHP_INT_MAX`/`M_PI`/`STR_PAD_*`/…, `str_contains`/`str_starts_with`/`str_ends_with`, `str_pad`, `str_split`, `ucwords`, `number_format`, `dechex`/`hexdec`/…, `htmlspecialchars`, variadic/array `max`/`min`.
+- [ ] **v8 — Classes.** Objects, `$this`, `new`, `->`, methods, properties, visibility, inheritance, static. (Big — next major rung.)
+
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)
 - [ ] honor `--SKIPIF--` / `--EXTENSIONS--`

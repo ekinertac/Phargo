@@ -4,24 +4,24 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 338 / 21862  (1.55% of the entire PHP test suite)**
+**`.phpt` pass rate: 362 / 21862  (1.66% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 1.55%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 1.66%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 338 | 21458 | 66 | 21862 |
+| 362 | 21434 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 45/45 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 46/46 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 56 | 5329 | 1.1% |
-| `ext/standard` | 57 | 3877 | 1.5% |
-| `ext/opcache` | 163 | 916 | 17.8% |
-| `core` | 37 | 868 | 4.3% |
+| `Zend` | 57 | 5329 | 1.1% |
+| `ext/standard` | 75 | 3877 | 1.9% |
+| `ext/opcache` | 167 | 916 | 18.2% |
+| `core` | 38 | 868 | 4.4% |
 | `ext/dom` | 6 | 868 | 0.7% |
 | `ext/spl` | 0 | 796 | 0.0% |
 | `ext/date` | 0 | 689 | 0.0% |
@@ -113,6 +113,9 @@ The ladder to **"WordPress boots in the browser"**. Each rung is measured agains
 - [ ] **v8 — Request lifecycle.** Superglobals, output buffering, the Playground host interface.
 - [ ] **v9 — pdo_sqlite.** WordPress-in-Playground runs on SQLite, not MySQL.
 - [ ] **🎯 WordPress boots in the browser** (compiled to WASM, smaller than the Emscripten build).
+
+- [x] **v7 — Constants + more builtins.** `PHP_EOL`/`PHP_INT_MAX`/`M_PI`/`STR_PAD_*`/…, `str_contains`/`str_starts_with`/`str_ends_with`, `str_pad`, `str_split`, `ucwords`, `number_format`, `dechex`/`hexdec`/…, `htmlspecialchars`, variadic/array `max`/`min`.
+- [ ] **v8 — Classes.** Objects, `$this`, `new`, `->`, methods, properties, visibility, inheritance, static. (Big — next major rung.)
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)
