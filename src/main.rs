@@ -446,6 +446,7 @@ const ROADMAP: &str = r#"The ladder to **"WordPress boots in the browser"**. Eac
 - [x] **v21 — Heredoc / nowdoc.** `<<<EOT` (interpolated) and `<<<'EOT'` (raw), with flexible (indented) closing markers.
 - [x] **v22 — Array destructuring.** `[$a, $b] = …` / `list($a, , $c) = …`, with skipped slots and nesting.
 - [x] **v23 — Hashing / encoding.** `md5`, `crc32`, `base64_encode`/`base64_decode`, `bin2hex`/`hex2bin` (from-scratch algorithms).
+- [x] **v24 — `sha1` + `hash()`.** From-scratch `sha1`; `hash('md5'|'sha1'|'crc32b', …)` dispatcher; `hash_equals`.
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)

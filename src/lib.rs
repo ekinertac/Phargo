@@ -2720,7 +2720,22 @@ impl Engine {
                 Value::Str(out)
             }
             "md5" => Value::Str(md5_hex(arg(0).to_php_string().as_bytes())),
+            "sha1" => Value::Str(sha1_hex(arg(0).to_php_string().as_bytes())),
             "crc32" => Value::Int(crc32(arg(0).to_php_string().as_bytes()) as i64),
+            "hash" => {
+                let algo = arg(0).to_php_string().to_ascii_lowercase();
+                let bytes = arg(1).to_php_string();
+                let bytes = bytes.as_bytes();
+                match algo.as_str() {
+                    "md5" => Value::Str(md5_hex(bytes)),
+                    "sha1" => Value::Str(sha1_hex(bytes)),
+                    "crc32b" => Value::Str(format!("{:08x}", crc32(bytes))),
+                    _ => return Err(EngineError(format!("hash(): unknown algorithm `{algo}`"))),
+                }
+            }
+            "hash_equals" => {
+                Value::Bool(arg(0).to_php_string() == arg(1).to_php_string())
+            }
             "base64_encode" => Value::Str(base64_encode(arg(0).to_php_string().as_bytes())),
             "base64_decode" => {
                 Value::Str(String::from_utf8_lossy(&base64_decode(&arg(0).to_php_string())).into_owned())
@@ -4842,6 +4857,64 @@ fn md5_hex(msg: &[u8]) -> String {
         for byte in v.to_le_bytes() {
             out.push_str(&format!("{byte:02x}"));
         }
+    }
+    out
+}
+
+fn sha1_hex(msg: &[u8]) -> String {
+    let mut h: [u32; 5] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0];
+    let mut m = msg.to_vec();
+    let bits = (msg.len() as u64).wrapping_mul(8);
+    m.push(0x80);
+    while m.len() % 64 != 56 {
+        m.push(0);
+    }
+    m.extend_from_slice(&bits.to_be_bytes());
+    for chunk in m.chunks(64) {
+        let mut w = [0u32; 80];
+        for (i, wv) in w.iter_mut().take(16).enumerate() {
+            *wv = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, &wi) in w.iter().enumerate() {
+            let (f, k) = if i < 20 {
+                ((b & c) | (!b & d), 0x5A82_7999u32)
+            } else if i < 40 {
+                (b ^ c ^ d, 0x6ED9_EBA1)
+            } else if i < 60 {
+                ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC)
+            } else {
+                (b ^ c ^ d, 0xCA62_C1D6)
+            };
+            let tmp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = tmp;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+    let mut out = String::with_capacity(40);
+    for v in h {
+        out.push_str(&format!("{v:08x}"));
     }
     out
 }

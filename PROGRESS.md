@@ -4,22 +4,22 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 852 / 21862  (3.90% of the entire PHP test suite)**
+**`.phpt` pass rate: 855 / 21862  (3.91% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 3.91%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 3.92%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 852 | 20944 | 66 | 21862 |
+| 855 | 20941 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 64/64 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 65/65 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
 | `Zend` | 277 | 5329 | 5.2% |
-| `ext/standard` | 231 | 3877 | 6.0% |
+| `ext/standard` | 232 | 3877 | 6.0% |
 | `ext/opcache` | 224 | 916 | 24.5% |
 | `core` | 81 | 868 | 9.3% |
 | `ext/dom` | 6 | 868 | 0.7% |
@@ -57,7 +57,7 @@ _Curated smoke tests (dev guards, **not** in the number above): 64/64 passing._
 | `ext/sqlite3` | 0 | 97 | 0.0% |
 | `ext/pdo_sqlite` | 0 | 86 | 0.0% |
 | `ext/xsl` | 0 | 81 | 0.0% |
-| `ext/hash` | 0 | 80 | 0.0% |
+| `ext/hash` | 2 | 80 | 2.5% |
 | `ext/iconv` | 0 | 77 | 0.0% |
 | `ext/random` | 0 | 69 | 0.0% |
 | `sapi/phpdbg` | 0 | 69 | 0.0% |
@@ -131,6 +131,7 @@ The ladder to **"WordPress boots in the browser"**. Each rung is measured agains
 - [x] **v21 — Heredoc / nowdoc.** `<<<EOT` (interpolated) and `<<<'EOT'` (raw), with flexible (indented) closing markers.
 - [x] **v22 — Array destructuring.** `[$a, $b] = …` / `list($a, , $c) = …`, with skipped slots and nesting.
 - [x] **v23 — Hashing / encoding.** `md5`, `crc32`, `base64_encode`/`base64_decode`, `bin2hex`/`hex2bin` (from-scratch algorithms).
+- [x] **v24 — `sha1` + `hash()`.** From-scratch `sha1`; `hash('md5'|'sha1'|'crc32b', …)` dispatcher; `hash_equals`.
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)
