@@ -1813,6 +1813,15 @@ impl Engine {
             return Ok(nv);
         }
         match self.peek() {
+            Some('@') => {
+                // error-suppression operator: evaluate the operand, but turn any
+                // runtime error it raises into a silent null.
+                self.pos += 1;
+                match self.parse_unary() {
+                    Ok(v) => Ok(v),
+                    Err(_) => Ok(Value::Null),
+                }
+            }
             Some('!') => {
                 self.pos += 1;
                 let v = self.parse_unary()?;
@@ -4886,15 +4895,34 @@ impl Engine {
     }
 
     fn number(&mut self) -> Value {
+        // hex / binary / octal prefixes (with optional `_` digit separators)
+        if self.peek() == Some('0') {
+            let radix = match self.peek_at(1) {
+                Some('x' | 'X') => Some(16),
+                Some('b' | 'B') => Some(2),
+                Some('o' | 'O') => Some(8),
+                _ => None,
+            };
+            if let Some(r) = radix {
+                self.pos += 2;
+                let ds = self.pos;
+                while matches!(self.peek(), Some(c) if c.is_digit(r) || c == '_') {
+                    self.pos += 1;
+                }
+                let t: String = self.src[ds..self.pos].iter().filter(|c| **c != '_').collect();
+                return Value::Int(i64::from_str_radix(&t, r).unwrap_or(0));
+            }
+        }
         let start = self.pos;
-        while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+        let digit = |c: char| c.is_ascii_digit() || c == '_';
+        while matches!(self.peek(), Some(c) if digit(c)) {
             self.pos += 1;
         }
         let mut is_float = false;
         if self.peek() == Some('.') && matches!(self.peek_at(1), Some(c) if c.is_ascii_digit()) {
             is_float = true;
             self.pos += 1;
-            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+            while matches!(self.peek(), Some(c) if digit(c)) {
                 self.pos += 1;
             }
         }
@@ -4906,14 +4934,24 @@ impl Engine {
             }
             if matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
                 is_float = true;
-                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                while matches!(self.peek(), Some(c) if digit(c)) {
                     self.pos += 1;
                 }
             } else {
                 self.pos = save;
             }
         }
-        let text: String = self.src[start..self.pos].iter().collect();
+        let text: String = self.src[start..self.pos].iter().filter(|c| **c != '_').collect();
+        // legacy octal literal: a leading 0 followed by only octal digits
+        if !is_float
+            && text.len() > 1
+            && text.starts_with('0')
+            && text.chars().all(|c| ('0'..='7').contains(&c))
+        {
+            if let Ok(n) = i64::from_str_radix(&text, 8) {
+                return Value::Int(n);
+            }
+        }
         if is_float {
             Value::Float(text.parse::<f64>().unwrap_or(0.0))
         } else {
