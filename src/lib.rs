@@ -60,6 +60,8 @@ struct ClassDef {
     parent: Option<String>,
     /// (property name, default-expression position).
     props: Vec<(String, Option<usize>)>,
+    /// (constant name, value-expression position).
+    consts: Vec<(String, usize)>,
     /// Methods keyed by lowercased name.
     methods: HashMap<String, FuncDef>,
 }
@@ -400,6 +402,7 @@ pub fn run(source: &str) -> R<String> {
         steps: 0,
         funcs: HashMap::new(),
         classes: HashMap::new(),
+        current_class: None,
         return_val: None,
         call_depth: 0,
     };
@@ -421,6 +424,8 @@ struct Engine {
     funcs: HashMap<String, FuncDef>,
     /// User-defined classes, keyed by lowercased name.
     classes: HashMap<String, ClassDef>,
+    /// Class name of the currently executing method (for `self`/`parent`/`static`).
+    current_class: Option<String>,
     /// Value stashed by `return`, picked up by the active call frame.
     return_val: Option<Value>,
     /// Current function-call nesting depth (guards against stack overflow).
@@ -591,7 +596,8 @@ impl Engine {
         loop {
             let value = self.expression()?;
             if self.live {
-                self.out.push_str(&value.to_php_string());
+                let s = self.stringify(&value)?;
+                self.out.push_str(&s);
             }
             self.skip_ws();
             if self.peek() == Some(',') {
@@ -1867,7 +1873,7 @@ impl Engine {
             _ => {
                 let key = name.to_ascii_lowercase();
                 if let Some(func) = self.funcs.get(&key).cloned() {
-                    return self.call_user_function(func, args.clone(), None);
+                    return self.call_user_function(func, args.clone(), None, None);
                 }
                 return Err(EngineError(format!("unknown function `{name}()`")));
             }
@@ -2015,6 +2021,7 @@ impl Engine {
         }
         self.expect_char('{')?;
         let mut props: Vec<(String, Option<usize>)> = Vec::new();
+        let mut consts: Vec<(String, usize)> = Vec::new();
         let mut methods: HashMap<String, FuncDef> = HashMap::new();
         loop {
             self.skip_ws();
@@ -2052,15 +2059,37 @@ impl Engine {
                     let def = self.parse_callable_def()?;
                     methods.insert(mname.to_ascii_lowercase(), def);
                 }
-                "const" => {
-                    // const NAME = expr;  (parsed and ignored for now)
-                    while !matches!(self.peek(), Some(';') | None) {
+                "const" => loop {
+                    self.skip_ws();
+                    let mut cname = self
+                        .try_identifier()
+                        .ok_or_else(|| EngineError("expected const name".into()))?;
+                    self.skip_ws();
+                    // typed constant: `const TYPE NAME = ...`
+                    if matches!(self.peek(), Some(c) if c.is_ascii_alphabetic() || c == '_') {
+                        cname = self
+                            .try_identifier()
+                            .ok_or_else(|| EngineError("expected const name".into()))?;
+                        self.skip_ws();
+                    }
+                    self.expect_char('=')?;
+                    self.skip_ws();
+                    let cpos = self.pos;
+                    let prev = self.live;
+                    self.live = false;
+                    let _ = self.expression()?;
+                    self.live = prev;
+                    consts.push((cname, cpos));
+                    self.skip_ws();
+                    if self.peek() == Some(',') {
                         self.pos += 1;
+                        continue;
                     }
                     if self.peek() == Some(';') {
                         self.pos += 1;
                     }
-                }
+                    break;
+                },
                 "prop" => loop {
                     let pname = self.parse_variable_name()?;
                     self.skip_ws();
@@ -2095,6 +2124,7 @@ impl Engine {
                 ClassDef {
                     parent,
                     props,
+                    consts,
                     methods,
                 },
             );
@@ -2120,7 +2150,13 @@ impl Engine {
 
     /// Call a user function: bind params in a fresh scope, run the body
     /// (re-entrant via pos save/restore), and pick up the `return` value.
-    fn call_user_function(&mut self, func: FuncDef, args: Vec<Value>, this: Option<Value>) -> R<Value> {
+    fn call_user_function(
+        &mut self,
+        func: FuncDef,
+        args: Vec<Value>,
+        this: Option<Value>,
+        class_ctx: Option<String>,
+    ) -> R<Value> {
         self.tick()?;
         self.call_depth += 1;
         if self.call_depth > 2000 {
@@ -2141,6 +2177,7 @@ impl Engine {
         }
         let saved_vars = std::mem::take(&mut self.vars);
         let saved_ret = self.return_val.take();
+        let saved_class = std::mem::replace(&mut self.current_class, class_ctx);
         for (n, v) in bound {
             self.vars.insert(n, v);
         }
@@ -2160,6 +2197,7 @@ impl Engine {
         };
         self.vars = saved_vars;
         self.return_val = saved_ret;
+        self.current_class = saved_class;
         self.pos = saved_pos;
         self.call_depth -= 1;
         Ok(ret)
@@ -2196,7 +2234,12 @@ impl Engine {
         self.init_props(&cd, &mut obj)?;
         let oref = Rc::new(RefCell::new(obj));
         if let Some(ctor) = self.lookup_method(bare, "__construct") {
-            self.call_user_function(ctor, args, Some(Value::Object(oref.clone())))?;
+            self.call_user_function(
+                ctor,
+                args,
+                Some(Value::Object(oref.clone())),
+                Some(bare.to_string()),
+            )?;
         }
         Ok(Value::Object(oref))
     }
@@ -2238,11 +2281,107 @@ impl Engine {
         };
         let class = oref.borrow().class.clone();
         match self.lookup_method(&class, method) {
-            Some(def) => self.call_user_function(def, args, Some(Value::Object(oref))),
+            Some(def) => {
+                self.call_user_function(def, args, Some(Value::Object(oref)), Some(class))
+            }
             None => Err(EngineError(format!(
                 "call to undefined method {class}::{method}()"
             ))),
         }
+    }
+
+    /// `Class::member` — class constants, `::class`, and static/`self`/`parent`
+    /// method calls.
+    fn static_access(&mut self, id: &str) -> R<Value> {
+        let class = self.resolve_class(id)?;
+        self.skip_ws();
+        if self.peek() == Some('$') {
+            return Err(EngineError("static properties not supported yet".into()));
+        }
+        let member = self
+            .try_identifier()
+            .ok_or_else(|| EngineError("expected member after `::`".into()))?;
+        if member.eq_ignore_ascii_case("class") {
+            return Ok(Value::Str(class));
+        }
+        let after = self.pos;
+        self.skip_ws();
+        if self.peek() == Some('(') {
+            let args = self.parse_args()?;
+            if !self.live {
+                return Ok(Value::Null);
+            }
+            let def = self.lookup_method(&class, &member).ok_or_else(|| {
+                EngineError(format!("call to undefined method {class}::{member}()"))
+            })?;
+            // preserve the current $this for self::/parent:: calls in instance context
+            let this = self.vars.get("this").cloned();
+            return self.call_user_function(def, args, this, Some(class));
+        }
+        // class constant
+        self.pos = after;
+        if !self.live {
+            return Ok(Value::Null);
+        }
+        let cpos = match self.lookup_const(&class, &member) {
+            Some(pos) => pos,
+            None => return Err(EngineError(format!("undefined constant {class}::{member}"))),
+        };
+        // Guard against self-referencing constants (PHP fatals on these).
+        self.call_depth += 1;
+        if self.call_depth > 2000 {
+            return Err(EngineError("self-referencing constant".into()));
+        }
+        let save = self.pos;
+        self.pos = cpos;
+        let v = self.expression()?;
+        self.pos = save;
+        self.call_depth -= 1;
+        Ok(v)
+    }
+
+    fn resolve_class(&self, id: &str) -> R<String> {
+        match id.to_ascii_lowercase().as_str() {
+            "self" | "static" => self
+                .current_class
+                .clone()
+                .ok_or_else(|| EngineError("`self`/`static` used outside class".into())),
+            "parent" => {
+                let c = self
+                    .current_class
+                    .as_ref()
+                    .ok_or_else(|| EngineError("`parent` used outside class".into()))?;
+                self.classes
+                    .get(&c.to_ascii_lowercase())
+                    .and_then(|cd| cd.parent.clone())
+                    .ok_or_else(|| EngineError("class has no parent".into()))
+            }
+            _ => Ok(id.trim_start_matches('\\').to_string()),
+        }
+    }
+
+    fn lookup_const(&self, class: &str, name: &str) -> Option<usize> {
+        let mut cur = Some(class.to_ascii_lowercase());
+        while let Some(cn) = cur {
+            let cd = self.classes.get(&cn)?;
+            if let Some((_, pos)) = cd.consts.iter().find(|(n, _)| n == name) {
+                return Some(*pos);
+            }
+            cur = cd.parent.as_ref().map(|p| p.to_ascii_lowercase());
+        }
+        None
+    }
+
+    /// Stringify a value, invoking `__toString` for objects that define it.
+    fn stringify(&mut self, v: &Value) -> R<String> {
+        if let Value::Object(o) = v {
+            let class = o.borrow().class.clone();
+            if let Some(def) = self.lookup_method(&class, "__tostring") {
+                let r = self.call_user_function(def, Vec::new(), Some(v.clone()), Some(class))?;
+                return Ok(r.to_php_string());
+            }
+        }
+        Ok(v.to_php_string())
     }
 
     fn assign_property(&mut self, name: &str, prop: &str, aop: &str, rhs: Value) -> R<Value> {
@@ -2360,7 +2499,10 @@ impl Engine {
                     _ => {
                         let after = self.pos;
                         self.skip_ws();
-                        if self.peek() == Some('(') {
+                        if self.starts_with("::") {
+                            self.pos += 2;
+                            self.static_access(&id)
+                        } else if self.peek() == Some('(') {
                             let args = self.parse_args()?;
                             self.call_function(&id, args)
                         } else {
@@ -2736,7 +2878,8 @@ impl Engine {
             if c == '$' && matches!(self.peek_at(1), Some(d) if d.is_ascii_alphabetic() || d == '_') {
                 let name = self.parse_variable_name()?;
                 let value = self.vars.get(&name).cloned().unwrap_or(Value::Null);
-                s.push_str(&value.to_php_string());
+                let sv = self.stringify(&value)?;
+                s.push_str(&sv);
                 continue;
             }
             s.push(c);

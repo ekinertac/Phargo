@@ -4,24 +4,24 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 531 / 21862  (2.43% of the entire PHP test suite)**
+**`.phpt` pass rate: 550 / 21862  (2.52% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 2.44%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 2.52%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 531 | 21265 | 66 | 21862 |
+| 550 | 21246 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 50/50 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 51/51 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 156 | 5329 | 2.9% |
+| `Zend` | 167 | 5329 | 3.1% |
 | `ext/standard` | 81 | 3877 | 2.1% |
-| `ext/opcache` | 199 | 916 | 21.7% |
-| `core` | 68 | 868 | 7.8% |
+| `ext/opcache` | 202 | 916 | 22.1% |
+| `core` | 72 | 868 | 8.3% |
 | `ext/dom` | 6 | 868 | 0.7% |
 | `ext/spl` | 1 | 796 | 0.1% |
 | `ext/date` | 0 | 689 | 0.0% |
@@ -68,7 +68,7 @@ _Curated smoke tests (dev guards, **not** in the number above): 50/50 passing._
 | `ext/posix` | 0 | 62 | 0.0% |
 | `ext/dba` | 0 | 59 | 0.0% |
 | `ext/ftp` | 0 | 57 | 0.0% |
-| `ext/xmlreader` | 0 | 56 | 0.0% |
+| `ext/xmlreader` | 1 | 56 | 1.8% |
 | `ext/calendar` | 0 | 53 | 0.0% |
 | `ext/tokenizer` | 0 | 53 | 0.0% |
 | `ext/xmlwriter` | 0 | 51 | 0.0% |
@@ -117,6 +117,7 @@ The ladder to **"WordPress boots in the browser"**. Each rung is measured agains
 - [x] **v7 — Constants + more builtins.** `PHP_EOL`/`PHP_INT_MAX`/`M_PI`/`STR_PAD_*`/…, `str_contains`/`str_starts_with`/`str_ends_with`, `str_pad`, `str_split`, `ucwords`, `number_format`, `dechex`/`hexdec`/…, `htmlspecialchars`, variadic/array `max`/`min`.
 - [x] **v8 — Classes (core).** `class`/`interface`/`trait` decls, properties (+defaults), methods, `$this`, `new`, `->` (read/method/assign), `__construct`, single inheritance + polymorphic dispatch. (TODO: `static`/`::`, visibility enforcement, `__toString`, interfaces semantics.)
 - [x] **v9 — `isset` / `empty` / `unset`** on variables, array elements, and object properties.
+- [x] **v10 — `::` + `__toString`.** Class constants (inherited), `self::`/`parent::`/`Class::` constants & static/method calls (with `$this` preserved), `::class`, and `__toString` for echo/interpolation. (TODO: static properties, late static binding.)
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)
