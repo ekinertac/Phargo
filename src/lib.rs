@@ -15,7 +15,7 @@
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 
@@ -2138,6 +2138,202 @@ impl Engine {
                 let s = arg(0).to_php_string();
                 let assoc = to_bool(&arg(1));
                 json_decode_str(&s, assoc).unwrap_or(Value::Null)
+            }
+            "array_fill" => {
+                let start = to_long(&arg(0));
+                let count = to_long(&arg(1)).clamp(0, 10_000_000);
+                let val = arg(2);
+                let mut r = PArray::default();
+                for i in 0..count {
+                    r.set(AKey::Int(start + i), val.clone());
+                }
+                Value::Array(r)
+            }
+            "array_fill_keys" => match arg(0) {
+                Value::Array(keys) => {
+                    let val = arg(1);
+                    let mut r = PArray::default();
+                    for (_, k) in &keys.entries {
+                        r.set(key_from_value(k), val.clone());
+                    }
+                    Value::Array(r)
+                }
+                _ => Value::Array(PArray::default()),
+            },
+            "array_combine" => match (arg(0), arg(1)) {
+                (Value::Array(keys), Value::Array(vals)) => {
+                    let mut r = PArray::default();
+                    for ((_, k), (_, v)) in keys.entries.iter().zip(vals.entries.iter()) {
+                        r.set(key_from_value(k), v.clone());
+                    }
+                    Value::Array(r)
+                }
+                _ => Value::Bool(false),
+            },
+            "array_column" => match arg(0) {
+                Value::Array(rows) => {
+                    let col = arg(1);
+                    let idx = arg(2);
+                    let mut r = PArray::default();
+                    for (_, row) in &rows.entries {
+                        let cell = match row {
+                            Value::Array(a) => a.get(&key_from_value(&col)).cloned(),
+                            Value::Object(o) => o.borrow().get(&col.to_php_string()),
+                            _ => None,
+                        };
+                        if let Some(c) = cell {
+                            if matches!(idx, Value::Null) {
+                                r.push(c);
+                            } else {
+                                let ikey = match row {
+                                    Value::Array(a) => {
+                                        a.get(&key_from_value(&idx)).cloned().unwrap_or(Value::Null)
+                                    }
+                                    Value::Object(o) => {
+                                        o.borrow().get(&idx.to_php_string()).unwrap_or(Value::Null)
+                                    }
+                                    _ => Value::Null,
+                                };
+                                r.set(key_from_value(&ikey), c);
+                            }
+                        }
+                    }
+                    Value::Array(r)
+                }
+                _ => Value::Array(PArray::default()),
+            },
+            "array_product" => match arg(0) {
+                Value::Array(a) => {
+                    let mut acc = Value::Int(1);
+                    for (_, v) in &a.entries {
+                        acc = arith("*", &acc, v);
+                    }
+                    acc
+                }
+                _ => Value::Int(0),
+            },
+            "array_pad" => match arg(0) {
+                Value::Array(a) => {
+                    let size = to_long(&arg(1));
+                    let val = arg(2);
+                    let cur = a.entries.len() as i64;
+                    // cap padding so a huge size can't allocate billions of elements
+                    let target = size.saturating_abs().max(cur).min(cur + 10_000_000);
+                    let need = (target - cur).max(0);
+                    let mut r = PArray::default();
+                    if size < 0 {
+                        for _ in 0..need {
+                            r.push(val.clone());
+                        }
+                    }
+                    for (k, v) in &a.entries {
+                        match k {
+                            AKey::Int(_) => r.push(v.clone()),
+                            AKey::Str(s) => r.set(AKey::Str(s.clone()), v.clone()),
+                        }
+                    }
+                    if size >= 0 {
+                        for _ in 0..need {
+                            r.push(val.clone());
+                        }
+                    }
+                    Value::Array(r)
+                }
+                _ => Value::Array(PArray::default()),
+            },
+            "array_key_first" => match arg(0) {
+                Value::Array(a) => a
+                    .entries
+                    .first()
+                    .map(|(k, _)| akey_to_value(k))
+                    .unwrap_or(Value::Null),
+                _ => Value::Null,
+            },
+            "array_key_last" => match arg(0) {
+                Value::Array(a) => a
+                    .entries
+                    .last()
+                    .map(|(k, _)| akey_to_value(k))
+                    .unwrap_or(Value::Null),
+                _ => Value::Null,
+            },
+            "array_diff" => match arg(0) {
+                Value::Array(a) => {
+                    let mut excl: HashSet<String> = HashSet::new();
+                    for o in &args[1..] {
+                        if let Value::Array(b) = o {
+                            for (_, bv) in &b.entries {
+                                excl.insert(bv.to_php_string());
+                            }
+                        }
+                    }
+                    let mut r = PArray::default();
+                    for (k, v) in &a.entries {
+                        if !excl.contains(&v.to_php_string()) {
+                            r.set(k.clone(), v.clone());
+                        }
+                    }
+                    Value::Array(r)
+                }
+                _ => Value::Array(PArray::default()),
+            },
+            "array_intersect" => match arg(0) {
+                Value::Array(a) => {
+                    let sets: Vec<HashSet<String>> = args[1..]
+                        .iter()
+                        .filter_map(|o| match o {
+                            Value::Array(b) => {
+                                Some(b.entries.iter().map(|(_, v)| v.to_php_string()).collect())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let mut r = PArray::default();
+                    for (k, v) in &a.entries {
+                        let s = v.to_php_string();
+                        if sets.iter().all(|set| set.contains(&s)) {
+                            r.set(k.clone(), v.clone());
+                        }
+                    }
+                    Value::Array(r)
+                }
+                _ => Value::Array(PArray::default()),
+            },
+            "ctype_digit" => {
+                let s = arg(0).to_php_string();
+                Value::Bool(!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            }
+            "ctype_alpha" => {
+                let s = arg(0).to_php_string();
+                Value::Bool(!s.is_empty() && s.bytes().all(|b| b.is_ascii_alphabetic()))
+            }
+            "ctype_alnum" => {
+                let s = arg(0).to_php_string();
+                Value::Bool(!s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric()))
+            }
+            "ctype_space" => {
+                let s = arg(0).to_php_string();
+                Value::Bool(!s.is_empty() && s.bytes().all(|b| b.is_ascii_whitespace()))
+            }
+            "ctype_upper" => {
+                let s = arg(0).to_php_string();
+                Value::Bool(!s.is_empty() && s.bytes().all(|b| b.is_ascii_uppercase()))
+            }
+            "ctype_lower" => {
+                let s = arg(0).to_php_string();
+                Value::Bool(!s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase()))
+            }
+            "substr_count" => {
+                let h = arg(0).to_php_string();
+                let n = arg(1).to_php_string();
+                if n.is_empty() {
+                    Value::Int(0)
+                } else {
+                    Value::Int(h.matches(&n).count() as i64)
+                }
+            }
+            "str_word_count" => {
+                Value::Int(arg(0).to_php_string().split_whitespace().count() as i64)
             }
             "htmlspecialchars" => {
                 let s = arg(0).to_php_string();
