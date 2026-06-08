@@ -3974,6 +3974,124 @@ impl Engine {
                 Value::Array(r)
             }
             "extension_loaded" => Value::Bool(false),
+            // ---- mbstring (UTF-8; codepoint == Rust char) --------------------
+            "mb_strlen" => Value::Int(arg(0).to_php_string().chars().count() as i64),
+            "mb_strtoupper" => Value::Str(arg(0).to_php_string().to_uppercase()),
+            "mb_strtolower" => Value::Str(arg(0).to_php_string().to_lowercase()),
+            "mb_convert_case" => {
+                let s = arg(0).to_php_string();
+                let r = match to_long(&arg(1)) {
+                    0 => s.to_uppercase(),
+                    1 => s.to_lowercase(),
+                    _ => {
+                        // MB_CASE_TITLE
+                        let mut out = String::new();
+                        let mut start = true;
+                        for c in s.chars() {
+                            if c.is_alphanumeric() {
+                                if start {
+                                    out.extend(c.to_uppercase());
+                                    start = false;
+                                } else {
+                                    out.extend(c.to_lowercase());
+                                }
+                            } else {
+                                out.push(c);
+                                start = true;
+                            }
+                        }
+                        out
+                    }
+                };
+                Value::Str(r)
+            }
+            "mb_substr" => {
+                let chars: Vec<char> = arg(0).to_php_string().chars().collect();
+                let n = chars.len() as i64;
+                let mut start = to_long(&arg(1));
+                if start < 0 {
+                    start = (n + start).max(0);
+                }
+                let start = start.min(n) as usize;
+                let end = match args.get(2) {
+                    Some(v) if !matches!(v, Value::Null) => {
+                        let l = to_long(v);
+                        if l < 0 {
+                            (n + l).max(start as i64) as usize
+                        } else {
+                            (start + l as usize).min(n as usize)
+                        }
+                    }
+                    _ => n as usize,
+                };
+                Value::Str(chars[start..end.max(start)].iter().collect())
+            }
+            "mb_str_split" => {
+                let chars: Vec<char> = arg(0).to_php_string().chars().collect();
+                let size = if args.len() > 1 {
+                    to_long(&arg(1)).max(1) as usize
+                } else {
+                    1
+                };
+                let mut r = PArray::default();
+                for chunk in chars.chunks(size) {
+                    r.push(Value::Str(chunk.iter().collect()));
+                }
+                Value::Array(r)
+            }
+            "mb_strpos" | "mb_stripos" => {
+                let (mut h, mut nd) = (arg(0).to_php_string(), arg(1).to_php_string());
+                if name.eq_ignore_ascii_case("mb_stripos") {
+                    h = h.to_lowercase();
+                    nd = nd.to_lowercase();
+                }
+                let off = to_long(&arg(2)).max(0) as usize;
+                let hchars: Vec<char> = h.chars().collect();
+                let ndchars: Vec<char> = nd.chars().collect();
+                let mut found = Value::Bool(false);
+                if !ndchars.is_empty() && off <= hchars.len() {
+                    for i in off..=hchars.len().saturating_sub(ndchars.len()) {
+                        if hchars[i..i + ndchars.len()] == ndchars[..] {
+                            found = Value::Int(i as i64);
+                            break;
+                        }
+                    }
+                }
+                found
+            }
+            "mb_ord" => match arg(0).to_php_string().chars().next() {
+                Some(c) => Value::Int(c as i64),
+                None => Value::Bool(false),
+            },
+            "mb_chr" => match char::from_u32(to_long(&arg(0)) as u32) {
+                Some(c) => Value::Str(c.to_string()),
+                None => Value::Bool(false),
+            },
+            "mb_strwidth" => Value::Int(arg(0).to_php_string().chars().count() as i64),
+            "mb_internal_encoding" => {
+                if matches!(arg(0), Value::Null) {
+                    Value::Str("UTF-8".into())
+                } else {
+                    Value::Bool(true)
+                }
+            }
+            "mb_detect_encoding" => Value::Str("UTF-8".into()),
+            "mb_check_encoding" => Value::Bool(true),
+            "mb_convert_encoding" => Value::Str(arg(0).to_php_string()),
+            "mb_substitute_character" => {
+                if matches!(arg(0), Value::Null) {
+                    Value::Str("none".into())
+                } else {
+                    Value::Bool(true)
+                }
+            }
+            "mb_language" => {
+                if matches!(arg(0), Value::Null) {
+                    Value::Str("neutral".into())
+                } else {
+                    Value::Bool(true)
+                }
+            }
             // ---- streams (fopen family) --------------------------------------
             "fopen" => {
                 let path = arg(0).to_php_string();
