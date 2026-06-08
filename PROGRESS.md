@@ -4,24 +4,24 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 75 / 21862  (0.34% of the entire PHP test suite)**
+**`.phpt` pass rate: 216 / 21862  (0.99% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (13750): 0.55%. The 8112 "not-yet-gradeable" tests mostly use `--EXPECTF--`, which the runner doesn't match yet._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (13750): 1.57%. The 8112 "not-yet-gradeable" tests mostly use `--EXPECTF--`, which the runner doesn't match yet._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 75 | 13675 | 8112 | 21862 |
+| 216 | 13534 | 8112 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 30/30 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 34/34 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 10 | 5329 | 0.2% |
-| `ext/standard` | 9 | 3877 | 0.2% |
-| `ext/opcache` | 10 | 916 | 1.1% |
-| `core` | 21 | 868 | 2.4% |
+| `Zend` | 34 | 5329 | 0.6% |
+| `ext/standard` | 10 | 3877 | 0.3% |
+| `ext/opcache` | 119 | 916 | 13.0% |
+| `core` | 28 | 868 | 3.2% |
 | `ext/dom` | 6 | 868 | 0.7% |
 | `ext/spl` | 0 | 796 | 0.0% |
 | `ext/date` | 0 | 689 | 0.0% |
@@ -104,7 +104,7 @@ The ladder to **"WordPress boots in the browser"**. Each rung is measured agains
 - [x] **v3b — `for`, `++`/`--`, assignment-as-expression** (incl. compound `+= -= *= /= %= .= **=`).
 - [ ] **v3c — `switch`** and **`foreach`** (`foreach` needs arrays, v5).
 - [x] **v4a — Built-in function calls.** `var_dump`/`print_r`/`var_export`, `gettype`, `is_*`, `intval`/`strval`/…, core string & math builtins (scalars).
-- [ ] **v4b — User-defined functions.** `function` decls, params, return, call scope.
+- [x] **v4b — User-defined functions.** `function` decls, params (+ defaults), `return`, isolated call scope, recursion.
 - [ ] **v5 — Arrays & strings.** PHP arrays (ordered maps) + the core built-ins WordPress leans on.
 - [ ] **v6 — Classes.** Classes, interfaces, traits — the OOP WordPress actually uses.
 - [ ] **v7 — pcre / mbstring.** Regex + Unicode. (Here be dragons.)

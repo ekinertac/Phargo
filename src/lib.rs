@@ -36,6 +36,21 @@ enum Flow {
     Normal,
     Break(u32),
     Continue(u32),
+    Return,
+}
+
+#[derive(Clone)]
+struct Param {
+    name: String,
+    /// Source position of the default-value expression, if the param has one.
+    default: Option<usize>,
+}
+
+#[derive(Clone)]
+struct FuncDef {
+    params: Vec<Param>,
+    /// Position of the body's opening `{`.
+    body_start: usize,
 }
 
 /// A PHP value — the engine's "zval". Scalars only, so far.
@@ -233,6 +248,9 @@ pub fn run(source: &str) -> R<String> {
         vars: HashMap::new(),
         live: true,
         steps: 0,
+        funcs: HashMap::new(),
+        return_val: None,
+        call_depth: 0,
     };
     engine.program()?;
     Ok(engine.out)
@@ -248,6 +266,12 @@ struct Engine {
     /// Hard budget on interpreter steps — a backstop against infinite loops
     /// (`catch_unwind` stops panics, not hangs).
     steps: u64,
+    /// User-defined functions, keyed by lowercased name (PHP is case-insensitive).
+    funcs: HashMap<String, FuncDef>,
+    /// Value stashed by `return`, picked up by the active call frame.
+    return_val: Option<Value>,
+    /// Current function-call nesting depth (guards against stack overflow).
+    call_depth: usize,
 }
 
 const POW_PREC: u8 = 8;
@@ -369,6 +393,8 @@ impl Engine {
                 "while" => return self.while_statement(),
                 "do" => return self.do_while_statement(),
                 "for" => return self.for_statement(),
+                "function" => return self.function_decl(),
+                "return" => return self.return_statement(),
                 "break" => return self.break_continue(true),
                 "continue" => return self.break_continue(false),
                 _ => self.pos = save, // not a keyword: fall through to expression statement
@@ -583,6 +609,7 @@ impl Engine {
                         return Ok(if n > 1 { Flow::Break(n - 1) } else { Flow::Normal });
                     }
                     Flow::Continue(n) if n > 1 => return Ok(Flow::Continue(n - 1)),
+                    Flow::Return => return Ok(Flow::Return),
                     _ => {}
                 }
             } else {
@@ -618,6 +645,7 @@ impl Engine {
                     false
                 }
                 Flow::Continue(n) if n > 1 => return Ok(Flow::Continue(n - 1)),
+                Flow::Return => return Ok(Flow::Return),
                 _ => self.live && to_bool(&cond),
             };
             if again {
@@ -684,6 +712,7 @@ impl Engine {
                         return Ok(if n > 1 { Flow::Break(n - 1) } else { Flow::Normal });
                     }
                     Flow::Continue(n) if n > 1 => return Ok(Flow::Continue(n - 1)),
+                    Flow::Return => return Ok(Flow::Return),
                     _ => {}
                 }
                 // run the step (live), then loop (which resets to cond_start)
@@ -1047,9 +1076,159 @@ impl Engine {
                 Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_)
             )),
             "is_array" | "is_object" | "is_callable" => Value::Bool(false),
-            _ => return Err(EngineError(format!("unknown function `{name}()`"))),
+            _ => {
+                let key = name.to_ascii_lowercase();
+                if let Some(func) = self.funcs.get(&key).cloned() {
+                    return self.call_user_function(func, args.clone());
+                }
+                return Err(EngineError(format!("unknown function `{name}()`")));
+            }
         };
         Ok(v)
+    }
+
+    /// `function name(params) : T { body }` — record it and skip the body.
+    fn function_decl(&mut self) -> R<Flow> {
+        self.skip_ws();
+        let name = match self.try_identifier() {
+            Some(n) => n,
+            None => return Err(EngineError("expected function name".into())),
+        };
+        self.expect_char('(')?;
+        let mut params = Vec::new();
+        self.skip_ws();
+        if self.peek() != Some(')') {
+            loop {
+                self.skip_ws();
+                if self.peek() == Some('?') {
+                    self.pos += 1; // nullable type
+                    self.skip_ws();
+                }
+                // type hint (incl. unions and namespaces) — parsed and ignored
+                if matches!(self.peek(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '\\') {
+                    while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '\\' || c == '|') {
+                        self.pos += 1;
+                    }
+                    self.skip_ws();
+                }
+                if self.peek() == Some('&') {
+                    self.pos += 1; // by-reference — treated as by-value for now
+                    self.skip_ws();
+                }
+                if self.starts_with("...") {
+                    self.pos += 3; // variadic — treated as a single param for now
+                    self.skip_ws();
+                }
+                if self.peek() != Some('$') {
+                    return Err(EngineError("expected parameter variable".into()));
+                }
+                let pname = self.parse_variable_name()?;
+                self.skip_ws();
+                let mut default = None;
+                if self.peek() == Some('=') && self.peek_at(1) != Some('=') {
+                    self.pos += 1;
+                    self.skip_ws();
+                    default = Some(self.pos);
+                    let prev = self.live;
+                    self.live = false;
+                    let _ = self.expression()?; // skip past the default expression
+                    self.live = prev;
+                }
+                params.push(Param { name: pname, default });
+                self.skip_ws();
+                match self.peek() {
+                    Some(',') => self.pos += 1,
+                    Some(')') => break,
+                    other => {
+                        return Err(EngineError(format!(
+                            "expected `,` or `)` in parameters, found {other:?}"
+                        )))
+                    }
+                }
+            }
+        }
+        self.expect_char(')')?;
+        // optional `: returnType`
+        self.skip_ws();
+        if self.peek() == Some(':') {
+            self.pos += 1;
+            self.skip_ws();
+            if self.peek() == Some('?') {
+                self.pos += 1;
+                self.skip_ws();
+            }
+            while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '\\' || c == '|') {
+                self.pos += 1;
+            }
+            self.skip_ws();
+        }
+        if self.peek() != Some('{') {
+            return Err(EngineError("expected `{` for function body".into()));
+        }
+        let body_start = self.pos;
+        self.pos += 1; // consume {
+        self.skip_to_block_end()?;
+        if self.live {
+            self.funcs
+                .insert(name.to_ascii_lowercase(), FuncDef { params, body_start });
+        }
+        Ok(Flow::Normal)
+    }
+
+    fn return_statement(&mut self) -> R<Flow> {
+        self.skip_ws();
+        let val = if self.peek() == Some(';') || self.starts_with("?>") {
+            Value::Null
+        } else {
+            self.expression()?
+        };
+        self.end_statement()?;
+        if self.live {
+            self.return_val = Some(val);
+            Ok(Flow::Return)
+        } else {
+            Ok(Flow::Normal)
+        }
+    }
+
+    /// Call a user function: bind params in a fresh scope, run the body
+    /// (re-entrant via pos save/restore), and pick up the `return` value.
+    fn call_user_function(&mut self, func: FuncDef, args: Vec<Value>) -> R<Value> {
+        self.tick()?;
+        self.call_depth += 1;
+        if self.call_depth > 2000 {
+            return Err(EngineError("maximum function nesting level reached".into()));
+        }
+        let saved_pos = self.pos;
+        let mut bound: Vec<(String, Value)> = Vec::with_capacity(func.params.len());
+        for (i, p) in func.params.iter().enumerate() {
+            let v = if let Some(a) = args.get(i) {
+                a.clone()
+            } else if let Some(dstart) = p.default {
+                self.pos = dstart;
+                self.expression()?
+            } else {
+                Value::Null
+            };
+            bound.push((p.name.clone(), v));
+        }
+        let saved_vars = std::mem::take(&mut self.vars);
+        let saved_ret = self.return_val.take();
+        for (n, v) in bound {
+            self.vars.insert(n, v);
+        }
+        self.pos = func.body_start;
+        let flow = self.block()?;
+        let ret = if matches!(flow, Flow::Return) {
+            self.return_val.take().unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        self.vars = saved_vars;
+        self.return_val = saved_ret;
+        self.pos = saved_pos;
+        self.call_depth -= 1;
+        Ok(ret)
     }
 
     fn primary(&mut self) -> R<Value> {

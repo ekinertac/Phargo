@@ -274,7 +274,7 @@ const ROADMAP: &str = r#"The ladder to **"WordPress boots in the browser"**. Eac
 - [x] **v3b — `for`, `++`/`--`, assignment-as-expression** (incl. compound `+= -= *= /= %= .= **=`).
 - [ ] **v3c — `switch`** and **`foreach`** (`foreach` needs arrays, v5).
 - [x] **v4a — Built-in function calls.** `var_dump`/`print_r`/`var_export`, `gettype`, `is_*`, `intval`/`strval`/…, core string & math builtins (scalars).
-- [ ] **v4b — User-defined functions.** `function` decls, params, return, call scope.
+- [x] **v4b — User-defined functions.** `function` decls, params (+ defaults), `return`, isolated call scope, recursion.
 - [ ] **v5 — Arrays & strings.** PHP arrays (ordered maps) + the core built-ins WordPress leans on.
 - [ ] **v6 — Classes.** Classes, interfaces, traits — the OOP WordPress actually uses.
 - [ ] **v7 — pcre / mbstring.** Regex + Unicode. (Here be dragons.)
