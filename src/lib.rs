@@ -903,7 +903,79 @@ impl Engine {
             }
             self.pos = save; // not an assignment
         }
-        self.parse_binary(0)
+        self.parse_ternary()
+    }
+
+    /// `cond ? a : b` and `cond ?: b`. Only the taken branch is executed (the
+    /// other is parsed with `live = false`).
+    fn parse_ternary(&mut self) -> R<Value> {
+        let cond = self.parse_coalesce()?;
+        self.skip_ws();
+        if self.peek() == Some('?') && self.peek_at(1) != Some('?') {
+            self.pos += 1;
+            self.skip_ws();
+            let take = self.live && to_bool(&cond);
+            if self.peek() == Some(':') {
+                self.pos += 1; // short ternary: cond ?: else
+                self.skip_ws();
+                let prev = self.live;
+                self.live = prev && !take;
+                let else_v = self.parse_assignment()?;
+                self.live = prev;
+                return Ok(if !self.live {
+                    Value::Null
+                } else if take {
+                    cond
+                } else {
+                    else_v
+                });
+            }
+            let prev = self.live;
+            self.live = prev && take;
+            let then_v = self.parse_assignment()?;
+            self.live = prev;
+            self.skip_ws();
+            if self.peek() != Some(':') {
+                return Err(EngineError("expected `:` in ternary".into()));
+            }
+            self.pos += 1;
+            self.skip_ws();
+            let prev = self.live;
+            self.live = prev && !take;
+            let else_v = self.parse_assignment()?;
+            self.live = prev;
+            return Ok(if !self.live {
+                Value::Null
+            } else if take {
+                then_v
+            } else {
+                else_v
+            });
+        }
+        Ok(cond)
+    }
+
+    /// `a ?? b` — right-associative; `b` runs only if `a` is null.
+    fn parse_coalesce(&mut self) -> R<Value> {
+        let left = self.parse_binary(0)?;
+        self.skip_ws();
+        if self.starts_with("??") {
+            self.pos += 2;
+            self.skip_ws();
+            let left_is_null = matches!(left, Value::Null);
+            let prev = self.live;
+            self.live = prev && left_is_null;
+            let right = self.parse_coalesce()?;
+            self.live = prev;
+            return Ok(if !self.live {
+                Value::Null
+            } else if left_is_null {
+                right
+            } else {
+                left
+            });
+        }
+        Ok(left)
     }
 
     fn assign_indexed(
@@ -1194,7 +1266,8 @@ impl Engine {
             "lcfirst" => Value::Str(lcfirst(&arg(0).to_php_string())),
             "strrev" => Value::Str(arg(0).to_php_string().chars().rev().collect()),
             "str_repeat" => {
-                Value::Str(arg(0).to_php_string().repeat(to_long(&arg(1)).max(0) as usize))
+                let n = to_long(&arg(1)).clamp(0, 10_000_000) as usize;
+                Value::Str(arg(0).to_php_string().repeat(n))
             }
             "ord" => Value::Int(arg(0).to_php_string().bytes().next().unwrap_or(0) as i64),
             "chr" => Value::Str((to_long(&arg(0)).rem_euclid(256) as u8 as char).to_string()),
@@ -1203,6 +1276,56 @@ impl Engine {
                 match h.find(&n) {
                     Some(i) => Value::Int(i as i64),
                     None => Value::Bool(false),
+                }
+            }
+            "sprintf" => {
+                if args.is_empty() {
+                    Value::Str(String::new())
+                } else {
+                    Value::Str(php_sprintf(&args[0].to_php_string(), &args[1..]))
+                }
+            }
+            "printf" => {
+                if args.is_empty() {
+                    Value::Int(0)
+                } else {
+                    let out = php_sprintf(&args[0].to_php_string(), &args[1..]);
+                    let n = out.len() as i64;
+                    self.out.push_str(&out);
+                    Value::Int(n)
+                }
+            }
+            "substr" => {
+                let chars: Vec<char> = arg(0).to_php_string().chars().collect();
+                let total = chars.len() as i64;
+                let mut start = to_long(&arg(1));
+                if start < 0 {
+                    start = (total + start).max(0);
+                } else if start > total {
+                    start = total;
+                }
+                let start = start as usize;
+                let end = if args.len() >= 3 && !matches!(arg(2), Value::Null) {
+                    let l = to_long(&arg(2));
+                    if l < 0 {
+                        (total + l).max(start as i64) as usize
+                    } else {
+                        (start + l as usize).min(chars.len())
+                    }
+                } else {
+                    chars.len()
+                };
+                let end = end.clamp(start, chars.len());
+                Value::Str(chars[start..end].iter().collect())
+            }
+            "str_replace" => {
+                let search = arg(0).to_php_string();
+                let replace = arg(1).to_php_string();
+                let subject = arg(2).to_php_string();
+                if search.is_empty() {
+                    Value::Str(subject)
+                } else {
+                    Value::Str(subject.replace(&search, &replace))
                 }
             }
             "abs" => match to_num(&arg(0)) {
@@ -2011,4 +2134,136 @@ fn lcfirst(s: &str) -> String {
         Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
         None => String::new(),
     }
+}
+
+/// A pragmatic `sprintf`: flags `-0+ '`, width, `.precision`, and the
+/// `s d i u f F x X o b c e` specifiers (no positional args yet).
+fn php_sprintf(fmt: &str, args: &[Value]) -> String {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut argi = 0;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if chars.get(i) == Some(&'%') {
+            out.push('%');
+            i += 1;
+            continue;
+        }
+        let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
+        let mut pad = ' ';
+        loop {
+            match chars.get(i) {
+                Some('-') => left = true,
+                Some('0') => zero = true,
+                Some('+') => plus = true,
+                Some(' ') => space = true,
+                Some('\'') => {
+                    i += 1;
+                    if let Some(&c) = chars.get(i) {
+                        pad = c;
+                    }
+                }
+                _ => break,
+            }
+            i += 1;
+        }
+        let mut width = 0usize;
+        while let Some(c) = chars.get(i) {
+            if c.is_ascii_digit() {
+                width = (width * 10 + (*c as usize - '0' as usize)).min(1_000_000);
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        let mut prec: Option<usize> = None;
+        if chars.get(i) == Some(&'.') {
+            i += 1;
+            let mut p = 0usize;
+            while let Some(c) = chars.get(i) {
+                if c.is_ascii_digit() {
+                    p = (p * 10 + (*c as usize - '0' as usize)).min(10_000);
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            prec = Some(p);
+        }
+        let spec = match chars.get(i) {
+            Some(c) => *c,
+            None => break,
+        };
+        i += 1;
+        let a = args.get(argi).cloned().unwrap_or(Value::Null);
+        argi += 1;
+        let mut body = match spec {
+            's' => {
+                let t = a.to_php_string();
+                match prec {
+                    Some(p) => t.chars().take(p).collect(),
+                    None => t,
+                }
+            }
+            'd' | 'i' => {
+                let n = to_long(&a);
+                let sign = if n < 0 {
+                    "-"
+                } else if plus {
+                    "+"
+                } else if space {
+                    " "
+                } else {
+                    ""
+                };
+                format!("{sign}{}", n.unsigned_abs())
+            }
+            'u' => (to_long(&a) as u64).to_string(),
+            'f' | 'F' => {
+                let p = prec.unwrap_or(6);
+                let v = to_f64(&a);
+                let sign = if v < 0.0 {
+                    "-"
+                } else if plus {
+                    "+"
+                } else if space {
+                    " "
+                } else {
+                    ""
+                };
+                format!("{sign}{:.*}", p, v.abs())
+            }
+            'x' => format!("{:x}", to_long(&a)),
+            'X' => format!("{:X}", to_long(&a)),
+            'o' => format!("{:o}", to_long(&a)),
+            'b' => format!("{:b}", to_long(&a)),
+            'c' => (to_long(&a).rem_euclid(256) as u8 as char).to_string(),
+            'e' => format!("{:e}", to_f64(&a)),
+            _ => {
+                argi -= 1;
+                String::new()
+            }
+        };
+        let bodylen = body.chars().count();
+        if bodylen < width {
+            let n = width - bodylen;
+            if left {
+                body.push_str(&pad.to_string().repeat(n));
+            } else if zero && (body.starts_with('-') || body.starts_with('+')) {
+                let (sign, rest) = body.split_at(1);
+                body = format!("{sign}{}{rest}", "0".repeat(n));
+            } else {
+                let p = if zero { '0' } else { pad };
+                body = format!("{}{}", p.to_string().repeat(n), body);
+            }
+        }
+        out.push_str(&body);
+    }
+    out
 }

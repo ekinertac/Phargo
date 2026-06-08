@@ -4,24 +4,24 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 301 / 21862  (1.38% of the entire PHP test suite)**
+**`.phpt` pass rate: 322 / 21862  (1.47% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 1.38%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 1.48%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 301 | 21495 | 66 | 21862 |
+| 322 | 21474 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 39/39 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 44/44 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 47 | 5329 | 0.9% |
-| `ext/standard` | 38 | 3877 | 1.0% |
-| `ext/opcache` | 152 | 916 | 16.6% |
-| `core` | 39 | 868 | 4.5% |
+| `Zend` | 51 | 5329 | 1.0% |
+| `ext/standard` | 57 | 3877 | 1.5% |
+| `ext/opcache` | 157 | 916 | 17.1% |
+| `core` | 32 | 868 | 3.7% |
 | `ext/dom` | 6 | 868 | 0.7% |
 | `ext/spl` | 0 | 796 | 0.0% |
 | `ext/date` | 0 | 689 | 0.0% |
@@ -106,6 +106,7 @@ The ladder to **"WordPress boots in the browser"**. Each rung is measured agains
 - [x] **v4a — Built-in function calls.** `var_dump`/`print_r`/`var_export`, `gettype`, `is_*`, `intval`/`strval`/…, core string & math builtins (scalars).
 - [x] **v4b — User-defined functions.** `function` decls, params (+ defaults), `return`, isolated call scope, recursion.
 - [x] **v5 — Arrays.** Ordered-map arrays, `[...]`/`array()` literals, index read/write/append, `foreach`, `var_dump`/`print_r`/`var_export` of arrays, and `count`/`in_array`/`implode`/`explode`/`array_keys`/`array_values`/`array_merge`/`range`/… builtins.
+- [x] **v6 — Ternary `?:` / null-coalescing `??` + string builtins** (`sprintf`/`printf`, `substr`, `str_replace`).
 - [ ] **v3c — `switch`.** Deferred from v3.
 - [ ] **v6 — Classes.** Classes, interfaces, traits — the OOP WordPress actually uses.
 - [ ] **v7 — pcre / mbstring.** Regex + Unicode. (Here be dragons.)
