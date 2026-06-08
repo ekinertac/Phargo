@@ -3595,6 +3595,182 @@ impl Engine {
             "function_exists" => {
                 Value::Bool(self.funcs.contains_key(&arg(0).to_php_string().to_ascii_lowercase()))
             }
+            // ---- filesystem --------------------------------------------------
+            "file_put_contents" => {
+                let path = arg(0).to_php_string();
+                let data = match arg(1) {
+                    Value::Array(a) => a
+                        .entries
+                        .iter()
+                        .map(|(_, v)| v.to_php_string())
+                        .collect::<String>(),
+                    other => other.to_php_string(),
+                };
+                let append = to_long(&arg(2)) & 8 != 0;
+                let res = if append {
+                    use std::io::Write;
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .and_then(|mut f| f.write_all(data.as_bytes()))
+                } else {
+                    std::fs::write(&path, data.as_bytes())
+                };
+                match res {
+                    Ok(_) => Value::Int(data.len() as i64),
+                    Err(_) => Value::Bool(false),
+                }
+            }
+            "file_get_contents" => match std::fs::read(arg(0).to_php_string()) {
+                Ok(b) => Value::Str(String::from_utf8_lossy(&b).to_string()),
+                Err(_) => Value::Bool(false),
+            },
+            "file" => match std::fs::read_to_string(arg(0).to_php_string()) {
+                Ok(s) => {
+                    let mut r = PArray::default();
+                    let keep_nl = to_long(&arg(1)) & 2 == 0; // FILE_IGNORE_NEW_LINES = 2
+                    for line in s.split_inclusive('\n') {
+                        let l = if keep_nl {
+                            line.to_string()
+                        } else {
+                            line.trim_end_matches(['\n', '\r']).to_string()
+                        };
+                        r.push(Value::Str(l));
+                    }
+                    Value::Array(r)
+                }
+                Err(_) => Value::Bool(false),
+            },
+            "file_exists" => Value::Bool(Path::new(&arg(0).to_php_string()).exists()),
+            "is_file" => Value::Bool(Path::new(&arg(0).to_php_string()).is_file()),
+            "is_dir" => Value::Bool(Path::new(&arg(0).to_php_string()).is_dir()),
+            "is_readable" | "is_writable" | "is_writeable" => {
+                Value::Bool(Path::new(&arg(0).to_php_string()).exists())
+            }
+            "unlink" => Value::Bool(std::fs::remove_file(arg(0).to_php_string()).is_ok()),
+            "rmdir" => Value::Bool(std::fs::remove_dir(arg(0).to_php_string()).is_ok()),
+            "mkdir" => {
+                let path = arg(0).to_php_string();
+                let recursive = to_bool(&arg(2));
+                let res = if recursive {
+                    std::fs::create_dir_all(&path)
+                } else {
+                    std::fs::create_dir(&path)
+                };
+                Value::Bool(res.is_ok())
+            }
+            "rename" => {
+                Value::Bool(std::fs::rename(arg(0).to_php_string(), arg(1).to_php_string()).is_ok())
+            }
+            "copy" => {
+                Value::Bool(std::fs::copy(arg(0).to_php_string(), arg(1).to_php_string()).is_ok())
+            }
+            "filesize" => match std::fs::metadata(arg(0).to_php_string()) {
+                Ok(m) => Value::Int(m.len() as i64),
+                Err(_) => Value::Bool(false),
+            },
+            "touch" => {
+                let path = arg(0).to_php_string();
+                let r = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .open(&path);
+                Value::Bool(r.is_ok())
+            }
+            "scandir" => match std::fs::read_dir(arg(0).to_php_string()) {
+                Ok(rd) => {
+                    let mut names: Vec<String> = vec![".".into(), "..".into()];
+                    for e in rd.flatten() {
+                        names.push(e.file_name().to_string_lossy().to_string());
+                    }
+                    names.sort();
+                    let mut r = PArray::default();
+                    for n in names {
+                        r.push(Value::Str(n));
+                    }
+                    Value::Array(r)
+                }
+                Err(_) => Value::Bool(false),
+            },
+            "realpath" => match std::fs::canonicalize(arg(0).to_php_string()) {
+                Ok(p) => Value::Str(p.to_string_lossy().trim_start_matches(r"\\?\").to_string()),
+                Err(_) => Value::Bool(false),
+            },
+            "sys_get_temp_dir" => {
+                Value::Str(std::env::temp_dir().to_string_lossy().trim_end_matches(['/', '\\']).to_string())
+            }
+            "getcwd" => match std::env::current_dir() {
+                Ok(p) => Value::Str(p.to_string_lossy().to_string()),
+                Err(_) => Value::Bool(false),
+            },
+            "tempnam" => {
+                let dir = arg(0).to_php_string();
+                let prefix = arg(1).to_php_string();
+                let mut n = self.steps;
+                let mut path;
+                loop {
+                    n = n.wrapping_mul(1103515245).wrapping_add(12345);
+                    path = format!("{dir}/{prefix}{:x}", n & 0xffffff);
+                    if !Path::new(&path).exists() {
+                        break;
+                    }
+                }
+                match std::fs::write(&path, b"") {
+                    Ok(_) => Value::Str(path),
+                    Err(_) => Value::Bool(false),
+                }
+            }
+            // ---- path strings (no filesystem access) -------------------------
+            "basename" => {
+                let p = arg(0).to_php_string();
+                let p = p.trim_end_matches(['/', '\\']);
+                let mut base = p.rsplit(['/', '\\']).next().unwrap_or(p).to_string();
+                let suffix = arg(1).to_php_string();
+                if !suffix.is_empty() && base.ends_with(&suffix) && base != suffix {
+                    base.truncate(base.len() - suffix.len());
+                }
+                Value::Str(base)
+            }
+            "dirname" => {
+                let mut s = arg(0).to_php_string();
+                let levels = to_long(&arg(1)).max(1);
+                for _ in 0..levels {
+                    let t = s.trim_end_matches(['/', '\\']);
+                    let next = match t.rfind(['/', '\\']) {
+                        Some(0) => "/".to_string(),
+                        Some(i) => t[..i].to_string(),
+                        None => ".".to_string(),
+                    };
+                    if next == s {
+                        break; // reached the root / cwd — can't go higher
+                    }
+                    s = next;
+                }
+                Value::Str(s)
+            }
+            "pathinfo" => {
+                let p = arg(0).to_php_string();
+                let pt = p.trim_end_matches(['/', '\\']);
+                let base = pt.rsplit(['/', '\\']).next().unwrap_or(pt).to_string();
+                let dir = match pt.rfind(['/', '\\']) {
+                    Some(0) => "/".to_string(),
+                    Some(i) => pt[..i].to_string(),
+                    None => ".".to_string(),
+                };
+                let (filename, ext) = match base.rfind('.') {
+                    Some(i) if i > 0 => (base[..i].to_string(), base[i + 1..].to_string()),
+                    _ => (base.clone(), String::new()),
+                };
+                let mut r = PArray::default();
+                r.set(AKey::Str("dirname".into()), Value::Str(dir));
+                r.set(AKey::Str("basename".into()), Value::Str(base));
+                if !ext.is_empty() {
+                    r.set(AKey::Str("extension".into()), Value::Str(ext));
+                }
+                r.set(AKey::Str("filename".into()), Value::Str(filename));
+                Value::Array(r)
+            }
             "extension_loaded" => Value::Bool(false),
             "range" => {
                 let lo = to_long(&arg(0));
@@ -7442,6 +7618,21 @@ fn php_constant(name: &str) -> Option<Value> {
         "STR_PAD_BOTH" => Value::Int(2),
         "COUNT_NORMAL" => Value::Int(0),
         "COUNT_RECURSIVE" => Value::Int(1),
+        "FILE_APPEND" => Value::Int(8),
+        "FILE_USE_INCLUDE_PATH" => Value::Int(1),
+        "FILE_IGNORE_NEW_LINES" => Value::Int(2),
+        "FILE_SKIP_EMPTY_LINES" => Value::Int(4),
+        "FILE_NO_DEFAULT_CONTEXT" => Value::Int(16),
+        "LOCK_SH" => Value::Int(1),
+        "LOCK_EX" => Value::Int(2),
+        "LOCK_UN" => Value::Int(3),
+        "SEEK_SET" => Value::Int(0),
+        "SEEK_CUR" => Value::Int(1),
+        "SEEK_END" => Value::Int(2),
+        "PATHINFO_DIRNAME" => Value::Int(1),
+        "PATHINFO_BASENAME" => Value::Int(2),
+        "PATHINFO_EXTENSION" => Value::Int(4),
+        "PATHINFO_FILENAME" => Value::Int(8),
         "DIRECTORY_SEPARATOR" => Value::Str(if cfg!(windows) { "\\".into() } else { "/".into() }),
         "PATH_SEPARATOR" => Value::Str(if cfg!(windows) { ";".into() } else { ":".into() }),
         "PHP_VERSION_ID" => Value::Int(80300),
