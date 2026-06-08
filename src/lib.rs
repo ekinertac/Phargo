@@ -439,6 +439,7 @@ pub fn run(source: &str) -> R<String> {
         funcs: HashMap::new(),
         classes: HashMap::new(),
         current_class: None,
+        static_props: HashMap::new(),
         return_val: None,
         call_depth: 0,
         thrown: None,
@@ -463,6 +464,8 @@ struct Engine {
     classes: HashMap<String, ClassDef>,
     /// Class name of the currently executing method (for `self`/`parent`/`static`).
     current_class: Option<String>,
+    /// Static property values, keyed by (lowercased declaring class, prop name).
+    static_props: HashMap<(String, String), Value>,
     /// Value stashed by `return`, picked up by the active call frame.
     return_val: Option<Value>,
     /// Current function-call nesting depth (guards against stack overflow).
@@ -2682,6 +2685,7 @@ impl Engine {
         }
         self.expect_char('{')?;
         let mut props: Vec<(String, Option<usize>)> = Vec::new();
+        let mut static_props: Vec<(String, Option<usize>)> = Vec::new();
         let mut consts: Vec<(String, usize)> = Vec::new();
         let mut methods: HashMap<String, FuncDef> = HashMap::new();
         loop {
@@ -2695,6 +2699,7 @@ impl Engine {
                 _ => {}
             }
             // consume modifiers / type tokens until we reach function/const/$prop
+            let mut is_static = false;
             let kind: &str = loop {
                 self.skip_ws();
                 if self.peek() == Some('$') {
@@ -2704,10 +2709,15 @@ impl Engine {
                     self.pos += 1;
                     continue;
                 }
-                match self.try_identifier().map(|s| s.to_ascii_lowercase()).as_deref() {
-                    Some("function") => break "function",
-                    Some("const") => break "const",
-                    Some(_) => continue, // modifier or type name — ignore
+                match self.try_identifier().map(|s| s.to_ascii_lowercase()) {
+                    Some(ref m) if m == "function" => break "function",
+                    Some(ref m) if m == "const" => break "const",
+                    Some(m) => {
+                        if m == "static" {
+                            is_static = true;
+                        }
+                        continue; // modifier or type name — ignore (track `static`)
+                    }
                     None => return Err(EngineError("unexpected token in class body".into())),
                 }
             };
@@ -2764,7 +2774,11 @@ impl Engine {
                         let _ = self.expression()?;
                         self.live = prev;
                     }
-                    props.push((pname, default));
+                    if is_static {
+                        static_props.push((pname, default));
+                    } else {
+                        props.push((pname, default));
+                    }
                     self.skip_ws();
                     if self.peek() == Some(',') {
                         self.pos += 1;
@@ -2780,8 +2794,22 @@ impl Engine {
             }
         }
         if self.live {
+            let clower = name.to_ascii_lowercase();
+            for (pn, defpos) in &static_props {
+                let v = match defpos {
+                    Some(p) => {
+                        let s = self.pos;
+                        self.pos = *p;
+                        let val = self.expression()?;
+                        self.pos = s;
+                        val
+                    }
+                    None => Value::Null,
+                };
+                self.static_props.insert((clower.clone(), pn.clone()), v);
+            }
             self.classes.insert(
-                name.to_ascii_lowercase(),
+                clower,
                 ClassDef {
                     parent,
                     props,
@@ -3305,7 +3333,32 @@ impl Engine {
         let class = self.resolve_class(id)?;
         self.skip_ws();
         if self.peek() == Some('$') {
-            return Err(EngineError("static properties not supported yet".into()));
+            let pname = self.parse_variable_name()?;
+            let dc = self
+                .find_static_class(&class, &pname)
+                .unwrap_or_else(|| class.to_ascii_lowercase());
+            let key = (dc, pname);
+            self.skip_ws();
+            if let Some(aop) = self.peek_assign_op() {
+                self.pos += aop.len();
+                self.skip_ws();
+                let rhs = self.parse_assignment()?;
+                if !self.live {
+                    return Ok(rhs);
+                }
+                let newval = if aop == "=" {
+                    rhs
+                } else {
+                    let cur = self.static_props.get(&key).cloned().unwrap_or(Value::Null);
+                    self.apply_binary(&aop[..aop.len() - 1], cur, rhs)?
+                };
+                self.static_props.insert(key, newval.clone());
+                return Ok(newval);
+            }
+            if !self.live {
+                return Ok(Value::Null);
+            }
+            return Ok(self.static_props.get(&key).cloned().unwrap_or(Value::Null));
         }
         let member = self
             .try_identifier()
@@ -3515,6 +3568,27 @@ impl Engine {
             }
         }
         false
+    }
+
+    /// Walk the class chain to find which class actually declares static `$name`.
+    fn find_static_class(&self, class: &str, name: &str) -> Option<String> {
+        let mut cur = Some(class.to_ascii_lowercase());
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 10_000 {
+                return None;
+            }
+            if self.static_props.contains_key(&(cn.clone(), name.to_string())) {
+                return Some(cn);
+            }
+            cur = self
+                .classes
+                .get(&cn)
+                .and_then(|cd| cd.parent.clone())
+                .map(|p| p.to_ascii_lowercase());
+        }
+        None
     }
 
     fn lookup_const(&self, class: &str, name: &str) -> Option<usize> {

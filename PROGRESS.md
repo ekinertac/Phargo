@@ -4,24 +4,24 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 724 / 21862  (3.31% of the entire PHP test suite)**
+**`.phpt` pass rate: 744 / 21862  (3.40% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 3.32%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 3.41%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 724 | 21072 | 66 | 21862 |
+| 744 | 21052 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 58/58 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 59/59 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 256 | 5329 | 4.8% |
+| `Zend` | 267 | 5329 | 5.0% |
 | `ext/standard` | 137 | 3877 | 3.5% |
-| `ext/opcache` | 218 | 916 | 23.8% |
-| `core` | 74 | 868 | 8.5% |
+| `ext/opcache` | 220 | 916 | 24.0% |
+| `core` | 81 | 868 | 9.3% |
 | `ext/dom` | 6 | 868 | 0.7% |
 | `ext/spl` | 3 | 796 | 0.4% |
 | `ext/date` | 0 | 689 | 0.0% |
@@ -125,6 +125,7 @@ The ladder to **"WordPress boots in the browser"**. Each rung is measured agains
 - [x] **v15 — By-reference array fns.** `sort`/`rsort`/`asort`/`arsort`/`ksort`/`krsort`/`usort`/`uasort`/`uksort` and `array_push`/`array_pop`/`array_shift`/`array_unshift` (mutate the caller's array in place).
 - [x] **v16 — More builtins.** `array_fill`/`array_fill_keys`/`array_combine`/`array_column`/`array_pad`/`array_product`/`array_key_first`/`array_key_last`/`array_diff`/`array_intersect`, `ctype_*`, `substr_count`, `str_word_count`.
 - [x] **v17 — `match` expression.** Strict `===` arms, multi-condition arms, `default`, `UnhandledMatchError` on no match.
+- [x] **v18 — Static class properties.** `public static $x = …`; `Class::$x` / `self::$x` read, write, and compound assignment (inherited via the class chain).
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)
