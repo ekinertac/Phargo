@@ -34,6 +34,10 @@ fn main() {
 }
 
 fn scan() {
+    // tests do real file I/O with relative paths — sandbox CWD to a temp dir
+    let scratch = std::env::temp_dir().join("phargo_scratch");
+    let _ = std::fs::create_dir_all(&scratch);
+    let _ = std::env::set_current_dir(&scratch);
     let root = env!("CARGO_MANIFEST_DIR");
     let dir = Path::new(root).join("vendor").join("php-src");
     let mut files = Vec::new();
@@ -61,6 +65,31 @@ fn scan() {
         samples.entry(key).or_insert(msg);
     }
     let _ = &samples;
+    // PATHS mode: print test file paths whose error contains a substring.
+    if let Some(rest) = std::env::args().nth(1).and_then(|a| a.strip_prefix("PATHS:").map(String::from)) {
+        let mut shown = 0;
+        for f in &files {
+            if shown >= 25 {
+                break;
+            }
+            let src = match fs::read_to_string(f) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let code = match section(&src, "--FILE--") {
+                Some(c) => c,
+                None => continue,
+            };
+            let res = std::panic::catch_unwind(|| phargo::run(&code));
+            if let Ok(Err(e)) = res {
+                if format!("{e:?}").contains(&rest) {
+                    println!("{}", f.display());
+                    shown += 1;
+                }
+            }
+        }
+        return;
+    }
     // Detailed breakdown: tally the backtick token for selected buckets.
     let want = std::env::args().nth(1);
     if let Some(bucket) = want {

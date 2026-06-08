@@ -1027,6 +1027,195 @@ impl Engine {
         })
     }
 
+    /// Build a stream handle (a synthetic `__Stream` object whose props hold the
+    /// kind/path/mode and an in-memory buffer + cursor).
+    fn make_stream(kind: &str, path: &str, mode: &str, buf: String) -> Value {
+        let props = vec![
+            ("__kind".to_string(), Value::Str(kind.to_string())),
+            ("__path".to_string(), Value::Str(path.to_string())),
+            ("__mode".to_string(), Value::Str(mode.to_string())),
+            ("__buf".to_string(), Value::Str(buf)),
+            ("__pos".to_string(), Value::Int(0)),
+        ];
+        Value::Object(Rc::new(RefCell::new(Obj {
+            class: "__Stream".to_string(),
+            props,
+        })))
+    }
+
+    fn stream_open(&mut self, path: &str, mode: &str) -> Value {
+        let m = mode.replace(['b', 't'], "");
+        let kind = match path {
+            "php://stdout" | "php://output" => "stdout",
+            "php://stderr" => "stderr",
+            "php://stdin" | "php://input" => "stdin",
+            "php://memory" | "php://temp" => "memory",
+            _ => "file",
+        };
+        if kind != "file" {
+            return Self::make_stream(kind, path, &m, String::new());
+        }
+        let first = m.chars().next().unwrap_or('r');
+        let buf = match first {
+            'r' | 'a' => match std::fs::read(path) {
+                Ok(b) => String::from_utf8_lossy(&b).to_string(),
+                Err(_) => {
+                    if first == 'r' {
+                        return Value::Bool(false); // r/r+ require an existing file
+                    }
+                    String::new()
+                }
+            },
+            _ => String::new(), // w/x/c: start empty (truncate)
+        };
+        if first == 'w' {
+            let _ = std::fs::write(path, b"");
+        }
+        let h = Self::make_stream("file", path, &m, buf);
+        if first == 'a' {
+            if let Some(Value::Object(o)) = Some(&h) {
+                let len = o.borrow().get("__buf").map(|v| v.to_php_string().len()).unwrap_or(0);
+                o.borrow_mut().set("__pos", Value::Int(len as i64));
+            }
+        }
+        h
+    }
+
+    fn stream_write(&mut self, h: &Value, data: &str) -> Value {
+        let kind = stream_get(h, "__kind").map(|v| v.to_php_string()).unwrap_or_default();
+        match kind.as_str() {
+            "stdout" => {
+                self.out.push_str(data);
+                Value::Int(data.len() as i64)
+            }
+            "stderr" => Value::Int(data.len() as i64), // not captured by --EXPECT--
+            _ => {
+                let mut buf = stream_get(h, "__buf").map(|v| v.to_php_string()).unwrap_or_default();
+                let pos = stream_get(h, "__pos").map(|v| to_long(&v)).unwrap_or(0).max(0) as usize;
+                let dbytes = data.as_bytes();
+                let mut bytes = buf.into_bytes();
+                if pos > bytes.len() {
+                    bytes.resize(pos, b' ');
+                }
+                for (i, b) in dbytes.iter().enumerate() {
+                    if pos + i < bytes.len() {
+                        bytes[pos + i] = *b;
+                    } else {
+                        bytes.push(*b);
+                    }
+                }
+                buf = String::from_utf8_lossy(&bytes).to_string();
+                let newpos = pos + dbytes.len();
+                stream_set(h, "__pos", Value::Int(newpos as i64));
+                stream_set(h, "__buf", Value::Str(buf.clone()));
+                if let Some(p) = stream_get(h, "__path") {
+                    let path = p.to_php_string();
+                    if !path.is_empty() {
+                        let _ = std::fs::write(&path, buf.as_bytes());
+                    }
+                }
+                Value::Int(data.len() as i64)
+            }
+        }
+    }
+
+    fn stream_read(&mut self, h: &Value, n: Option<usize>) -> Value {
+        let buf = stream_get(h, "__buf").map(|v| v.to_php_string()).unwrap_or_default();
+        let bytes = buf.into_bytes();
+        let pos = stream_get(h, "__pos").map(|v| to_long(&v)).unwrap_or(0).max(0) as usize;
+        if pos >= bytes.len() {
+            return Value::Str(String::new());
+        }
+        let end = match n {
+            Some(k) => (pos + k).min(bytes.len()),
+            None => bytes.len(),
+        };
+        let slice = String::from_utf8_lossy(&bytes[pos..end]).to_string();
+        stream_set(h, "__pos", Value::Int(end as i64));
+        Value::Str(slice)
+    }
+
+    fn stream_gets(&mut self, h: &Value, max: Option<usize>) -> Value {
+        let buf = stream_get(h, "__buf").map(|v| v.to_php_string()).unwrap_or_default();
+        let bytes = buf.into_bytes();
+        let pos = stream_get(h, "__pos").map(|v| to_long(&v)).unwrap_or(0).max(0) as usize;
+        if pos >= bytes.len() {
+            return Value::Bool(false);
+        }
+        let mut end = pos;
+        while end < bytes.len() {
+            let stop = bytes[end] == b'\n';
+            end += 1;
+            if stop {
+                break;
+            }
+            if let Some(m) = max {
+                if end - pos >= m.saturating_sub(1) {
+                    break;
+                }
+            }
+        }
+        let line = String::from_utf8_lossy(&bytes[pos..end]).to_string();
+        stream_set(h, "__pos", Value::Int(end as i64));
+        Value::Str(line)
+    }
+
+    fn stream_eof(&self, h: &Value) -> bool {
+        let len = stream_get(h, "__buf").map(|v| v.to_php_string().len()).unwrap_or(0);
+        let pos = stream_get(h, "__pos").map(|v| to_long(&v)).unwrap_or(0).max(0) as usize;
+        pos >= len
+    }
+
+    fn stream_flush(&mut self, h: &Value) {
+        if let (Some(p), Some(b)) = (stream_get(h, "__path"), stream_get(h, "__buf")) {
+            let path = p.to_php_string();
+            let kind = stream_get(h, "__kind").map(|v| v.to_php_string()).unwrap_or_default();
+            if kind == "file" && !path.is_empty() {
+                let _ = std::fs::write(&path, b.to_php_string().as_bytes());
+            }
+        }
+    }
+
+    fn stream_getcsv(&mut self, h: &Value) -> Value {
+        let line = match self.stream_gets(h, None) {
+            Value::Str(s) => s,
+            _ => return Value::Bool(false),
+        };
+        if line.is_empty() {
+            return Value::Bool(false);
+        }
+        let line = line.trim_end_matches(['\n', '\r']);
+        let mut fields = PArray::default();
+        let mut cur = String::new();
+        let mut in_q = false;
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if in_q {
+                if c == '"' {
+                    if chars.get(i + 1) == Some(&'"') {
+                        cur.push('"');
+                        i += 1;
+                    } else {
+                        in_q = false;
+                    }
+                } else {
+                    cur.push(c);
+                }
+            } else if c == '"' {
+                in_q = true;
+            } else if c == ',' {
+                fields.push(Value::Str(std::mem::take(&mut cur)));
+            } else {
+                cur.push(c);
+            }
+            i += 1;
+        }
+        fields.push(Value::Str(cur));
+        Value::Array(fields)
+    }
+
     /// Program loop (HTML + `<?php`) bounded by `end`, capturing a top-level
     /// `return` (which an included file may use).
     fn program_ranged(&mut self, end: usize) -> R<Flow> {
@@ -3785,6 +3974,105 @@ impl Engine {
                 Value::Array(r)
             }
             "extension_loaded" => Value::Bool(false),
+            // ---- streams (fopen family) --------------------------------------
+            "fopen" => {
+                let path = arg(0).to_php_string();
+                let mode = arg(1).to_php_string();
+                self.stream_open(&path, &mode)
+            }
+            "fwrite" | "fputs" => {
+                let data = arg(1).to_php_string();
+                let data = if args.len() > 2 {
+                    let n = to_long(&arg(2)).max(0) as usize;
+                    data.chars().take(n).collect()
+                } else {
+                    data
+                };
+                self.stream_write(&arg(0), &data)
+            }
+            "fread" => {
+                let n = to_long(&arg(1)).max(0) as usize;
+                self.stream_read(&arg(0), Some(n))
+            }
+            "stream_get_contents" => self.stream_read(&arg(0), None),
+            "fgets" => {
+                let max = if args.len() > 1 {
+                    Some(to_long(&arg(1)).max(0) as usize)
+                } else {
+                    None
+                };
+                self.stream_gets(&arg(0), max)
+            }
+            "fgetc" => self.stream_read(&arg(0), Some(1)),
+            "feof" => Value::Bool(self.stream_eof(&arg(0))),
+            "ftell" => Value::Int(stream_get(&arg(0), "__pos").map(|v| to_long(&v)).unwrap_or(0)),
+            "rewind" => {
+                stream_set(&arg(0), "__pos", Value::Int(0));
+                Value::Bool(true)
+            }
+            "fseek" => {
+                let off = to_long(&arg(1));
+                let whence = to_long(&arg(2));
+                let len = stream_get(&arg(0), "__buf").map(|v| v.to_php_string().len() as i64).unwrap_or(0);
+                let cur = stream_get(&arg(0), "__pos").map(|v| to_long(&v)).unwrap_or(0);
+                let np = match whence {
+                    1 => cur + off,    // SEEK_CUR
+                    2 => len + off,    // SEEK_END
+                    _ => off,          // SEEK_SET
+                }
+                .max(0);
+                stream_set(&arg(0), "__pos", Value::Int(np));
+                Value::Int(0)
+            }
+            "fclose" | "fflush" => {
+                self.stream_flush(&arg(0));
+                if name.eq_ignore_ascii_case("fclose") {
+                    stream_set(&arg(0), "__closed", Value::Bool(true));
+                }
+                Value::Bool(true)
+            }
+            "fgetcsv" => self.stream_getcsv(&arg(0)),
+            "fputcsv" => {
+                let fields = match arg(1) {
+                    Value::Array(a) => a,
+                    _ => return Ok(Value::Bool(false)),
+                };
+                let mut line = String::new();
+                for (i, (_, v)) in fields.entries.iter().enumerate() {
+                    if i > 0 {
+                        line.push(',');
+                    }
+                    let s = v.to_php_string();
+                    if s.contains([',', '"', '\n', '\r']) {
+                        line.push('"');
+                        line.push_str(&s.replace('"', "\"\""));
+                        line.push('"');
+                    } else {
+                        line.push_str(&s);
+                    }
+                }
+                line.push('\n');
+                self.stream_write(&arg(0), &line)
+            }
+            "is_resource" => Value::Bool(matches!(&arg(0), Value::Object(o)
+                if o.borrow().class == "__Stream"
+                && !matches!(o.borrow().get("__closed"), Some(Value::Bool(true))))),
+            "get_resource_type" => Value::Str("stream".into()),
+            "readfile" => match std::fs::read(arg(0).to_php_string()) {
+                Ok(b) => {
+                    let s = String::from_utf8_lossy(&b).to_string();
+                    let n = s.len();
+                    self.out.push_str(&s);
+                    Value::Int(n as i64)
+                }
+                Err(_) => Value::Bool(false),
+            },
+            "fpassthru" => {
+                let s = self.stream_read(&arg(0), None).to_php_string();
+                let n = s.len();
+                self.out.push_str(&s);
+                Value::Int(n as i64)
+            }
             "range" => {
                 let lo = to_long(&arg(0));
                 let hi = to_long(&arg(1));
@@ -5447,6 +5735,13 @@ impl Engine {
                             self.pos = after;
                             if let Some(v) = self.magic_constant(&id) {
                                 Ok(v)
+                            } else if matches!(id.as_str(), "STDIN" | "STDOUT" | "STDERR") {
+                                let kind = match id.as_str() {
+                                    "STDOUT" => "stdout",
+                                    "STDERR" => "stderr",
+                                    _ => "stdin",
+                                };
+                                Ok(Self::make_stream(kind, "", "w", String::new()))
                             } else if let Some(v) = self.consts.get(&id) {
                                 Ok(v.clone())
                             } else if let Some(v) = php_constant(&id) {
@@ -6317,6 +6612,21 @@ fn is_byref_builtin(name: &str) -> bool {
             | "array_shift"
             | "array_unshift"
     )
+}
+
+/// Read a property off a stream handle object.
+fn stream_get(h: &Value, k: &str) -> Option<Value> {
+    match h {
+        Value::Object(o) => o.borrow().get(k),
+        _ => None,
+    }
+}
+
+/// Set a property on a stream handle object.
+fn stream_set(h: &Value, k: &str, v: Value) {
+    if let Value::Object(o) = h {
+        o.borrow_mut().set(k, v);
+    }
 }
 
 /// Rebuild an array after a shift/unshift: integer keys renumber, string keys stay.
