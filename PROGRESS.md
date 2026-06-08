@@ -4,23 +4,23 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 1503 / 21862  (6.87% of the entire PHP test suite)**
+**`.phpt` pass rate: 1550 / 21862  (7.09% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 6.90%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 7.11%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 1503 | 20293 | 66 | 21862 |
+| 1550 | 20246 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 76/76 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 77/77 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 533 | 5329 | 10.0% |
-| `ext/standard` | 378 | 3877 | 9.7% |
-| `ext/opcache` | 297 | 916 | 32.4% |
+| `Zend` | 540 | 5329 | 10.1% |
+| `ext/standard` | 402 | 3877 | 10.4% |
+| `ext/opcache` | 298 | 916 | 32.5% |
 | `core` | 142 | 868 | 16.4% |
 | `ext/dom` | 6 | 868 | 0.7% |
 | `ext/spl` | 8 | 796 | 1.0% |
@@ -37,16 +37,16 @@ _Curated smoke tests (dev guards, **not** in the number above): 76/76 passing._
 | `ext/openssl` | 0 | 257 | 0.0% |
 | `ext/curl` | 0 | 175 | 0.0% |
 | `ext/bcmath` | 0 | 168 | 0.0% |
-| `ext/pcre` | 35 | 168 | 20.8% |
+| `ext/pcre` | 36 | 168 | 21.4% |
 | `ext/pdo_mysql` | 0 | 167 | 0.0% |
 | `ext/zend_test` | 3 | 159 | 1.9% |
-| `ext/zlib` | 5 | 157 | 3.2% |
+| `ext/zlib` | 6 | 157 | 3.8% |
 | `ext/simplexml` | 0 | 156 | 0.0% |
 | `sapi/fpm` | 0 | 141 | 0.0% |
 | `ext/ldap` | 0 | 140 | 0.0% |
 | `ext/pdo` | 0 | 127 | 0.0% |
 | `ext/sockets` | 0 | 123 | 0.0% |
-| `ext/filter` | 0 | 120 | 0.0% |
+| `ext/filter` | 13 | 120 | 10.8% |
 | `ext/zip` | 1 | 118 | 0.8% |
 | `sapi/cli` | 1 | 114 | 0.9% |
 | `ext/ffi` | 0 | 105 | 0.0% |

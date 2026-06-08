@@ -3974,6 +3974,173 @@ impl Engine {
                 Value::Array(r)
             }
             "extension_loaded" => Value::Bool(false),
+            // ---- more string / misc builtins ---------------------------------
+            "strstr" | "strchr" => {
+                let (h, nd) = (arg(0).to_php_string(), arg(1).to_php_string());
+                let before = to_bool(&arg(2));
+                match h.find(&nd) {
+                    Some(i) => Value::Str(if before { h[..i].to_string() } else { h[i..].to_string() }),
+                    None => Value::Bool(false),
+                }
+            }
+            "stristr" => {
+                let (h, nd) = (arg(0).to_php_string(), arg(1).to_php_string());
+                let before = to_bool(&arg(2));
+                match h.to_lowercase().find(&nd.to_lowercase()) {
+                    Some(i) => Value::Str(if before { h[..i].to_string() } else { h[i..].to_string() }),
+                    None => Value::Bool(false),
+                }
+            }
+            "strrchr" => {
+                let h = arg(0).to_php_string();
+                let nd = arg(1).to_php_string();
+                match nd.chars().next() {
+                    Some(c) => match h.rfind(c) {
+                        Some(i) => Value::Str(h[i..].to_string()),
+                        None => Value::Bool(false),
+                    },
+                    None => Value::Bool(false),
+                }
+            }
+            "strpbrk" => {
+                let h = arg(0).to_php_string();
+                let set: Vec<char> = arg(1).to_php_string().chars().collect();
+                match h.char_indices().find(|(_, c)| set.contains(c)) {
+                    Some((i, _)) => Value::Str(h[i..].to_string()),
+                    None => Value::Bool(false),
+                }
+            }
+            "fdiv" => {
+                let (a, b) = (to_f64(&arg(0)), to_f64(&arg(1)));
+                Value::Float(a / b)
+            }
+            "chdir" => Value::Bool(true), // sandboxed; relative I/O stays in scratch
+            "class_alias" => {
+                let orig = arg(0).to_php_string().to_ascii_lowercase();
+                let alias = arg(1).to_php_string().to_ascii_lowercase();
+                if let Some(def) = self.classes.get(&orig).cloned() {
+                    self.classes.insert(alias, def);
+                    Value::Bool(true)
+                } else {
+                    Value::Bool(false)
+                }
+            }
+            "array_walk" => {
+                let cb = arg(1);
+                let extra = arg(2);
+                if let Value::Array(a) = arg(0) {
+                    for (k, v) in a.entries {
+                        let mut callargs = vec![v, akey_to_value(&k)];
+                        if !matches!(extra, Value::Null) {
+                            callargs.push(extra.clone());
+                        }
+                        self.call_callable(&cb, callargs)?;
+                    }
+                }
+                Value::Bool(true)
+            }
+            "wordwrap" => {
+                let s = arg(0).to_php_string();
+                let width = if args.len() > 1 { to_long(&arg(1)).max(1) as usize } else { 75 };
+                let brk = if args.len() > 2 { arg(2).to_php_string() } else { "\n".into() };
+                let mut out = String::new();
+                let mut line_len = 0usize;
+                for (i, word) in s.split(' ').enumerate() {
+                    if i > 0 {
+                        if line_len + 1 + word.len() > width {
+                            out.push_str(&brk);
+                            line_len = 0;
+                        } else {
+                            out.push(' ');
+                            line_len += 1;
+                        }
+                    }
+                    out.push_str(word);
+                    line_len += word.len();
+                }
+                Value::Str(out)
+            }
+            "htmlentities" => {
+                let s = arg(0).to_php_string();
+                let mut out = String::new();
+                for c in s.chars() {
+                    match c {
+                        '&' => out.push_str("&amp;"),
+                        '<' => out.push_str("&lt;"),
+                        '>' => out.push_str("&gt;"),
+                        '"' => out.push_str("&quot;"),
+                        '\'' => out.push_str("&#039;"),
+                        _ => out.push(c),
+                    }
+                }
+                Value::Str(out)
+            }
+            "html_entity_decode" | "htmlspecialchars_decode" => {
+                let s = arg(0)
+                    .to_php_string()
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&quot;", "\"")
+                    .replace("&#039;", "'")
+                    .replace("&#39;", "'")
+                    .replace("&apos;", "'")
+                    .replace("&nbsp;", "\u{a0}")
+                    .replace("&amp;", "&");
+                Value::Str(s)
+            }
+            "filter_var" => {
+                let v = arg(0);
+                let filter = if args.len() > 1 { to_long(&arg(1)) } else { 516 };
+                match filter {
+                    257 => {
+                        // FILTER_VALIDATE_INT
+                        let s = v.to_php_string();
+                        match s.trim().parse::<i64>() {
+                            Ok(n) => Value::Int(n),
+                            Err(_) => Value::Bool(false),
+                        }
+                    }
+                    259 => {
+                        let s = v.to_php_string();
+                        match s.trim().parse::<f64>() {
+                            Ok(x) => Value::Float(x),
+                            Err(_) => Value::Bool(false),
+                        }
+                    }
+                    258 => {
+                        // FILTER_VALIDATE_BOOLEAN
+                        let s = v.to_php_string().trim().to_ascii_lowercase();
+                        match s.as_str() {
+                            "1" | "true" | "on" | "yes" => Value::Bool(true),
+                            "0" | "false" | "off" | "no" | "" => Value::Bool(false),
+                            _ => Value::Null,
+                        }
+                    }
+                    274 => {
+                        let s = v.to_php_string();
+                        let ok = s.contains('@')
+                            && s.split('@').count() == 2
+                            && s.rsplit('@').next().map(|d| d.contains('.')).unwrap_or(false)
+                            && !s.contains(' ');
+                        if ok { Value::Str(s) } else { Value::Bool(false) }
+                    }
+                    273 => {
+                        let s = v.to_php_string();
+                        if s.contains("://") && !s.contains(' ') {
+                            Value::Str(s)
+                        } else {
+                            Value::Bool(false)
+                        }
+                    }
+                    275 => {
+                        let s = v.to_php_string();
+                        let ok = s.split('.').count() == 4
+                            && s.split('.').all(|o| o.parse::<u8>().is_ok());
+                        if ok { Value::Str(s) } else { Value::Bool(false) }
+                    }
+                    _ => Value::Str(v.to_php_string()),
+                }
+            }
             // ---- mbstring (UTF-8; codepoint == Rust char) --------------------
             "mb_strlen" => Value::Int(arg(0).to_php_string().chars().count() as i64),
             "mb_strtoupper" => Value::Str(arg(0).to_php_string().to_uppercase()),

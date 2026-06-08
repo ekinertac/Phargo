@@ -26,4 +26,4 @@ cargo run
 
 ## Status
 
-**v34: 1446 / 21862 upstream php-src tests passing (6.61%).** The core language is largely there — variables, the full operator/type-juggling model, control flow, functions/closures, arrays + ~200 builtins, classes/interfaces/traits/enums, exceptions, constructor promotion, attributes, a from-scratch regex engine (`preg_*`), `include`/`require`/`eval`, output buffering, filesystem + path functions, and `serialize`/`unserialize`. The climb continues — see [PROGRESS.md](PROGRESS.md).
+**v36: 1550 / 21862 upstream php-src tests passing (7.09%).** The core language is largely there — variables, the full operator/type-juggling model, control flow, functions/closures, arrays + ~200 builtins, classes/interfaces/traits/enums, exceptions, constructor promotion, attributes, a from-scratch regex engine (`preg_*`), `include`/`require`/`eval`, output buffering, filesystem + path functions, file streams (`fopen` family + `STDIN`/`STDOUT`/`STDERR`), UTF-8 `mbstring` basics, and `serialize`/`unserialize`. The climb continues — see [PROGRESS.md](PROGRESS.md).
