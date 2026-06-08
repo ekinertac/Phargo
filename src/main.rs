@@ -434,6 +434,7 @@ const ROADMAP: &str = r#"The ladder to **"WordPress boots in the browser"**. Eac
 - [x] **v9 — `isset` / `empty` / `unset`** on variables, array elements, and object properties.
 - [x] **v10 — `::` + `__toString`.** Class constants (inherited), `self::`/`parent::`/`Class::` constants & static/method calls (with `$this` preserved), `::class`, and `__toString` for echo/interpolation. (TODO: static properties, late static binding.)
 - [x] **v11 — Exceptions + `instanceof`.** `throw`/`try`/`catch`/`finally`, the Exception/Error/SPL hierarchy (via a parsed PHP prelude), `getMessage`/`getCode`/etc., and `instanceof` over classes + interfaces.
+- [x] **v12 — Callables + higher-order builtins.** String/`[obj,method]` callables; `array_map`/`array_filter`/`array_reduce`/`call_user_func`(`_array`); `array_search`/`array_key_exists`/`array_flip`/`array_unique`/`array_slice`; `strcmp`/`strcasecmp`; `fmod`/`log`/`exp`/trig. (TODO: closures, by-ref `sort`/`usort`.)
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)

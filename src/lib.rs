@@ -1955,6 +1955,165 @@ impl Engine {
             "bindec" => Value::Int(i64::from_str_radix(&arg(0).to_php_string(), 2).unwrap_or(0)),
             "octdec" => Value::Int(i64::from_str_radix(&arg(0).to_php_string(), 8).unwrap_or(0)),
             "pi" => Value::Float(std::f64::consts::PI),
+            "call_user_func" => {
+                if args.is_empty() {
+                    Value::Null
+                } else {
+                    return self.call_callable(&args[0].clone(), args[1..].to_vec());
+                }
+            }
+            "call_user_func_array" => {
+                let cb = arg(0);
+                let callargs = match arg(1) {
+                    Value::Array(a) => a.entries.into_iter().map(|(_, v)| v).collect(),
+                    _ => Vec::new(),
+                };
+                return self.call_callable(&cb, callargs);
+            }
+            "array_map" => match arg(1) {
+                Value::Array(a) => {
+                    let cb = arg(0);
+                    let mut r = PArray::default();
+                    for (k, v) in a.entries {
+                        let m = if matches!(cb, Value::Null) {
+                            v
+                        } else {
+                            self.call_callable(&cb, vec![v])?
+                        };
+                        r.set(k, m);
+                    }
+                    Value::Array(r)
+                }
+                _ => Value::Null,
+            },
+            "array_filter" => match arg(0) {
+                Value::Array(a) => {
+                    let cb = arg(1);
+                    let mut r = PArray::default();
+                    for (k, v) in a.entries {
+                        let keep = if matches!(cb, Value::Null) {
+                            to_bool(&v)
+                        } else {
+                            to_bool(&self.call_callable(&cb, vec![v.clone()])?)
+                        };
+                        if keep {
+                            r.set(k, v);
+                        }
+                    }
+                    Value::Array(r)
+                }
+                _ => Value::Null,
+            },
+            "array_reduce" => match arg(0) {
+                Value::Array(a) => {
+                    let cb = arg(1);
+                    let mut acc = arg(2);
+                    for (_, v) in a.entries {
+                        acc = self.call_callable(&cb, vec![acc, v])?;
+                    }
+                    acc
+                }
+                _ => arg(2),
+            },
+            "array_search" => match arg(1) {
+                Value::Array(a) => {
+                    let needle = arg(0);
+                    match a.entries.iter().find(|(_, v)| loose_eq(&needle, v)) {
+                        Some((k, _)) => akey_to_value(k),
+                        None => Value::Bool(false),
+                    }
+                }
+                _ => Value::Bool(false),
+            },
+            "array_key_exists" | "key_exists" => match arg(1) {
+                Value::Array(a) => Value::Bool(a.get(&key_from_value(&arg(0))).is_some()),
+                _ => Value::Bool(false),
+            },
+            "array_flip" => match arg(0) {
+                Value::Array(a) => {
+                    let mut r = PArray::default();
+                    for (k, v) in &a.entries {
+                        r.set(key_from_value(v), akey_to_value(k));
+                    }
+                    Value::Array(r)
+                }
+                _ => Value::Null,
+            },
+            "array_unique" => match arg(0) {
+                Value::Array(a) => {
+                    let mut r = PArray::default();
+                    let mut seen: Vec<String> = Vec::new();
+                    for (k, v) in &a.entries {
+                        let s = v.to_php_string();
+                        if !seen.contains(&s) {
+                            seen.push(s);
+                            r.set(k.clone(), v.clone());
+                        }
+                    }
+                    Value::Array(r)
+                }
+                _ => Value::Null,
+            },
+            "array_slice" => match arg(0) {
+                Value::Array(a) => {
+                    let len = a.entries.len() as i64;
+                    let mut off = to_long(&arg(1));
+                    if off < 0 {
+                        off = (len + off).max(0);
+                    }
+                    let off = off.min(len) as usize;
+                    let count = if args.len() >= 3 && !matches!(arg(2), Value::Null) {
+                        let l = to_long(&arg(2));
+                        if l < 0 {
+                            ((len + l) - off as i64).max(0) as usize
+                        } else {
+                            l.max(0) as usize
+                        }
+                    } else {
+                        a.entries.len() - off
+                    };
+                    let mut r = PArray::default();
+                    for (k, v) in a.entries.iter().skip(off).take(count) {
+                        match k {
+                            AKey::Int(_) => r.push(v.clone()),
+                            AKey::Str(s) => r.set(AKey::Str(s.clone()), v.clone()),
+                        }
+                    }
+                    Value::Array(r)
+                }
+                _ => Value::Null,
+            },
+            "strcmp" => {
+                let (a, b) = (arg(0).to_php_string(), arg(1).to_php_string());
+                Value::Int(match a.cmp(&b) {
+                    Ordering::Less => -1,
+                    Ordering::Equal => 0,
+                    Ordering::Greater => 1,
+                })
+            }
+            "strcasecmp" => {
+                let a = arg(0).to_php_string().to_ascii_lowercase();
+                let b = arg(1).to_php_string().to_ascii_lowercase();
+                Value::Int(match a.cmp(&b) {
+                    Ordering::Less => -1,
+                    Ordering::Equal => 0,
+                    Ordering::Greater => 1,
+                })
+            }
+            "fmod" => Value::Float(to_f64(&arg(0)) % to_f64(&arg(1))),
+            "log" => {
+                let x = to_f64(&arg(0));
+                if args.len() >= 2 {
+                    Value::Float(x.log(to_f64(&arg(1))))
+                } else {
+                    Value::Float(x.ln())
+                }
+            }
+            "log10" => Value::Float(to_f64(&arg(0)).log10()),
+            "exp" => Value::Float(to_f64(&arg(0)).exp()),
+            "sin" => Value::Float(to_f64(&arg(0)).sin()),
+            "cos" => Value::Float(to_f64(&arg(0)).cos()),
+            "tan" => Value::Float(to_f64(&arg(0)).tan()),
             "htmlspecialchars" => {
                 let s = arg(0).to_php_string();
                 Value::Str(
@@ -2005,7 +2164,12 @@ impl Engine {
                 Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_)
             )),
             "is_array" => Value::Bool(matches!(arg(0), Value::Array(_))),
-            "is_object" | "is_callable" => Value::Bool(false),
+            "is_object" => Value::Bool(matches!(arg(0), Value::Object(_))),
+            "is_callable" => Value::Bool(match arg(0) {
+                Value::Str(s) => !s.is_empty(),
+                Value::Array(a) => a.entries.len() == 2,
+                _ => false,
+            }),
             "count" | "sizeof" => match arg(0) {
                 Value::Array(a) => Value::Int(a.entries.len() as i64),
                 _ => Value::Int(1),
@@ -2575,6 +2739,30 @@ impl Engine {
             None => Err(EngineError(format!(
                 "call to undefined method {class}::{method}()"
             ))),
+        }
+    }
+
+    /// Invoke a PHP callable: a function-name string, or `[receiver, "method"]`.
+    fn call_callable(&mut self, callable: &Value, args: Vec<Value>) -> R<Value> {
+        match callable {
+            Value::Str(name) => self.call_function(name, args),
+            Value::Array(a) if a.entries.len() == 2 => {
+                let recv = a.get(&AKey::Int(0)).cloned().unwrap_or(Value::Null);
+                let method = a
+                    .get(&AKey::Int(1))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string();
+                match &recv {
+                    Value::Object(_) => self.call_method(&recv, &method, args),
+                    Value::Str(cls) => match self.lookup_method(cls, &method) {
+                        Some(def) => self.call_user_function(def, args, None, Some(cls.clone())),
+                        None => Err(EngineError(format!("undefined method {cls}::{method}()"))),
+                    },
+                    _ => Err(EngineError("invalid callable array".into())),
+                }
+            }
+            _ => Err(EngineError("value is not callable".into())),
         }
     }
 
