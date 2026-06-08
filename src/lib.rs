@@ -46,6 +46,9 @@ struct Param {
     name: String,
     /// Source position of the default-value expression, if the param has one.
     default: Option<usize>,
+    /// Constructor property promotion: a leading `public`/`private`/`protected`
+    /// (and/or `readonly`) modifier means the arg is also stored on `$this`.
+    promoted: bool,
 }
 
 /// An anonymous function / arrow function. `captures` snapshots the outer
@@ -639,6 +642,44 @@ impl Engine {
         }
     }
 
+    /// Skip one or more `#[Attr(...)]` attribute groups (PHP 8 attributes),
+    /// which we parse-and-discard. Balances brackets, ignoring string contents.
+    fn skip_attributes(&mut self) {
+        loop {
+            self.skip_ws();
+            if !(self.peek() == Some('#') && self.peek_at(1) == Some('[')) {
+                break;
+            }
+            self.pos += 2;
+            let mut depth = 1;
+            while depth > 0 {
+                match self.peek() {
+                    Some('[') => {
+                        depth += 1;
+                        self.pos += 1;
+                    }
+                    Some(']') => {
+                        depth -= 1;
+                        self.pos += 1;
+                    }
+                    Some(q @ ('\'' | '"')) => {
+                        self.pos += 1;
+                        while let Some(ch) = self.peek() {
+                            self.pos += 1;
+                            if ch == '\\' {
+                                self.pos += 1;
+                            } else if ch == q {
+                                break;
+                            }
+                        }
+                    }
+                    None => break,
+                    _ => self.pos += 1,
+                }
+            }
+        }
+    }
+
     fn line_comment(&mut self) {
         while let Some(c) = self.peek() {
             if c == '\n' || self.starts_with("?>") {
@@ -700,6 +741,8 @@ impl Engine {
 
     fn statement(&mut self) -> R<Flow> {
         self.tick()?;
+        self.skip_ws();
+        self.skip_attributes();
         self.skip_ws();
         match self.peek() {
             None => return Ok(Flow::Normal),
@@ -3304,13 +3347,32 @@ impl Engine {
         }
         loop {
             self.skip_ws();
+            // attributes `#[...]` before a parameter
+            self.skip_attributes();
+            // constructor property promotion: leading visibility / readonly
+            let mut promoted = false;
+            loop {
+                let save = self.pos;
+                match self.try_identifier().map(|s| s.to_ascii_lowercase()) {
+                    Some(ref m)
+                        if matches!(m.as_str(), "public" | "private" | "protected" | "readonly") =>
+                    {
+                        promoted = true;
+                        self.skip_ws();
+                    }
+                    _ => {
+                        self.pos = save;
+                        break;
+                    }
+                }
+            }
             if self.peek() == Some('?') {
                 self.pos += 1; // nullable type
                 self.skip_ws();
             }
-            // type hint (incl. unions/namespaces) — parsed and ignored
+            // type hint (incl. unions/intersections/namespaces) — parsed and ignored
             if matches!(self.peek(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '\\') {
-                while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '\\' || c == '|') {
+                while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '\\' || c == '|' || c == '&') {
                     self.pos += 1;
                 }
                 self.skip_ws();
@@ -3338,7 +3400,11 @@ impl Engine {
                 let _ = self.expression()?; // skip past the default expression
                 self.live = prev;
             }
-            params.push(Param { name: pname, default });
+            params.push(Param {
+                name: pname,
+                default,
+                promoted,
+            });
             self.skip_ws();
             match self.peek() {
                 Some(',') => self.pos += 1,
@@ -3435,16 +3501,23 @@ impl Engine {
             let mut is_static = false;
             let kind: &str = loop {
                 self.skip_ws();
+                self.skip_attributes();
+                self.skip_ws();
                 if self.peek() == Some('$') {
                     break "prop";
                 }
-                if self.peek() == Some('?') {
+                if self.peek() == Some('}') {
+                    break "end";
+                }
+                // nullable / union / intersection / namespace separators in types
+                if matches!(self.peek(), Some('?') | Some('|') | Some('&') | Some('\\')) {
                     self.pos += 1;
                     continue;
                 }
                 match self.try_identifier().map(|s| s.to_ascii_lowercase()) {
                     Some(ref m) if m == "function" => break "function",
                     Some(ref m) if m == "const" => break "const",
+                    Some(ref m) if m == "use" => break "use",
                     Some(m) => {
                         if m == "static" {
                             is_static = true;
@@ -3455,6 +3528,67 @@ impl Engine {
                 }
             };
             match kind {
+                "end" => {
+                    self.expect_char('}')?;
+                    break;
+                }
+                "use" => {
+                    // trait use: merge the named traits' members into this class
+                    loop {
+                        self.skip_ws();
+                        if self.peek() == Some('\\') {
+                            self.pos += 1;
+                        }
+                        let tname = match self.try_identifier() {
+                            Some(n) => n,
+                            None => break,
+                        };
+                        let tl = tname.to_ascii_lowercase();
+                        if let Some(td) = self.classes.get(&tl).cloned() {
+                            for (mn, md) in td.methods {
+                                methods.entry(mn).or_insert(md);
+                            }
+                            for pr in td.props {
+                                if !props.iter().any(|(n, _)| *n == pr.0) {
+                                    props.push(pr);
+                                }
+                            }
+                            for cs in td.consts {
+                                if !consts.iter().any(|(n, _)| *n == cs.0) {
+                                    consts.push(cs);
+                                }
+                            }
+                        }
+                        self.skip_ws();
+                        if self.peek() == Some(',') {
+                            self.pos += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    self.skip_ws();
+                    if self.peek() == Some('{') {
+                        // conflict-resolution / aliasing block — skip it
+                        self.pos += 1;
+                        let mut depth = 1;
+                        while depth > 0 {
+                            match self.peek() {
+                                Some('{') => {
+                                    depth += 1;
+                                    self.pos += 1;
+                                }
+                                Some('}') => {
+                                    depth -= 1;
+                                    self.pos += 1;
+                                }
+                                None => break,
+                                _ => self.pos += 1,
+                            }
+                        }
+                    } else if self.peek() == Some(';') {
+                        self.pos += 1;
+                    }
+                }
                 "function" => {
                     self.skip_ws();
                     let mname = self
@@ -3605,6 +3739,16 @@ impl Engine {
             self.vars.insert(n, v);
         }
         if let Some(t) = this {
+            // constructor property promotion: copy promoted args onto $this
+            if let Value::Object(o) = &t {
+                for p in &func.params {
+                    if p.promoted {
+                        if let Some(v) = self.vars.get(&p.name).cloned() {
+                            o.borrow_mut().set(&p.name, v);
+                        }
+                    }
+                }
+            }
             self.vars.insert("this".to_string(), t);
         }
         let body_result = if func.body_start == usize::MAX {
