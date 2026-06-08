@@ -4,23 +4,23 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 839 / 21862  (3.84% of the entire PHP test suite)**
+**`.phpt` pass rate: 852 / 21862  (3.90% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 3.85%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 3.91%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 839 | 20957 | 66 | 21862 |
+| 852 | 20944 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 63/63 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 64/64 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
 | `Zend` | 277 | 5329 | 5.2% |
-| `ext/standard` | 219 | 3877 | 5.6% |
-| `ext/opcache` | 223 | 916 | 24.3% |
+| `ext/standard` | 231 | 3877 | 6.0% |
+| `ext/opcache` | 224 | 916 | 24.5% |
 | `core` | 81 | 868 | 9.3% |
 | `ext/dom` | 6 | 868 | 0.7% |
 | `ext/spl` | 3 | 796 | 0.4% |
@@ -130,6 +130,7 @@ The ladder to **"WordPress boots in the browser"**. Each rung is measured agains
 - [x] **v20 — More builtins.** `strtr` (both forms), `chunk_split`, `compact`, `levenshtein`, `array_is_list`, `quotemeta`.
 - [x] **v21 — Heredoc / nowdoc.** `<<<EOT` (interpolated) and `<<<'EOT'` (raw), with flexible (indented) closing markers.
 - [x] **v22 — Array destructuring.** `[$a, $b] = …` / `list($a, , $c) = …`, with skipped slots and nesting.
+- [x] **v23 — Hashing / encoding.** `md5`, `crc32`, `base64_encode`/`base64_decode`, `bin2hex`/`hex2bin` (from-scratch algorithms).
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)
