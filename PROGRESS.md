@@ -4,26 +4,26 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 1561 / 21862  (7.14% of the entire PHP test suite)**
+**`.phpt` pass rate: 1578 / 21862  (7.22% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 7.16%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 7.24%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 1561 | 20235 | 66 | 21862 |
+| 1578 | 20218 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 78/78 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 79/79 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 549 | 5329 | 10.3% |
-| `ext/standard` | 402 | 3877 | 10.4% |
-| `ext/opcache` | 300 | 916 | 32.8% |
-| `core` | 142 | 868 | 16.4% |
-| `ext/dom` | 6 | 868 | 0.7% |
-| `ext/spl` | 8 | 796 | 1.0% |
+| `Zend` | 557 | 5329 | 10.5% |
+| `ext/standard` | 403 | 3877 | 10.4% |
+| `ext/opcache` | 302 | 916 | 33.0% |
+| `core` | 144 | 868 | 16.6% |
+| `ext/dom` | 7 | 868 | 0.8% |
+| `ext/spl` | 9 | 796 | 1.1% |
 | `ext/date` | 1 | 689 | 0.1% |
 | `ext/soap` | 0 | 593 | 0.0% |
 | `ext/phar` | 13 | 574 | 2.3% |
@@ -47,7 +47,7 @@ _Curated smoke tests (dev guards, **not** in the number above): 78/78 passing._
 | `ext/pdo` | 0 | 127 | 0.0% |
 | `ext/sockets` | 0 | 123 | 0.0% |
 | `ext/filter` | 13 | 120 | 10.8% |
-| `ext/zip` | 1 | 118 | 0.8% |
+| `ext/zip` | 2 | 118 | 1.7% |
 | `sapi/cli` | 1 | 114 | 0.9% |
 | `ext/ffi` | 0 | 105 | 0.0% |
 | `ext/pgsql` | 0 | 102 | 0.0% |
@@ -68,7 +68,7 @@ _Curated smoke tests (dev guards, **not** in the number above): 78/78 passing._
 | `ext/posix` | 0 | 62 | 0.0% |
 | `ext/dba` | 0 | 59 | 0.0% |
 | `ext/ftp` | 0 | 57 | 0.0% |
-| `ext/xmlreader` | 1 | 56 | 1.8% |
+| `ext/xmlreader` | 2 | 56 | 3.6% |
 | `ext/calendar` | 0 | 53 | 0.0% |
 | `ext/tokenizer` | 0 | 53 | 0.0% |
 | `ext/xmlwriter` | 0 | 51 | 0.0% |

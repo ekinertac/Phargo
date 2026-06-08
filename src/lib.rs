@@ -2030,18 +2030,42 @@ impl Engine {
                 }
                 return self.assign_indexed(name, indices, aop, rhs);
             }
-            // object property lvalue: $obj->prop = ...
+            // object property lvalue: $obj->prop = ... or $obj->prop[k] = ...
             if indices.is_empty() && self.starts_with("->") {
                 let s2 = self.pos;
                 self.pos += 2;
                 self.skip_ws();
                 if let Some(prop) = self.try_identifier() {
+                    // optional index chain on the property
+                    let mut pindices: Vec<Option<Value>> = Vec::new();
+                    loop {
+                        let after = self.pos;
+                        self.skip_ws();
+                        if self.peek() == Some('[') {
+                            self.pos += 1;
+                            self.skip_ws();
+                            if self.peek() == Some(']') {
+                                self.pos += 1;
+                                pindices.push(None);
+                            } else {
+                                let k = self.expression()?;
+                                self.expect_char(']')?;
+                                pindices.push(Some(k));
+                            }
+                        } else {
+                            self.pos = after;
+                            break;
+                        }
+                    }
                     self.skip_ws();
                     if let Some(aop) = self.peek_assign_op() {
                         self.pos += aop.len();
                         self.skip_ws();
                         let rhs = self.parse_assignment()?;
-                        return self.assign_property(&name, &prop, aop, rhs);
+                        if pindices.is_empty() {
+                            return self.assign_property(&name, &prop, aop, rhs);
+                        }
+                        return self.assign_property_indexed(&name, &prop, pindices, aop, rhs);
                     }
                 }
                 self.pos = s2;
@@ -2133,6 +2157,21 @@ impl Engine {
         if !self.live {
             return Ok(rhs);
         }
+        // ArrayAccess: `$obj[k] = v` / `$obj[] = v` → offsetSet (single level).
+        if indices.len() == 1 {
+            if let Some(Value::Object(_)) = self.vars.get(&name) {
+                let obj = self.vars.get(&name).cloned().unwrap();
+                let key = indices[0].clone().unwrap_or(Value::Null);
+                let newval = if aop == "=" {
+                    rhs
+                } else {
+                    let cur = self.call_method(&obj, "offsetGet", vec![key.clone()])?;
+                    self.apply_binary(&aop[..aop.len() - 1], cur, rhs)?
+                };
+                self.call_method(&obj, "offsetSet", vec![key, newval.clone()])?;
+                return Ok(newval);
+            }
+        }
         let newval = if aop == "=" {
             rhs
         } else {
@@ -2140,6 +2179,47 @@ impl Engine {
             self.apply_binary(&aop[..aop.len() - 1], cur, rhs)?
         };
         let slot = self.vars.entry(name).or_insert(Value::Null);
+        set_path(slot, &indices, newval.clone());
+        Ok(newval)
+    }
+
+    /// Assign to an array element of an object property: `$obj->prop[k] = v`,
+    /// `$obj->prop[] = v` (single property level, nested indices).
+    fn assign_property_indexed(
+        &mut self,
+        name: &str,
+        prop: &str,
+        indices: Vec<Option<Value>>,
+        aop: &str,
+        rhs: Value,
+    ) -> R<Value> {
+        if !self.live {
+            return Ok(rhs);
+        }
+        let o = match self.vars.get(name) {
+            Some(Value::Object(o)) => o.clone(),
+            _ => {
+                return Err(EngineError(format!(
+                    "attempt to assign element of property `{prop}` on a non-object"
+                )))
+            }
+        };
+        // For compound ops, read the (small) current leaf first.
+        let newval = if aop == "=" {
+            rhs
+        } else {
+            let cur = index_get(&o.borrow().get(prop).unwrap_or(Value::Null), &indices);
+            self.apply_binary(&aop[..aop.len() - 1], cur, rhs)?
+        };
+        // Mutate the property's array IN PLACE (no whole-array clone per write).
+        let mut ob = o.borrow_mut();
+        if !ob.props.iter().any(|(n, _)| n == prop) {
+            ob.props.push((prop.to_string(), Value::Array(PArray::default())));
+        }
+        let slot = &mut ob.props.iter_mut().find(|(n, _)| n == prop).unwrap().1;
+        if !matches!(slot, Value::Array(_)) {
+            *slot = Value::Array(PArray::default());
+        }
         set_path(slot, &indices, newval.clone());
         Ok(newval)
     }
@@ -6188,31 +6268,36 @@ impl Engine {
 
         // Resolve the *leading* run of `[index]` accesses by reference so we
         // never clone a whole array container — only the small leaf element.
+        // (Skipped when the base is an object, e.g. ArrayAccess, so each index
+        // dispatches through offsetGet below.)
+        let base_is_object = matches!(self.vars.get(&name), Some(Value::Object(_)));
         let mut i = 0;
-        let mut keys: Vec<AKey> = Vec::new();
-        while let Some(Acc::Index(k)) = accs.get(i) {
-            keys.push(key_from_value(k));
-            i += 1;
-        }
-        let mut cur = self.read_keys(&name, &keys);
-        // Apply any remaining accesses (after a `->`) on the now-small value.
+        let mut cur = if base_is_object {
+            self.vars.get(&name).cloned().unwrap_or(Value::Null)
+        } else {
+            let mut keys: Vec<AKey> = Vec::new();
+            while let Some(Acc::Index(k)) = accs.get(i) {
+                keys.push(key_from_value(k));
+                i += 1;
+            }
+            self.read_keys(&name, &keys)
+        };
+        // Apply remaining accesses on the now-small value.
         while i < accs.len() {
             cur = match &accs[i] {
-                Acc::Index(k) => {
-                    let key = key_from_value(k);
-                    match &cur {
-                        Value::Array(a) => a.get(&key).cloned().unwrap_or(Value::Null),
-                        Value::Str(s) => match key {
-                            AKey::Int(n) => s
-                                .chars()
-                                .nth(n as usize)
-                                .map(|c| Value::Str(c.to_string()))
-                                .unwrap_or(Value::Str(String::new())),
-                            _ => Value::Null,
-                        },
+                Acc::Index(k) => match &cur {
+                    Value::Array(a) => a.get(&key_from_value(k)).cloned().unwrap_or(Value::Null),
+                    Value::Str(s) => match key_from_value(k) {
+                        AKey::Int(n) => s
+                            .chars()
+                            .nth(n as usize)
+                            .map(|c| Value::Str(c.to_string()))
+                            .unwrap_or(Value::Str(String::new())),
                         _ => Value::Null,
-                    }
-                }
+                    },
+                    Value::Object(_) => self.call_method(&cur, "offsetGet", vec![k.clone()])?,
+                    _ => Value::Null,
+                },
                 Acc::Prop(p) => read_property(&cur, p),
                 Acc::Method(m, args) => self.call_method(&cur, m, args.clone())?,
                 Acc::Call(args) => self.call_callable(&cur, args.clone())?,
@@ -6276,6 +6361,13 @@ impl Engine {
                 let key = key_from_value(&k);
                 cur = match cur {
                     Some(Value::Array(a)) => a.get(&key).cloned(),
+                    Some(obj @ Value::Object(_)) => {
+                        if to_bool(&self.call_method(&obj, "offsetExists", vec![k.clone()])?) {
+                            Some(self.call_method(&obj, "offsetGet", vec![k])?)
+                        } else {
+                            None
+                        }
+                    }
                     _ => None,
                 };
             } else if self.starts_with("->") {
@@ -6304,31 +6396,69 @@ impl Engine {
             return Ok(());
         }
         let name = self.parse_variable_name()?;
-        self.skip_ws();
-        if self.peek() == Some('[') {
-            self.pos += 1;
+        // Consume a full chain of `->prop` / `[k]` so parsing always succeeds.
+        enum Seg {
+            Prop(String),
+            Index(Value),
+        }
+        let mut segs: Vec<Seg> = Vec::new();
+        loop {
+            let after = self.pos;
             self.skip_ws();
-            let k = self.expression()?;
-            self.expect_char(']')?;
-            if self.live {
-                let key = key_from_value(&k);
-                if let Some(Value::Array(a)) = self.vars.get_mut(&name) {
-                    a.remove(&key);
-                }
+            if self.peek() == Some('[') {
+                self.pos += 1;
+                self.skip_ws();
+                let k = self.expression()?;
+                self.expect_char(']')?;
+                segs.push(Seg::Index(k));
+            } else if self.starts_with("->") {
+                self.pos += 2;
+                self.skip_ws();
+                let prop = self
+                    .try_identifier()
+                    .ok_or_else(|| EngineError("expected property after `->`".into()))?;
+                segs.push(Seg::Prop(prop));
+            } else {
+                self.pos = after;
+                break;
             }
-        } else if self.starts_with("->") {
-            self.pos += 2;
-            self.skip_ws();
-            let prop = self
-                .try_identifier()
-                .ok_or_else(|| EngineError("expected property after `->`".into()))?;
-            if self.live {
+        }
+        if !self.live {
+            return Ok(());
+        }
+        match segs.as_slice() {
+            [] => {
+                self.vars.remove(&name);
+            }
+            [Seg::Index(k)] => match self.vars.get(&name) {
+                Some(Value::Object(_)) => {
+                    let obj = self.vars.get(&name).cloned().unwrap();
+                    self.call_method(&obj, "offsetUnset", vec![k.clone()])?;
+                }
+                _ => {
+                    let key = key_from_value(k);
+                    if let Some(Value::Array(a)) = self.vars.get_mut(&name) {
+                        a.remove(&key);
+                    }
+                }
+            },
+            [Seg::Prop(p)] => {
                 if let Some(Value::Object(o)) = self.vars.get(&name) {
-                    o.borrow_mut().remove(&prop);
+                    o.borrow_mut().remove(p);
                 }
             }
-        } else if self.live {
-            self.vars.remove(&name);
+            [Seg::Prop(p), Seg::Index(k)] => {
+                if let Some(Value::Object(o)) = self.vars.get(&name).cloned() {
+                    let mut arr = o.borrow().get(p).unwrap_or(Value::Null);
+                    if let Value::Array(a) = &mut arr {
+                        a.remove(&key_from_value(k));
+                        o.borrow_mut().set(p, arr);
+                    } else if matches!(arr, Value::Object(_)) {
+                        self.call_method(&arr, "offsetUnset", vec![k.clone()])?;
+                    }
+                }
+            }
+            _ => {} // deeper chains: tokens consumed, best-effort no-op
         }
         Ok(())
     }
@@ -6751,6 +6881,25 @@ fn akey_to_value(k: &AKey) -> Value {
         AKey::Int(i) => Value::Int(*i),
         AKey::Str(s) => Value::Str(s.clone()),
     }
+}
+
+/// Read a value following an index path (returns Null on any miss / append).
+fn index_get(v: &Value, indices: &[Option<Value>]) -> Value {
+    let mut cur = v;
+    for idx in indices {
+        let key = match idx {
+            Some(k) => key_from_value(k),
+            None => return Value::Null,
+        };
+        cur = match cur {
+            Value::Array(a) => match a.get(&key) {
+                Some(x) => x,
+                None => return Value::Null,
+            },
+            _ => return Value::Null,
+        };
+    }
+    cur.clone()
 }
 
 /// Write `val` into `slot` following an index path, auto-vivifying arrays.
