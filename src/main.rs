@@ -244,7 +244,7 @@ const ROADMAP: &str = r#"The ladder to **"WordPress boots in the browser"**. Eac
 
 - [x] **v0 — Hello, World.** Inline HTML, `echo`, string/int literals, `.` concat.
 - [x] **v1 — Variables & types.** `$vars`, assignment, the zval value model (int/float/bool/null/string), `"$var"` interpolation.
-- [ ] **v2 — Operators & expressions.** Arithmetic, comparison, logical, precedence.
+- [x] **v2 — Operators & expressions.** Arithmetic, comparison, logical, precedence, parentheses, float literals, type juggling.
 - [ ] **v3 — Control flow.** `if`/`else`, `while`, `for`, `foreach`, `switch`.
 - [ ] **v4 — Functions.** User functions, parameters, return, scope.
 - [ ] **v5 — Arrays & strings.** PHP arrays (ordered maps) + the core built-ins WordPress leans on.

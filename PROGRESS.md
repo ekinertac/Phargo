@@ -4,22 +4,22 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 46 / 21872  (0.21% of the entire PHP test suite)**
+**`.phpt` pass rate: 63 / 21878  (0.29% of the entire PHP test suite)**
 
-_Among tests the runner can currently grade (13760): 0.33%. The 8112 "not-yet-gradeable" tests mostly use `--EXPECTF--`, which the runner doesn't match yet._
+_Among tests the runner can currently grade (13766): 0.46%. The 8112 "not-yet-gradeable" tests mostly use `--EXPECTF--`, which the runner doesn't match yet._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 46 | 13714 | 8112 | 21872 |
+| 63 | 13703 | 8112 | 21878 |
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 2 | 5329 | 0.0% |
-| `ext/standard` | 0 | 3877 | 0.0% |
+| `Zend` | 7 | 5329 | 0.1% |
+| `ext/standard` | 1 | 3877 | 0.0% |
 | `ext/opcache` | 6 | 916 | 0.7% |
-| `core` | 6 | 868 | 0.7% |
+| `core` | 10 | 868 | 1.2% |
 | `ext/dom` | 6 | 868 | 0.7% |
 | `ext/spl` | 0 | 796 | 0.0% |
 | `ext/date` | 0 | 689 | 0.0% |
@@ -84,9 +84,9 @@ _Among tests the runner can currently grade (13760): 0.33%. The 8112 "not-yet-gr
 | `ext/readline` | 0 | 25 | 0.0% |
 | `sapi/cgi` | 1 | 24 | 4.2% |
 | `ext/gettext` | 0 | 19 | 0.0% |
+| `_curated (ours)` | 15 | 16 | 93.8% |
 | `ext/pdo_odbc` | 0 | 16 | 0.0% |
 | `ext/sysvshm` | 0 | 12 | 0.0% |
-| `_curated (ours)` | 8 | 10 | 80.0% |
 | `ext/sysvmsg` | 0 | 7 | 0.0% |
 | `ext/shmop` | 0 | 5 | 0.0% |
 | `ext/skeleton` | 1 | 3 | 33.3% |
@@ -98,7 +98,7 @@ The ladder to **"WordPress boots in the browser"**. Each rung gets its own slice
 
 - [x] **v0 — Hello, World.** Inline HTML, `echo`, string/int literals, `.` concat.
 - [x] **v1 — Variables & types.** `$vars`, assignment, the zval value model (int/float/bool/null/string), `"$var"` interpolation.
-- [ ] **v2 — Operators & expressions.** Arithmetic, comparison, logical, precedence.
+- [x] **v2 — Operators & expressions.** Arithmetic, comparison, logical, precedence, parentheses, float literals, type juggling.
 - [ ] **v3 — Control flow.** `if`/`else`, `while`, `for`, `foreach`, `switch`.
 - [ ] **v4 — Functions.** User functions, parameters, return, scope.
 - [ ] **v5 — Arrays & strings.** PHP arrays (ordered maps) + the core built-ins WordPress leans on.
