@@ -2767,6 +2767,183 @@ impl Engine {
         }
     }
 
+    /// Built-ins that take their first argument by reference (sort family,
+    /// array_push/pop/shift/unshift). The first arg must be a plain `$var`.
+    fn byref_call(&mut self, name: &str) -> R<Value> {
+        self.expect_char('(')?;
+        self.skip_ws();
+        if self.peek() != Some('$') {
+            // first arg isn't a simple variable — consume to `)` and bail
+            let mut depth = 1;
+            while depth > 0 {
+                match self.peek() {
+                    Some('(') => {
+                        depth += 1;
+                        self.pos += 1;
+                    }
+                    Some(')') => {
+                        depth -= 1;
+                        self.pos += 1;
+                    }
+                    Some('\'') => {
+                        let _ = self.single_quoted()?;
+                    }
+                    Some('"') => {
+                        let _ = self.double_quoted()?;
+                    }
+                    None => break,
+                    _ => self.pos += 1,
+                }
+            }
+            return Ok(Value::Bool(false));
+        }
+        let varname = self.parse_variable_name()?;
+        let mut rest: Vec<Value> = Vec::new();
+        self.skip_ws();
+        while self.peek() == Some(',') {
+            self.pos += 1;
+            self.skip_ws();
+            if self.peek() == Some(')') {
+                break;
+            }
+            rest.push(self.expression()?);
+            self.skip_ws();
+        }
+        self.expect_char(')')?;
+        if !self.live {
+            return Ok(Value::Null);
+        }
+        let lname = name.to_ascii_lowercase();
+        let mut arr = match self.vars.get(&varname).cloned() {
+            Some(Value::Array(a)) => a,
+            _ => PArray::default(),
+        };
+        let result = match lname.as_str() {
+            "array_push" => {
+                for v in rest {
+                    arr.push(v);
+                }
+                Value::Int(arr.entries.len() as i64)
+            }
+            "array_pop" => {
+                let v = arr.entries.pop().map(|(_, v)| v).unwrap_or(Value::Null);
+                arr.index = None;
+                arr.ensure_index();
+                v
+            }
+            "array_shift" => {
+                if arr.entries.is_empty() {
+                    Value::Null
+                } else {
+                    let (_, v) = arr.entries.remove(0);
+                    arr = reindex(std::mem::take(&mut arr.entries));
+                    v
+                }
+            }
+            "array_unshift" => {
+                let old = std::mem::take(&mut arr.entries);
+                let mut na = PArray::default();
+                for v in rest {
+                    na.push(v);
+                }
+                for (k, val) in old {
+                    match k {
+                        AKey::Int(_) => na.push(val),
+                        AKey::Str(s) => na.set(AKey::Str(s), val),
+                    }
+                }
+                let n = na.entries.len() as i64;
+                arr = na;
+                Value::Int(n)
+            }
+            "sort" | "rsort" => {
+                let mut vals: Vec<Value> = arr.entries.iter().map(|(_, v)| v.clone()).collect();
+                if lname == "sort" {
+                    vals.sort_by(compare);
+                } else {
+                    vals.sort_by(|a, b| compare(b, a));
+                }
+                let mut na = PArray::default();
+                for v in vals {
+                    na.push(v);
+                }
+                arr = na;
+                Value::Bool(true)
+            }
+            "asort" | "arsort" => {
+                let mut entries = std::mem::take(&mut arr.entries);
+                if lname == "asort" {
+                    entries.sort_by(|(_, a), (_, b)| compare(a, b));
+                } else {
+                    entries.sort_by(|(_, a), (_, b)| compare(b, a));
+                }
+                let mut na = PArray::default();
+                for (k, v) in entries {
+                    na.set(k, v);
+                }
+                arr = na;
+                Value::Bool(true)
+            }
+            "ksort" | "krsort" => {
+                let mut entries = std::mem::take(&mut arr.entries);
+                if lname == "ksort" {
+                    entries.sort_by(|(a, _), (b, _)| {
+                        compare(&akey_to_value(a), &akey_to_value(b))
+                    });
+                } else {
+                    entries.sort_by(|(a, _), (b, _)| {
+                        compare(&akey_to_value(b), &akey_to_value(a))
+                    });
+                }
+                let mut na = PArray::default();
+                for (k, v) in entries {
+                    na.set(k, v);
+                }
+                arr = na;
+                Value::Bool(true)
+            }
+            "usort" | "uasort" | "uksort" => {
+                let cb = rest.first().cloned().unwrap_or(Value::Null);
+                let mut entries = std::mem::take(&mut arr.entries);
+                let mut err: Option<EngineError> = None;
+                entries.sort_by(|a, b| {
+                    let (x, y) = if lname == "uksort" {
+                        (akey_to_value(&a.0), akey_to_value(&b.0))
+                    } else {
+                        (a.1.clone(), b.1.clone())
+                    };
+                    match self.call_callable(&cb, vec![x, y]) {
+                        Ok(r) => to_long(&r).cmp(&0),
+                        Err(e) => {
+                            if err.is_none() {
+                                err = Some(e);
+                            }
+                            Ordering::Equal
+                        }
+                    }
+                });
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                let mut na = PArray::default();
+                if lname == "usort" {
+                    for (_, v) in entries {
+                        na.push(v);
+                    }
+                } else {
+                    for (k, v) in entries {
+                        na.set(k, v);
+                    }
+                }
+                arr = na;
+                Value::Bool(true)
+            }
+            _ => Value::Bool(false),
+        };
+        self.vars.insert(varname, Value::Array(arr));
+        Ok(result)
+    }
+
     /// Invoke a PHP callable: a function-name string, or `[receiver, "method"]`.
     fn call_callable(&mut self, callable: &Value, args: Vec<Value>) -> R<Value> {
         match callable {
@@ -3198,8 +3375,12 @@ impl Engine {
                             self.pos += 2;
                             self.static_access(&id)
                         } else if self.peek() == Some('(') {
-                            let args = self.parse_args()?;
-                            self.call_function(&id, args)
+                            if is_byref_builtin(&id) {
+                                self.byref_call(&id)
+                            } else {
+                                let args = self.parse_args()?;
+                                self.call_function(&id, args)
+                            }
                         } else {
                             self.pos = after;
                             match php_constant(&id) {
@@ -3696,6 +3877,37 @@ fn read_property(v: &Value, name: &str) -> Value {
         Value::Object(o) => o.borrow().get(name).unwrap_or(Value::Null),
         _ => Value::Null,
     }
+}
+
+fn is_byref_builtin(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "sort"
+            | "rsort"
+            | "asort"
+            | "arsort"
+            | "ksort"
+            | "krsort"
+            | "usort"
+            | "uasort"
+            | "uksort"
+            | "array_push"
+            | "array_pop"
+            | "array_shift"
+            | "array_unshift"
+    )
+}
+
+/// Rebuild an array after a shift/unshift: integer keys renumber, string keys stay.
+fn reindex(entries: Vec<(AKey, Value)>) -> PArray {
+    let mut na = PArray::default();
+    for (k, v) in entries {
+        match k {
+            AKey::Int(_) => na.push(v),
+            AKey::Str(s) => na.set(AKey::Str(s), v),
+        }
+    }
+    na
 }
 
 // ---- JSON ------------------------------------------------------------------

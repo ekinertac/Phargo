@@ -436,7 +436,8 @@ const ROADMAP: &str = r#"The ladder to **"WordPress boots in the browser"**. Eac
 - [x] **v11 — Exceptions + `instanceof`.** `throw`/`try`/`catch`/`finally`, the Exception/Error/SPL hierarchy (via a parsed PHP prelude), `getMessage`/`getCode`/etc., and `instanceof` over classes + interfaces.
 - [x] **v12 — Callables + higher-order builtins.** String/`[obj,method]` callables; `array_map`/`array_filter`/`array_reduce`/`call_user_func`(`_array`); `array_search`/`array_key_exists`/`array_flip`/`array_unique`/`array_slice`; `strcmp`/`strcasecmp`; `fmod`/`log`/`exp`/trig. (TODO: by-ref `sort`/`usort`.)
 - [x] **v13 — Closures.** Anonymous `function(...) use(...) {}` (by-value capture), arrow `fn(...) => expr` (auto-capture), and direct `$f(...)` invocation.
-- [x] **v14 — JSON.** `json_encode` (lists→arrays, maps/objects→objects, scalars) and `json_decode` (assoc arrays, or `stdClass` objects). (TODO: by-ref `sort`/`usort`.)
+- [x] **v14 — JSON.** `json_encode` (lists→arrays, maps/objects→objects, scalars) and `json_decode` (assoc arrays, or `stdClass` objects).
+- [x] **v15 — By-reference array fns.** `sort`/`rsort`/`asort`/`arsort`/`ksort`/`krsort`/`usort`/`uasort`/`uksort` and `array_push`/`array_pop`/`array_shift`/`array_unshift` (mutate the caller's array in place).
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)

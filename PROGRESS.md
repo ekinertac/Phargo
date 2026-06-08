@@ -4,22 +4,22 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 672 / 21862  (3.07% of the entire PHP test suite)**
+**`.phpt` pass rate: 690 / 21862  (3.16% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 3.08%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 3.17%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 672 | 21124 | 66 | 21862 |
+| 690 | 21106 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 55/55 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 56/56 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 241 | 5329 | 4.5% |
-| `ext/standard` | 103 | 3877 | 2.7% |
+| `Zend` | 242 | 5329 | 4.5% |
+| `ext/standard` | 120 | 3877 | 3.1% |
 | `ext/opcache` | 215 | 916 | 23.5% |
 | `core` | 74 | 868 | 8.5% |
 | `ext/dom` | 6 | 868 | 0.7% |
@@ -121,7 +121,8 @@ The ladder to **"WordPress boots in the browser"**. Each rung is measured agains
 - [x] **v11 — Exceptions + `instanceof`.** `throw`/`try`/`catch`/`finally`, the Exception/Error/SPL hierarchy (via a parsed PHP prelude), `getMessage`/`getCode`/etc., and `instanceof` over classes + interfaces.
 - [x] **v12 — Callables + higher-order builtins.** String/`[obj,method]` callables; `array_map`/`array_filter`/`array_reduce`/`call_user_func`(`_array`); `array_search`/`array_key_exists`/`array_flip`/`array_unique`/`array_slice`; `strcmp`/`strcasecmp`; `fmod`/`log`/`exp`/trig. (TODO: by-ref `sort`/`usort`.)
 - [x] **v13 — Closures.** Anonymous `function(...) use(...) {}` (by-value capture), arrow `fn(...) => expr` (auto-capture), and direct `$f(...)` invocation.
-- [x] **v14 — JSON.** `json_encode` (lists→arrays, maps/objects→objects, scalars) and `json_decode` (assoc arrays, or `stdClass` objects). (TODO: by-ref `sort`/`usort`.)
+- [x] **v14 — JSON.** `json_encode` (lists→arrays, maps/objects→objects, scalars) and `json_decode` (assoc arrays, or `stdClass` objects).
+- [x] **v15 — By-reference array fns.** `sort`/`rsort`/`asort`/`arsort`/`ksort`/`krsort`/`usort`/`uasort`/`uksort` and `array_push`/`array_pop`/`array_shift`/`array_unshift` (mutate the caller's array in place).
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)
