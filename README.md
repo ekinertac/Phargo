@@ -1,6 +1,6 @@
-# FerroPHP
+# Phargo
 
-A from-scratch, **memory-safe PHP engine written in Rust** — built the same way the Bun team rewrote Bun in Rust: drive an AI with the original project's **own test suite as the oracle**, and watch the pass-rate climb *in public*.
+**PHP + Cargo.** A from-scratch, **memory-safe PHP engine written in Rust** — built the same way the Bun team rewrote Bun in Rust: drive an AI with the original project's **own test suite as the oracle**, and watch the pass-rate climb *in public*.
 
 ## North star: run WordPress in the browser
 
@@ -26,4 +26,4 @@ cargo run
 
 ## Status
 
-**v0** implements: inline HTML, `echo`, string/integer literals, and `.` concatenation. That's it — on purpose. The rest is the journey. See the roadmap in [PROGRESS.md](PROGRESS.md).
+**v34: 1446 / 21862 upstream php-src tests passing (6.61%).** The core language is largely there — variables, the full operator/type-juggling model, control flow, functions/closures, arrays + ~200 builtins, classes/interfaces/traits/enums, exceptions, constructor promotion, attributes, a from-scratch regex engine (`preg_*`), `include`/`require`/`eval`, output buffering, filesystem + path functions, and `serialize`/`unserialize`. The climb continues — see [PROGRESS.md](PROGRESS.md).

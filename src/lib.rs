@@ -1,4 +1,4 @@
-//! FerroPHP — a from-scratch, memory-safe PHP engine written in Rust.
+//! Phargo — a from-scratch, memory-safe PHP engine written in Rust (PHP + Cargo).
 //!
 //! **v3b.** On top of v3 (control flow), this adds:
 //!   * assignment as an *expression* (`$a = $b = 3`) incl. compound

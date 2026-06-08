@@ -49,7 +49,7 @@ fn scan() {
             Some(c) => c,
             None => continue,
         };
-        let res = std::panic::catch_unwind(|| ferrophp::run(&code));
+        let res = std::panic::catch_unwind(|| phargo::run(&code));
         let msg = match res {
             Ok(Ok(_)) => continue,
             Ok(Err(e)) => format!("{e:?}"),
@@ -74,7 +74,7 @@ fn scan() {
                 Some(c) => c,
                 None => continue,
             };
-            let res = std::panic::catch_unwind(|| ferrophp::run(&code));
+            let res = std::panic::catch_unwind(|| phargo::run(&code));
             let msg = match res {
                 Ok(Err(e)) => format!("{e:?}"),
                 _ => continue,

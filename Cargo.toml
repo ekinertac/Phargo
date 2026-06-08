@@ -1,8 +1,8 @@
 [package]
-name = "ferrophp"
+name = "phargo"
 version = "0.0.1"
 edition = "2021"
-description = "FerroPHP — a from-scratch, memory-safe PHP engine in Rust. AI-assisted, built in public."
+description = "Phargo — a from-scratch, memory-safe PHP engine in Rust (PHP + Cargo). AI-assisted, built in public."
 license = "MIT OR Apache-2.0"
 
 # v0 is deliberately dependency-free: fast builds, nothing to explain, easy to audit.

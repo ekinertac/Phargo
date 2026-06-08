@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "ferrophp"
+name = "phargo"
 version = "0.0.1"
