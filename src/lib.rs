@@ -505,6 +505,8 @@ pub fn run(source: &str) -> R<String> {
         return_val: None,
         call_depth: 0,
         thrown: None,
+        consts: HashMap::new(),
+        ob_stack: Vec::new(),
     };
     engine.program()?;
     Ok(engine.out)
@@ -534,6 +536,10 @@ struct Engine {
     call_depth: usize,
     /// The in-flight thrown exception value (set by `throw`, cleared by `catch`).
     thrown: Option<Value>,
+    /// User-defined constants (`define(...)` and top-level `const`), case-sensitive.
+    consts: HashMap<String, Value>,
+    /// Output-buffering watermarks into `out` (one per active `ob_start`).
+    ob_stack: Vec<usize>,
 }
 
 /// A minimal exception/SPL class hierarchy, parsed before every script so that
@@ -788,6 +794,35 @@ impl Engine {
                 "return" => return self.return_statement(),
                 "break" => return self.break_continue(true),
                 "continue" => return self.break_continue(false),
+                "const" => return self.const_statement(),
+                "declare" => return self.declare_statement(),
+                "namespace" => return self.namespace_statement(),
+                "global" => {
+                    // bring named globals into the current scope (best-effort:
+                    // parse-skip the declaration)
+                    loop {
+                        self.skip_ws();
+                        if self.peek() == Some('$') {
+                            let _ = self.parse_variable_name()?;
+                        }
+                        self.skip_ws();
+                        if self.peek() == Some(',') {
+                            self.pos += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    self.end_statement()?;
+                    return Ok(Flow::Normal);
+                }
+                "use" => {
+                    // top-level namespace import — parse-skip to `;`
+                    while !matches!(self.peek(), None | Some(';')) {
+                        self.pos += 1;
+                    }
+                    self.end_statement()?;
+                    return Ok(Flow::Normal);
+                }
                 _ => self.pos = save, // not a keyword: fall through to expression statement
             }
         }
@@ -844,6 +879,93 @@ impl Engine {
         } else {
             Ok(Flow::Normal)
         }
+    }
+
+    fn const_statement(&mut self) -> R<Flow> {
+        loop {
+            self.skip_ws();
+            let name = self
+                .try_identifier()
+                .ok_or_else(|| EngineError("expected const name".into()))?;
+            self.skip_ws();
+            self.expect_char('=')?;
+            let v = self.expression()?;
+            if self.live {
+                self.consts.insert(name, v);
+            }
+            self.skip_ws();
+            if self.peek() == Some(',') {
+                self.pos += 1;
+                continue;
+            }
+            break;
+        }
+        self.end_statement()?;
+        Ok(Flow::Normal)
+    }
+
+    /// `declare(directive=value, …);` or `declare(…) { block }`. Directives
+    /// (strict_types, ticks, encoding) have no effect here — only the optional
+    /// block matters.
+    fn declare_statement(&mut self) -> R<Flow> {
+        self.skip_ws();
+        self.expect_char('(')?;
+        let mut depth = 1;
+        while depth > 0 {
+            match self.peek() {
+                Some('(') => {
+                    depth += 1;
+                    self.pos += 1;
+                }
+                Some(')') => {
+                    depth -= 1;
+                    self.pos += 1;
+                }
+                None => break,
+                _ => self.pos += 1,
+            }
+        }
+        self.skip_ws();
+        if self.peek() == Some('{') {
+            return self.block();
+        }
+        self.end_statement()?;
+        Ok(Flow::Normal)
+    }
+
+    /// `namespace Name;` or `namespace Name { block }`. We don't model namespaces;
+    /// the declaration is skipped and any block is executed inline.
+    fn namespace_statement(&mut self) -> R<Flow> {
+        self.skip_ws();
+        while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '\\') {
+            self.pos += 1;
+        }
+        self.skip_ws();
+        if self.peek() == Some('{') {
+            return self.block();
+        }
+        self.end_statement()?;
+        Ok(Flow::Normal)
+    }
+
+    /// Resolve a magic constant (`__CLASS__`, `__LINE__`, …). Returns `None`
+    /// for any other identifier.
+    fn magic_constant(&self, id: &str) -> Option<Value> {
+        Some(match id {
+            "__CLASS__" | "__TRAIT__" => {
+                Value::Str(self.current_class.clone().unwrap_or_default())
+            }
+            "__NAMESPACE__" => Value::Str(String::new()),
+            "__METHOD__" | "__FUNCTION__" => Value::Str(String::new()),
+            "__DIR__" | "__FILE__" => Value::Str(String::new()),
+            "__LINE__" => {
+                let upto = self.pos.min(self.src.len());
+                let nl = self.src[..upto].iter().filter(|c| **c == '\n').count();
+                let prelude_nl = PRELUDE.matches('\n').count();
+                Value::Int((nl.saturating_sub(prelude_nl) + 1) as i64)
+            }
+            _ => return None,
+        })
     }
 
     // ---- control flow ------------------------------------------------------
@@ -3260,6 +3382,87 @@ impl Engine {
                 }
                 Value::Array(result)
             }
+            "define" => {
+                let name = arg(0).to_php_string();
+                self.consts.insert(name, arg(1));
+                Value::Bool(true)
+            }
+            "defined" => Value::Bool(
+                self.consts.contains_key(&arg(0).to_php_string())
+                    || php_constant(&arg(0).to_php_string()).is_some(),
+            ),
+            "constant" => {
+                let n = arg(0).to_php_string();
+                self.consts
+                    .get(&n)
+                    .cloned()
+                    .or_else(|| php_constant(&n))
+                    .unwrap_or(Value::Null)
+            }
+            // ---- output buffering --------------------------------------------
+            "ob_start" => {
+                self.ob_stack.push(self.out.len());
+                Value::Bool(true)
+            }
+            "ob_get_contents" => match self.ob_stack.last() {
+                Some(&w) => Value::Str(self.out[w..].to_string()),
+                None => Value::Bool(false),
+            },
+            "ob_get_clean" => match self.ob_stack.pop() {
+                Some(w) => {
+                    let s = self.out[w..].to_string();
+                    self.out.truncate(w);
+                    Value::Str(s)
+                }
+                None => Value::Bool(false),
+            },
+            "ob_get_flush" => match self.ob_stack.pop() {
+                Some(w) => Value::Str(self.out[w..].to_string()),
+                None => Value::Bool(false),
+            },
+            "ob_end_clean" => match self.ob_stack.pop() {
+                Some(w) => {
+                    self.out.truncate(w);
+                    Value::Bool(true)
+                }
+                None => Value::Bool(false),
+            },
+            "ob_end_flush" | "ob_flush" | "flush" => {
+                if name.eq_ignore_ascii_case("ob_end_flush") {
+                    self.ob_stack.pop();
+                }
+                Value::Bool(true)
+            }
+            "ob_get_level" => Value::Int(self.ob_stack.len() as i64),
+            "ob_get_length" => match self.ob_stack.last() {
+                Some(&w) => Value::Int((self.out.len() - w) as i64),
+                None => Value::Bool(false),
+            },
+            // ---- environment / setup no-ops ----------------------------------
+            "error_reporting" => Value::Int(32767),
+            "ini_set" | "ini_get" => Value::Bool(false),
+            "set_error_handler" | "set_exception_handler" | "restore_error_handler"
+            | "restore_exception_handler" => Value::Null,
+            "spl_autoload_register" | "register_shutdown_function" | "register_tick_function" => {
+                Value::Bool(true)
+            }
+            "trigger_error" | "set_time_limit" | "declare" | "gc_collect_cycles"
+            | "gc_enable" | "gc_disable" | "clearstatcache" | "usleep" | "sleep"
+            | "srand" | "mt_srand" | "putenv" | "setlocale" | "header"
+            | "date_default_timezone_set" => Value::Bool(true),
+            "date_default_timezone_get" => Value::Str("UTC".into()),
+            "assert" => Value::Bool(true),
+            "getenv" => match std::env::var(arg(0).to_php_string()) {
+                Ok(v) => Value::Str(v),
+                Err(_) => Value::Bool(false),
+            },
+            "class_exists" | "interface_exists" | "trait_exists" | "enum_exists" => {
+                Value::Bool(self.classes.contains_key(&arg(0).to_php_string().to_ascii_lowercase()))
+            }
+            "function_exists" => {
+                Value::Bool(self.funcs.contains_key(&arg(0).to_php_string().to_ascii_lowercase()))
+            }
+            "extension_loaded" => Value::Bool(false),
             "range" => {
                 let lo = to_long(&arg(0));
                 let hi = to_long(&arg(1));
@@ -4674,6 +4877,32 @@ impl Engine {
                     "true" => Ok(Value::Bool(true)),
                     "false" => Ok(Value::Bool(false)),
                     "null" => Ok(Value::Null),
+                    "print" => {
+                        let v = self.parse_unary()?;
+                        if self.live {
+                            let s = self.stringify(&v)?;
+                            self.out.push_str(&s);
+                        }
+                        Ok(Value::Int(1))
+                    }
+                    "clone" => {
+                        let v = self.parse_unary()?;
+                        match v {
+                            Value::Object(o) => {
+                                let (class, props) = {
+                                    let b = o.borrow();
+                                    (b.class.clone(), b.props.clone())
+                                };
+                                let newo = Rc::new(RefCell::new(Obj { class: class.clone(), props }));
+                                let nv = Value::Object(newo);
+                                if let Some(def) = self.lookup_method(&class, "__clone") {
+                                    self.call_user_function(def, Vec::new(), Some(nv.clone()), Some(class))?;
+                                }
+                                Ok(nv)
+                            }
+                            other => Ok(other),
+                        }
+                    }
                     "isset" => {
                         self.expect_char('(')?;
                         let mut all = true;
@@ -4758,9 +4987,16 @@ impl Engine {
                             }
                         } else {
                             self.pos = after;
-                            match php_constant(&id) {
-                                Some(v) => Ok(v),
-                                None => Err(EngineError(format!("undefined constant `{id}`"))),
+                            if let Some(v) = self.magic_constant(&id) {
+                                Ok(v)
+                            } else if let Some(v) = self.consts.get(&id) {
+                                Ok(v.clone())
+                            } else if let Some(v) = php_constant(&id) {
+                                Ok(v)
+                            } else if !self.live {
+                                Ok(Value::Null)
+                            } else {
+                                Err(EngineError(format!("undefined constant `{id}`")))
                             }
                         }
                     }

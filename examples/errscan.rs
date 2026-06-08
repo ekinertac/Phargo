@@ -60,6 +60,41 @@ fn scan() {
         *tally.entry(key.clone()).or_insert(0) += 1;
         samples.entry(key).or_insert(msg);
     }
+    let _ = &samples;
+    // Detailed breakdown: tally the backtick token for selected buckets.
+    let want = std::env::args().nth(1);
+    if let Some(bucket) = want {
+        let mut detail: HashMap<String, usize> = HashMap::new();
+        for f in &files {
+            let src = match fs::read_to_string(f) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let code = match section(&src, "--FILE--") {
+                Some(c) => c,
+                None => continue,
+            };
+            let res = std::panic::catch_unwind(|| ferrophp::run(&code));
+            let msg = match res {
+                Ok(Err(e)) => format!("{e:?}"),
+                _ => continue,
+            };
+            if !msg.contains(&bucket) {
+                continue;
+            }
+            if let (Some(a), Some(b)) = (msg.find('`'), msg.rfind('`')) {
+                if b > a {
+                    *detail.entry(msg[a + 1..b].to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut v: Vec<_> = detail.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        for (k, n) in v.into_iter().take(50) {
+            println!("{n:5}  {k}");
+        }
+        return;
+    }
     let mut v: Vec<_> = tally.into_iter().collect();
     v.sort_by(|a, b| b.1.cmp(&a.1));
     for (k, n) in v.into_iter().take(40) {
