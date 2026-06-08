@@ -629,6 +629,95 @@ class RangeException extends RuntimeException {}
 class UnderflowException extends RuntimeException {}
 class UnexpectedValueException extends RuntimeException {}
 class JsonException extends Exception {}
+
+// ---- SPL (implemented in PHP atop ArrayAccess + the iterator protocol) ----
+class ArrayIterator implements Iterator, ArrayAccess, Countable {
+    private $__d; private $__k; private $__p = 0;
+    public function __construct($array = []) { $this->__d = $array; $this->__k = array_keys($array); }
+    public function rewind(): void { $this->__k = array_keys($this->__d); $this->__p = 0; }
+    public function valid(): bool { return $this->__p < count($this->__k); }
+    public function current(): mixed { return $this->__d[$this->__k[$this->__p]]; }
+    public function key(): mixed { return $this->__k[$this->__p]; }
+    public function next(): void { $this->__p = $this->__p + 1; }
+    public function offsetExists($k): bool { return isset($this->__d[$k]); }
+    public function offsetGet($k): mixed { return $this->__d[$k] ?? null; }
+    public function offsetSet($k, $v): void { if ($k === null) { $this->__d[] = $v; } else { $this->__d[$k] = $v; } }
+    public function offsetUnset($k): void { unset($this->__d[$k]); }
+    public function count(): int { return count($this->__d); }
+    public function getArrayCopy() { return $this->__d; }
+}
+class ArrayObject implements ArrayAccess, IteratorAggregate, Countable {
+    private $__d;
+    public function __construct($array = []) { $this->__d = $array; }
+    public function offsetExists($k): bool { return isset($this->__d[$k]); }
+    public function offsetGet($k): mixed { return $this->__d[$k] ?? null; }
+    public function offsetSet($k, $v): void { if ($k === null) { $this->__d[] = $v; } else { $this->__d[$k] = $v; } }
+    public function offsetUnset($k): void { unset($this->__d[$k]); }
+    public function count(): int { return count($this->__d); }
+    public function getArrayCopy() { return $this->__d; }
+    public function append($v) { $this->__d[] = $v; }
+    public function getIterator(): Iterator { return new ArrayIterator($this->__d); }
+}
+class SplDoublyLinkedList implements Iterator, Countable, ArrayAccess {
+    protected $__d = []; protected $__p = 0; protected $__lifo = false;
+    public function push($v) { $this->__d[] = $v; }
+    public function pop() { return array_pop($this->__d); }
+    public function shift() { return array_shift($this->__d); }
+    public function unshift($v) { array_unshift($this->__d, $v); }
+    public function top() { return $this->__d[count($this->__d) - 1]; }
+    public function bottom() { return $this->__d[0]; }
+    public function isEmpty() { return count($this->__d) === 0; }
+    public function count(): int { return count($this->__d); }
+    public function offsetExists($k): bool { return isset($this->__d[$k]); }
+    public function offsetGet($k): mixed { return $this->__d[$k]; }
+    public function offsetSet($k, $v): void { if ($k === null) { $this->__d[] = $v; } else { $this->__d[$k] = $v; } }
+    public function offsetUnset($k): void { unset($this->__d[$k]); $n = []; foreach ($this->__d as $x) { $n[] = $x; } $this->__d = $n; }
+    public function rewind(): void { $this->__p = $this->__lifo ? count($this->__d) - 1 : 0; }
+    public function valid(): bool { return $this->__p >= 0 && $this->__p < count($this->__d); }
+    public function current(): mixed { return $this->__d[$this->__p]; }
+    public function key(): mixed { return $this->__p; }
+    public function next(): void { if ($this->__lifo) { $this->__p = $this->__p - 1; } else { $this->__p = $this->__p + 1; } }
+}
+class SplStack extends SplDoublyLinkedList {
+    public function __construct() { $this->__lifo = true; }
+}
+class SplQueue extends SplDoublyLinkedList {
+    public function enqueue($v) { $this->push($v); }
+    public function dequeue() { return $this->shift(); }
+}
+class SplFixedArray implements ArrayAccess, Countable, Iterator {
+    private $__d = []; private $__size = 0; private $__p = 0;
+    public function __construct($size = 0) { $this->__size = $size; for ($i = 0; $i < $size; $i = $i + 1) { $this->__d[$i] = null; } }
+    public function offsetExists($k): bool { return $k >= 0 && $k < $this->__size; }
+    public function offsetGet($k): mixed { return $this->__d[$k] ?? null; }
+    public function offsetSet($k, $v): void { $this->__d[$k] = $v; }
+    public function offsetUnset($k): void { $this->__d[$k] = null; }
+    public function count(): int { return $this->__size; }
+    public function getSize() { return $this->__size; }
+    public function toArray() { return $this->__d; }
+    public function rewind(): void { $this->__p = 0; }
+    public function valid(): bool { return $this->__p < $this->__size; }
+    public function current(): mixed { return $this->__d[$this->__p] ?? null; }
+    public function key(): mixed { return $this->__p; }
+    public function next(): void { $this->__p = $this->__p + 1; }
+}
+class SplObjectStorage implements Countable, Iterator, ArrayAccess {
+    private $__o = []; private $__v = []; private $__k = []; private $__p = 0;
+    public function attach($obj, $data = null) { $h = spl_object_id($obj); $this->__o[$h] = $obj; $this->__v[$h] = $data; }
+    public function detach($obj) { $h = spl_object_id($obj); unset($this->__o[$h]); unset($this->__v[$h]); }
+    public function contains($obj) { return isset($this->__o[spl_object_id($obj)]); }
+    public function count(): int { return count($this->__o); }
+    public function offsetExists($obj): bool { return $this->contains($obj); }
+    public function offsetGet($obj): mixed { return $this->__v[spl_object_id($obj)] ?? null; }
+    public function offsetSet($obj, $data): void { $this->attach($obj, $data); }
+    public function offsetUnset($obj): void { $this->detach($obj); }
+    public function rewind(): void { $this->__k = array_keys($this->__o); $this->__p = 0; }
+    public function valid(): bool { return $this->__p < count($this->__k); }
+    public function current(): mixed { return $this->__o[$this->__k[$this->__p]]; }
+    public function key(): mixed { return $this->__p; }
+    public function getInfo() { return $this->__v[$this->__k[$this->__p]] ?? null; }
+    public function next(): void { $this->__p = $this->__p + 1; }
+}
 ?>
 "##;
 
@@ -3623,6 +3712,15 @@ impl Engine {
             }),
             "count" | "sizeof" => match arg(0) {
                 Value::Array(a) => Value::Int(a.entries.len() as i64),
+                // Countable: count($obj) calls $obj->count()
+                ref o @ Value::Object(ref obj) => {
+                    let class = obj.borrow().class.clone();
+                    if self.lookup_method(&class, "count").is_some() {
+                        self.call_method(o, "count", Vec::new())?
+                    } else {
+                        Value::Int(1)
+                    }
+                }
                 _ => Value::Int(1),
             },
             "in_array" => match arg(1) {
@@ -4128,6 +4226,59 @@ impl Engine {
                 Value::Array(r)
             }
             "extension_loaded" => Value::Bool(false),
+            "spl_object_id" => match arg(0) {
+                Value::Object(o) => Value::Int(Rc::as_ptr(&o) as *const () as usize as i64),
+                _ => Value::Int(0),
+            },
+            "spl_object_hash" => match arg(0) {
+                Value::Object(o) => {
+                    Value::Str(format!("{:032x}", Rc::as_ptr(&o) as *const () as usize))
+                }
+                _ => Value::Str(String::new()),
+            },
+            "iterator_to_array" => {
+                let mut r = PArray::default();
+                match arg(0) {
+                    Value::Array(a) => r = a,
+                    obj @ Value::Object(_) => {
+                        let use_keys = args.get(1).map(|v| to_bool(v)).unwrap_or(true);
+                        self.call_method(&obj, "rewind", Vec::new())?;
+                        let mut guard = 0;
+                        while to_bool(&self.call_method(&obj, "valid", Vec::new())?) {
+                            guard += 1;
+                            if guard > LOOP_CAP {
+                                break;
+                            }
+                            let v = self.call_method(&obj, "current", Vec::new())?;
+                            if use_keys {
+                                let k = self.call_method(&obj, "key", Vec::new())?;
+                                r.set(key_from_value(&k), v);
+                            } else {
+                                r.push(v);
+                            }
+                            self.call_method(&obj, "next", Vec::new())?;
+                        }
+                    }
+                    _ => {}
+                }
+                Value::Array(r)
+            }
+            "iterator_count" => match arg(0) {
+                Value::Array(a) => Value::Int(a.entries.len() as i64),
+                obj @ Value::Object(_) => {
+                    let mut n = 0i64;
+                    self.call_method(&obj, "rewind", Vec::new())?;
+                    while to_bool(&self.call_method(&obj, "valid", Vec::new())?) {
+                        n += 1;
+                        if n as u64 > LOOP_CAP {
+                            break;
+                        }
+                        self.call_method(&obj, "next", Vec::new())?;
+                    }
+                    Value::Int(n)
+                }
+                _ => Value::Int(0),
+            },
             // ---- more string / misc builtins ---------------------------------
             "strstr" | "strchr" => {
                 let (h, nd) = (arg(0).to_php_string(), arg(1).to_php_string());
@@ -5187,6 +5338,16 @@ impl Engine {
             return Ok(Value::Bool(false));
         }
         let varname = self.parse_variable_name()?;
+        // Optional single `->prop` so the by-ref target can be an object property
+        // (`array_push($this->items, …)`, `sort($obj->list)`).
+        self.skip_ws();
+        let target_prop = if self.starts_with("->") {
+            self.pos += 2;
+            self.skip_ws();
+            self.try_identifier()
+        } else {
+            None
+        };
         let mut rest: Vec<Value> = Vec::new();
         self.skip_ws();
         while self.peek() == Some(',') {
@@ -5203,9 +5364,18 @@ impl Engine {
             return Ok(Value::Null);
         }
         let lname = name.to_ascii_lowercase();
-        let mut arr = match self.vars.get(&varname).cloned() {
-            Some(Value::Array(a)) => a,
-            _ => PArray::default(),
+        let mut arr = match &target_prop {
+            Some(p) => match self.vars.get(&varname) {
+                Some(Value::Object(o)) => match o.borrow().get(p) {
+                    Some(Value::Array(a)) => a,
+                    _ => PArray::default(),
+                },
+                _ => PArray::default(),
+            },
+            None => match self.vars.get(&varname).cloned() {
+                Some(Value::Array(a)) => a,
+                _ => PArray::default(),
+            },
         };
         let result = match lname.as_str() {
             "array_push" => {
@@ -5217,6 +5387,13 @@ impl Engine {
             "array_pop" => {
                 let v = arr.entries.pop().map(|(_, v)| v).unwrap_or(Value::Null);
                 arr.index = None;
+                // PHP resets the next auto-index to max(int keys)+1 after a pop.
+                arr.next_index = arr
+                    .entries
+                    .iter()
+                    .filter_map(|(k, _)| if let AKey::Int(n) = k { Some(*n + 1) } else { None })
+                    .max()
+                    .unwrap_or(0);
                 arr.ensure_index();
                 v
             }
@@ -5329,7 +5506,16 @@ impl Engine {
             }
             _ => Value::Bool(false),
         };
-        self.vars.insert(varname, Value::Array(arr));
+        match &target_prop {
+            Some(p) => {
+                if let Some(Value::Object(o)) = self.vars.get(&varname) {
+                    o.borrow_mut().set(p, Value::Array(arr));
+                }
+            }
+            None => {
+                self.vars.insert(varname, Value::Array(arr));
+            }
+        }
         Ok(result)
     }
 
@@ -8590,9 +8776,17 @@ fn php_type_name(v: &Value) -> &'static str {
 
 /// `var_dump` output (with trailing newline). `indent` is the leading space
 /// count for this value's line — arrays recurse with `indent + 2`.
+fn obj_ptr(o: &ObjRef) -> usize {
+    Rc::as_ptr(o) as *const () as usize
+}
+
 fn var_dump_str(v: &Value, indent: usize) -> String {
-    if indent > 256 {
-        return format!("{}*RECURSION*\n", " ".repeat(indent)); // cyclic object guard
+    var_dump_seen(v, indent, &mut Vec::new())
+}
+
+fn var_dump_seen(v: &Value, indent: usize, seen: &mut Vec<usize>) -> String {
+    if indent > 4096 {
+        return format!("{}*RECURSION*\n", " ".repeat(indent));
     }
     let pad = " ".repeat(indent);
     match v {
@@ -8610,20 +8804,26 @@ fn var_dump_str(v: &Value, indent: usize) -> String {
                     AKey::Str(s) => format!("[\"{s}\"]"),
                 };
                 out.push_str(&format!("{kp}{ks}=>\n"));
-                out.push_str(&var_dump_str(val, indent + 2));
+                out.push_str(&var_dump_seen(val, indent + 2, seen));
             }
             out.push_str(&format!("{pad}}}\n"));
             out
         }
         Value::Object(o) => {
+            let ptr = obj_ptr(o);
+            if seen.contains(&ptr) {
+                return format!("{pad}*RECURSION*\n");
+            }
+            seen.push(ptr);
             let ob = o.borrow();
             let mut out = format!("{pad}object({})#1 ({}) {{\n", ob.class, ob.props.len());
             let kp = " ".repeat(indent + 2);
             for (n, v) in &ob.props {
                 out.push_str(&format!("{kp}[\"{n}\"]=>\n"));
-                out.push_str(&var_dump_str(v, indent + 2));
+                out.push_str(&var_dump_seen(v, indent + 2, seen));
             }
             out.push_str(&format!("{pad}}}\n"));
+            seen.pop();
             out
         }
         Value::Closure(_) => format!("{pad}object(Closure)#1 (0) {{\n{pad}}}\n"),
@@ -8631,11 +8831,11 @@ fn var_dump_str(v: &Value, indent: usize) -> String {
 }
 
 fn print_r_str(v: &Value) -> String {
-    print_r_inner(v, 0)
+    print_r_inner(v, 0, &mut Vec::new())
 }
 
-fn print_r_inner(v: &Value, depth: usize) -> String {
-    if depth > 128 {
+fn print_r_inner(v: &Value, depth: usize, seen: &mut Vec<usize>) -> String {
+    if depth > 4096 {
         return " *RECURSION*".to_string();
     }
     match v {
@@ -8649,21 +8849,27 @@ fn print_r_inner(v: &Value, depth: usize) -> String {
                     AKey::Int(i) => i.to_string(),
                     AKey::Str(st) => st.clone(),
                 };
-                s.push_str(&format!("{item}[{ks}] => {}\n", print_r_inner(val, depth + 1)));
+                s.push_str(&format!("{item}[{ks}] => {}\n", print_r_inner(val, depth + 1, seen)));
             }
             s.push_str(&format!("{paren})\n"));
             s
         }
         Value::Object(o) => {
+            let ptr = obj_ptr(o);
+            if seen.contains(&ptr) {
+                return format!("{} Object\n *RECURSION*", o.borrow().class);
+            }
+            seen.push(ptr);
             let ob = o.borrow();
             let paren = " ".repeat(depth * 8);
             let item = " ".repeat(depth * 8 + 4);
             let mut s = format!("{} Object\n", ob.class);
             s.push_str(&format!("{paren}(\n"));
             for (n, v) in &ob.props {
-                s.push_str(&format!("{item}[{n}] => {}\n", print_r_inner(v, depth + 1)));
+                s.push_str(&format!("{item}[{n}] => {}\n", print_r_inner(v, depth + 1, seen)));
             }
             s.push_str(&format!("{paren})\n"));
+            seen.pop();
             s
         }
         _ => v.to_php_string(),
@@ -8671,12 +8877,12 @@ fn print_r_inner(v: &Value, depth: usize) -> String {
 }
 
 fn var_export_str(v: &Value) -> String {
-    var_export_inner(v, 0)
+    var_export_inner(v, 0, &mut Vec::new())
 }
 
-fn var_export_inner(v: &Value, indent: usize) -> String {
-    if indent > 256 {
-        return "NULL".to_string(); // cyclic object guard
+fn var_export_inner(v: &Value, indent: usize, seen: &mut Vec<usize>) -> String {
+    if indent > 4096 {
+        return "NULL".to_string();
     }
     match v {
         Value::Null => "NULL".to_string(),
@@ -8703,23 +8909,32 @@ fn var_export_inner(v: &Value, indent: usize) -> String {
                 match val {
                     Value::Array(_) => s.push_str(&format!(
                         "{ipad}{ks} => \n{ipad}{},\n",
-                        var_export_inner(val, indent + 2)
+                        var_export_inner(val, indent + 2, seen)
                     )),
-                    _ => s.push_str(&format!("{ipad}{ks} => {},\n", var_export_inner(val, indent + 2))),
+                    _ => s.push_str(&format!(
+                        "{ipad}{ks} => {},\n",
+                        var_export_inner(val, indent + 2, seen)
+                    )),
                 }
             }
             s.push_str(&format!("{pad})"));
             s
         }
         Value::Object(o) => {
+            let ptr = obj_ptr(o);
+            if seen.contains(&ptr) {
+                return "NULL".to_string();
+            }
+            seen.push(ptr);
             let ob = o.borrow();
             let pad = " ".repeat(indent);
             let ipad = " ".repeat(indent + 2);
             let mut s = format!("\\{}::__set_state(array(\n", ob.class);
             for (n, v) in &ob.props {
-                s.push_str(&format!("{ipad}'{n}' => {},\n", var_export_inner(v, indent + 2)));
+                s.push_str(&format!("{ipad}'{n}' => {},\n", var_export_inner(v, indent + 2, seen)));
             }
             s.push_str(&format!("{pad}))"));
+            seen.pop();
             s
         }
         Value::Closure(_) => "NULL".to_string(),
