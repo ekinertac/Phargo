@@ -4,15 +4,15 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 55 / 21862  (0.25% of the entire PHP test suite)**
+**`.phpt` pass rate: 57 / 21862  (0.26% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (13750): 0.40%. The 8112 "not-yet-gradeable" tests mostly use `--EXPECTF--`, which the runner doesn't match yet._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (13750): 0.41%. The 8112 "not-yet-gradeable" tests mostly use `--EXPECTF--`, which the runner doesn't match yet._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 55 | 13695 | 8112 | 21862 |
+| 57 | 13693 | 8112 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 21/21 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 25/25 passing._
 
 ## By area
 
@@ -21,7 +21,7 @@ _Curated smoke tests (dev guards, **not** in the number above): 21/21 passing._
 | `Zend` | 8 | 5329 | 0.2% |
 | `ext/standard` | 1 | 3877 | 0.0% |
 | `ext/opcache` | 6 | 916 | 0.7% |
-| `core` | 15 | 868 | 1.7% |
+| `core` | 17 | 868 | 2.0% |
 | `ext/dom` | 6 | 868 | 0.7% |
 | `ext/spl` | 0 | 796 | 0.0% |
 | `ext/date` | 0 | 689 | 0.0% |
@@ -101,7 +101,8 @@ The ladder to **"WordPress boots in the browser"**. Each rung is measured agains
 - [x] **v1 — Variables & types.** `$vars`, assignment, the zval value model (int/float/bool/null/string), `"$var"` interpolation.
 - [x] **v2 — Operators & expressions.** Arithmetic, comparison, logical, precedence, parentheses, float literals, type juggling.
 - [x] **v3 — Control flow (conditionals & loops).** `if`/`elseif`/`else`, `while`, `do`/`while`, `break`/`continue`, and `//` `#` `/* */` comments.
-- [ ] **v3b — `for` / `foreach` / `switch`.** Needs `++`/`--` and assignment-as-expression; `foreach` needs arrays (v5).
+- [x] **v3b — `for`, `++`/`--`, assignment-as-expression** (incl. compound `+= -= *= /= %= .= **=`).
+- [ ] **v3c — `switch`** and **`foreach`** (`foreach` needs arrays, v5).
 - [ ] **v4 — Functions.** User functions, parameters, return, scope.
 - [ ] **v5 — Arrays & strings.** PHP arrays (ordered maps) + the core built-ins WordPress leans on.
 - [ ] **v6 — Classes.** Classes, interfaces, traits — the OOP WordPress actually uses.

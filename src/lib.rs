@@ -1,19 +1,17 @@
 //! FerroPHP — a from-scratch, memory-safe PHP engine written in Rust.
 //!
-//! **v3.** Building on v2 (the expression engine), this adds control flow:
-//!   * `if` / `elseif` / `else` (incl. `else if`)
-//!   * `while` and `do … while`
-//!   * `break` / `continue` (with optional level)
-//!   * `//`, `#`, and `/* … */` comments
+//! **v3b.** On top of v3 (control flow), this adds:
+//!   * assignment as an *expression* (`$a = $b = 3`) incl. compound
+//!     `+= -= *= /= %= .= **=`
+//!   * pre/post `++` / `--`
+//!   * the `for (init; cond; step)` loop
 //!
-//! Control flow is implemented over the streaming interpreter via two ideas:
-//!   * a [`Flow`] signal returned by every statement (Normal/Break/Continue)
-//!   * a `live` flag — when false, statements are *parsed but not executed*
-//!     (no output, no assignment, no arithmetic errors). Untaken branches and
-//!     skipped loop bodies run with `live = false`.
-//!
-//! `for`/`foreach`/`switch` (and `++`/`--`) are the next rung. Anything
-//! unsupported returns an [`EngineError`] so the matching `.phpt` fails honestly.
+//! Execution model recap: a streaming interpreter with a [`Flow`] signal
+//! (Normal/Break/Continue) and a `live` flag (false ⇒ parse-but-don't-execute,
+//! used for untaken branches and skipped loop bodies). A per-test step budget
+//! guards against infinite loops. `switch`/`foreach` and user functions are the
+//! next rungs; anything unsupported returns an [`EngineError`] so the matching
+//! `.phpt` fails honestly.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -355,7 +353,6 @@ impl Engine {
                 return Ok(Flow::Normal);
             }
             Some('{') => return self.block(),
-            Some('$') => return self.variable_statement(),
             _ => {}
         }
         if self.starts_with("?>") {
@@ -363,41 +360,21 @@ impl Engine {
             // block/branch (interleaved HTML), which we don't support yet.
             return Err(EngineError("`?>` inside a block is not supported yet".into()));
         }
-        if let Some(word) = self.try_identifier() {
-            return match word.to_ascii_lowercase().as_str() {
-                "echo" => self.echo_statement(),
-                "if" => self.if_statement(),
-                "while" => self.while_statement(),
-                "do" => self.do_while_statement(),
-                "break" => self.break_continue(true),
-                "continue" => self.break_continue(false),
-                _ => Err(EngineError(format!(
-                    "v3 does not support the `{word}` statement yet"
-                ))),
-            };
-        }
-        Err(EngineError(format!(
-            "v3 cannot parse statement near {:?}",
-            self.snippet()
-        )))
-    }
-
-    /// Assignment (`$x = …;`) or a bare expression statement starting with `$`.
-    fn variable_statement(&mut self) -> R<Flow> {
+        // Keyword statements — peek the word without committing.
         let save = self.pos;
-        let name = self.parse_variable_name()?;
-        self.skip_ws();
-        if self.peek() == Some('=') && self.peek_at(1) != Some('=') {
-            self.pos += 1;
-            self.skip_ws();
-            let value = self.expression()?;
-            if self.live {
-                self.vars.insert(name, value);
+        if let Some(word) = self.try_identifier() {
+            match word.to_ascii_lowercase().as_str() {
+                "echo" => return self.echo_statement(),
+                "if" => return self.if_statement(),
+                "while" => return self.while_statement(),
+                "do" => return self.do_while_statement(),
+                "for" => return self.for_statement(),
+                "break" => return self.break_continue(true),
+                "continue" => return self.break_continue(false),
+                _ => self.pos = save, // not a keyword: fall through to expression statement
             }
-            self.end_statement()?;
-            return Ok(Flow::Normal);
         }
-        self.pos = save;
+        // Expression statement (`$x = …;`, `$i++;`, `(…);`, bare literals).
         let _ = self.expression()?;
         self.end_statement()?;
         Ok(Flow::Normal)
@@ -453,23 +430,23 @@ impl Engine {
 
     // ---- control flow ------------------------------------------------------
 
-    /// `( expr )`
     fn paren_expr(&mut self) -> R<Value> {
-        self.skip_ws();
-        if self.peek() != Some('(') {
-            return Err(EngineError("expected `(`".into()));
-        }
-        self.pos += 1;
+        self.expect_char('(')?;
         let v = self.expression()?;
-        self.skip_ws();
-        if self.peek() != Some(')') {
-            return Err(EngineError("expected `)`".into()));
-        }
-        self.pos += 1;
+        self.expect_char(')')?;
         Ok(v)
     }
 
-    /// Execute either a `{ … }` block or a single statement.
+    fn expect_char(&mut self, c: char) -> R<()> {
+        self.skip_ws();
+        if self.peek() == Some(c) {
+            self.pos += 1;
+            Ok(())
+        } else {
+            Err(EngineError(format!("expected `{c}`")))
+        }
+    }
+
     fn block_or_statement(&mut self) -> R<Flow> {
         self.skip_ws();
         if self.peek() == Some('{') {
@@ -479,8 +456,6 @@ impl Engine {
         }
     }
 
-    /// Execute a `{ … }` block. On a non-Normal Flow, skips the rest of the
-    /// block (so the cursor lands past the closing `}`) and propagates it.
     fn block(&mut self) -> R<Flow> {
         self.pos += 1; // consume {
         loop {
@@ -530,7 +505,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Run a branch (block or statement) with `live` ANDed with `take`.
     fn exec_branch(&mut self, take: bool) -> R<Flow> {
         let prev = self.live;
         self.live = prev && take;
@@ -612,7 +586,6 @@ impl Engine {
                     _ => {}
                 }
             } else {
-                // skip the body once so the cursor lands after the loop
                 let prev = self.live;
                 self.live = false;
                 let _ = self.block_or_statement()?;
@@ -658,10 +631,133 @@ impl Engine {
         }
     }
 
-    // ---- expression parsing (precedence climbing) --------------------------
+    /// Evaluate a comma-separated expression list (for `for` init/step),
+    /// stopping before `stop`. No-op for an empty clause.
+    fn for_expr_list(&mut self, stop: char) -> R<()> {
+        self.skip_ws();
+        if self.peek() == Some(stop) {
+            return Ok(());
+        }
+        loop {
+            let _ = self.expression()?;
+            self.skip_ws();
+            if self.peek() == Some(',') {
+                self.pos += 1;
+                self.skip_ws();
+                continue;
+            }
+            break;
+        }
+        Ok(())
+    }
+
+    fn for_statement(&mut self) -> R<Flow> {
+        self.expect_char('(')?;
+        self.for_expr_list(';')?; // init (run once, live)
+        self.expect_char(';')?;
+        let cond_start = self.pos;
+        let mut guard = 0u64;
+        loop {
+            self.tick()?;
+            self.pos = cond_start;
+            self.skip_ws();
+            let cond = if self.peek() == Some(';') {
+                Value::Bool(true)
+            } else {
+                self.expression()?
+            };
+            self.expect_char(';')?;
+            let step_start = self.pos;
+            // locate the `)` by skipping the step clause without executing it
+            let prev = self.live;
+            self.live = false;
+            self.for_expr_list(')')?;
+            self.live = prev;
+            self.expect_char(')')?;
+            if self.live && to_bool(&cond) {
+                guard += 1;
+                if guard > LOOP_CAP {
+                    return Err(EngineError("for loop exceeded iteration cap".into()));
+                }
+                match self.block_or_statement()? {
+                    Flow::Break(n) => {
+                        return Ok(if n > 1 { Flow::Break(n - 1) } else { Flow::Normal });
+                    }
+                    Flow::Continue(n) if n > 1 => return Ok(Flow::Continue(n - 1)),
+                    _ => {}
+                }
+                // run the step (live), then loop (which resets to cond_start)
+                self.pos = step_start;
+                self.for_expr_list(')')?;
+            } else {
+                let prev = self.live;
+                self.live = false;
+                let _ = self.block_or_statement()?;
+                self.live = prev;
+                return Ok(Flow::Normal);
+            }
+        }
+    }
+
+    // ---- expression parsing ------------------------------------------------
 
     fn expression(&mut self) -> R<Value> {
+        self.parse_assignment()
+    }
+
+    /// Assignment is right-associative and lowest precedence: `$a = $b = expr`,
+    /// plus compound `+= -= *= /= %= .= **=`. Falls through to binary parsing.
+    fn parse_assignment(&mut self) -> R<Value> {
+        if self.peek() == Some('$') {
+            let save = self.pos;
+            let name = self.parse_variable_name()?;
+            self.skip_ws();
+            if let Some(aop) = self.peek_assign_op() {
+                self.pos += aop.len();
+                self.skip_ws();
+                let rhs = self.parse_assignment()?;
+                let newval = if aop == "=" {
+                    rhs
+                } else {
+                    let cur = self.vars.get(&name).cloned().unwrap_or(Value::Null);
+                    self.apply_binary(&aop[..aop.len() - 1], cur, rhs)?
+                };
+                if self.live {
+                    self.vars.insert(name, newval.clone());
+                }
+                return Ok(newval);
+            }
+            self.pos = save; // not an assignment
+        }
         self.parse_binary(0)
+    }
+
+    fn peek_assign_op(&self) -> Option<&'static str> {
+        for s in ["**=", "+=", "-=", "*=", "/=", "%=", ".="] {
+            if self.starts_with(s) {
+                return Some(s);
+            }
+        }
+        // plain `=`, but not `==`, `===`, or `=>`
+        if self.starts_with("=") && self.peek_at(1) != Some('=') && self.peek_at(1) != Some('>') {
+            Some("=")
+        } else {
+            None
+        }
+    }
+
+    fn inc_dec(&self, v: &Value, inc: bool) -> Value {
+        if inc {
+            match v {
+                Value::Null => Value::Int(1),
+                _ => arith("+", v, &Value::Int(1)),
+            }
+        } else {
+            match v {
+                Value::Null => Value::Null, // PHP: --null stays null
+                _ => arith("-", v, &Value::Int(1)),
+            }
+        }
     }
 
     fn peek_operator(&self) -> Option<(&'static str, u8, bool)> {
@@ -704,6 +800,10 @@ impl Engine {
         let mut left = self.parse_unary()?;
         loop {
             self.skip_ws();
+            // don't mistake compound-assign / `++` etc. for a binary operator
+            if self.peek_assign_op().is_some() {
+                break;
+            }
             let (op, prec, right_assoc) = match self.peek_operator() {
                 Some(x) => x,
                 None => break,
@@ -723,6 +823,21 @@ impl Engine {
 
     fn parse_unary(&mut self) -> R<Value> {
         self.skip_ws();
+        if self.starts_with("++") || self.starts_with("--") {
+            let inc = self.starts_with("++");
+            self.pos += 2;
+            self.skip_ws();
+            if self.peek() != Some('$') {
+                return Err(EngineError("`++`/`--` requires a variable".into()));
+            }
+            let name = self.parse_variable_name()?;
+            let cur = self.vars.get(&name).cloned().unwrap_or(Value::Null);
+            let nv = self.inc_dec(&cur, inc);
+            if self.live {
+                self.vars.insert(name, nv.clone());
+            }
+            return Ok(nv);
+        }
         match self.peek() {
             Some('!') => {
                 self.pos += 1;
@@ -821,20 +936,34 @@ impl Engine {
                     "false" => Ok(Value::Bool(false)),
                     "null" => Ok(Value::Null),
                     _ => Err(EngineError(format!(
-                        "v3 cannot use identifier `{id}` in an expression yet"
+                        "v3b cannot use identifier `{id}` in an expression yet"
                     ))),
                 }
             }
             other => Err(EngineError(format!(
-                "v3 cannot parse expression near {other:?} ({:?})",
+                "v3b cannot parse expression near {other:?} ({:?})",
                 self.snippet()
             ))),
         }
     }
 
+    /// A `$var` reference, with optional post `++`/`--`.
     fn variable(&mut self) -> R<Value> {
         let name = self.parse_variable_name()?;
-        Ok(self.vars.get(&name).cloned().unwrap_or(Value::Null))
+        let cur = self.vars.get(&name).cloned().unwrap_or(Value::Null);
+        let after = self.pos;
+        self.skip_ws();
+        if self.starts_with("++") || self.starts_with("--") {
+            let inc = self.starts_with("++");
+            self.pos += 2;
+            let nv = self.inc_dec(&cur, inc);
+            if self.live {
+                self.vars.insert(name, nv);
+            }
+            return Ok(cur); // post-inc/dec yields the OLD value
+        }
+        self.pos = after;
+        Ok(cur)
     }
 
     fn parse_variable_name(&mut self) -> R<String> {
