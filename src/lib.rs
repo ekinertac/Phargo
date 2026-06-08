@@ -2338,6 +2338,160 @@ impl Engine {
             "str_word_count" => {
                 Value::Int(arg(0).to_php_string().split_whitespace().count() as i64)
             }
+            "array_chunk" => match arg(0) {
+                Value::Array(a) => {
+                    let size = to_long(&arg(1)).max(1) as usize;
+                    let preserve = to_bool(&arg(2));
+                    let mut r = PArray::default();
+                    let mut chunk = PArray::default();
+                    for (k, v) in &a.entries {
+                        if preserve {
+                            chunk.set(k.clone(), v.clone());
+                        } else {
+                            chunk.push(v.clone());
+                        }
+                        if chunk.entries.len() >= size {
+                            r.push(Value::Array(std::mem::take(&mut chunk)));
+                        }
+                    }
+                    if !chunk.entries.is_empty() {
+                        r.push(Value::Array(chunk));
+                    }
+                    Value::Array(r)
+                }
+                _ => Value::Array(PArray::default()),
+            },
+            "array_merge_recursive" => {
+                let mut r = PArray::default();
+                for a in &args {
+                    if let Value::Array(arr) = a {
+                        for (k, v) in &arr.entries {
+                            match k {
+                                AKey::Int(_) => r.push(v.clone()),
+                                AKey::Str(s) => r.set(AKey::Str(s.clone()), v.clone()),
+                            }
+                        }
+                    }
+                }
+                Value::Array(r)
+            }
+            "str_ireplace" => {
+                let search = arg(0).to_php_string();
+                let replace = arg(1).to_php_string();
+                let subject = arg(2).to_php_string();
+                if search.is_empty() {
+                    Value::Str(subject)
+                } else {
+                    let lsub = subject.to_lowercase();
+                    let lsearch = search.to_lowercase();
+                    let mut out = String::new();
+                    let mut last = 0;
+                    let mut idx = 0;
+                    while let Some(pos) = lsub[idx..].find(&lsearch) {
+                        let abs = idx + pos;
+                        out.push_str(&subject[last..abs]);
+                        out.push_str(&replace);
+                        idx = abs + lsearch.len();
+                        last = idx;
+                    }
+                    out.push_str(&subject[last..]);
+                    Value::Str(out)
+                }
+            }
+            "substr_replace" => {
+                let s: Vec<char> = arg(0).to_php_string().chars().collect();
+                let replace = arg(1).to_php_string();
+                let total = s.len() as i64;
+                let mut start = to_long(&arg(2));
+                if start < 0 {
+                    start = (total + start).max(0);
+                } else {
+                    start = start.min(total);
+                }
+                let start = start as usize;
+                let len = if args.len() >= 4 && !matches!(arg(3), Value::Null) {
+                    let l = to_long(&arg(3));
+                    if l < 0 {
+                        ((total + l) - start as i64).max(0) as usize
+                    } else {
+                        (l as usize).min(s.len() - start)
+                    }
+                } else {
+                    s.len() - start
+                };
+                let end = (start + len).min(s.len());
+                let mut out: String = s[..start].iter().collect();
+                out.push_str(&replace);
+                out.extend(s[end..].iter());
+                Value::Str(out)
+            }
+            "nl2br" => {
+                let chars: Vec<char> = arg(0).to_php_string().chars().collect();
+                let mut out = String::new();
+                let mut i = 0;
+                while i < chars.len() {
+                    if chars[i] == '\r' && chars.get(i + 1) == Some(&'\n') {
+                        out.push_str("<br />\r\n");
+                        i += 2;
+                    } else if chars[i] == '\n' || chars[i] == '\r' {
+                        out.push_str("<br />");
+                        out.push(chars[i]);
+                        i += 1;
+                    } else {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                Value::Str(out)
+            }
+            "addslashes" => {
+                let mut out = String::new();
+                for c in arg(0).to_php_string().chars() {
+                    match c {
+                        '\'' | '"' | '\\' => {
+                            out.push('\\');
+                            out.push(c);
+                        }
+                        '\0' => out.push_str("\\0"),
+                        _ => out.push(c),
+                    }
+                }
+                Value::Str(out)
+            }
+            "stripslashes" => {
+                let chars: Vec<char> = arg(0).to_php_string().chars().collect();
+                let mut out = String::new();
+                let mut i = 0;
+                while i < chars.len() {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        out.push(chars[i + 1]);
+                        i += 2;
+                    } else {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                Value::Str(out)
+            }
+            "vsprintf" => {
+                let fmt = arg(0).to_php_string();
+                let vals: Vec<Value> = match arg(1) {
+                    Value::Array(a) => a.entries.into_iter().map(|(_, v)| v).collect(),
+                    _ => Vec::new(),
+                };
+                Value::Str(php_sprintf(&fmt, &vals))
+            }
+            "vprintf" => {
+                let fmt = arg(0).to_php_string();
+                let vals: Vec<Value> = match arg(1) {
+                    Value::Array(a) => a.entries.into_iter().map(|(_, v)| v).collect(),
+                    _ => Vec::new(),
+                };
+                let out = php_sprintf(&fmt, &vals);
+                let n = out.len() as i64;
+                self.out.push_str(&out);
+                Value::Int(n)
+            }
             "htmlspecialchars" => {
                 let s = arg(0).to_php_string();
                 Value::Str(

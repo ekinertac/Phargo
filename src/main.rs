@@ -441,6 +441,7 @@ const ROADMAP: &str = r#"The ladder to **"WordPress boots in the browser"**. Eac
 - [x] **v16 — More builtins.** `array_fill`/`array_fill_keys`/`array_combine`/`array_column`/`array_pad`/`array_product`/`array_key_first`/`array_key_last`/`array_diff`/`array_intersect`, `ctype_*`, `substr_count`, `str_word_count`.
 - [x] **v17 — `match` expression.** Strict `===` arms, multi-condition arms, `default`, `UnhandledMatchError` on no match.
 - [x] **v18 — Static class properties.** `public static $x = …`; `Class::$x` / `self::$x` read, write, and compound assignment (inherited via the class chain).
+- [x] **v19 — More builtins.** `array_chunk`/`array_merge_recursive`, `str_ireplace`/`substr_replace`/`nl2br`/`addslashes`/`stripslashes`, `vsprintf`/`vprintf`.
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)
