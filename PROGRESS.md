@@ -4,13 +4,13 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 299 / 21862  (1.37% of the entire PHP test suite)**
+**`.phpt` pass rate: 301 / 21862  (1.38% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (13750): 2.17%. The 8112 "not-yet-gradeable" tests mostly use `--EXPECTF--`, which the runner doesn't match yet._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 1.38%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 299 | 13451 | 8112 | 21862 |
+| 301 | 21495 | 66 | 21862 |
 
 _Curated smoke tests (dev guards, **not** in the number above): 39/39 passing._
 
@@ -20,8 +20,8 @@ _Curated smoke tests (dev guards, **not** in the number above): 39/39 passing._
 |---|---:|---:|---:|
 | `Zend` | 47 | 5329 | 0.9% |
 | `ext/standard` | 38 | 3877 | 1.0% |
-| `ext/opcache` | 151 | 916 | 16.5% |
-| `core` | 38 | 868 | 4.4% |
+| `ext/opcache` | 152 | 916 | 16.6% |
+| `core` | 39 | 868 | 4.5% |
 | `ext/dom` | 6 | 868 | 0.7% |
 | `ext/spl` | 0 | 796 | 0.0% |
 | `ext/date` | 0 | 689 | 0.0% |
@@ -114,6 +114,6 @@ The ladder to **"WordPress boots in the browser"**. Each rung is measured agains
 - [ ] **🎯 WordPress boots in the browser** (compiled to WASM, smaller than the Emscripten build).
 
 ### Runner TODO
-- [ ] `--EXPECTF--` matcher (unlocks grading of thousands more tests)
+- [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)
 - [ ] honor `--SKIPIF--` / `--EXTENSIONS--`
 - [ ] verify curated smoke tests against a reference PHP (Docker `php:8.3-cli`)

@@ -337,7 +337,8 @@ const POW_PREC: u8 = 8;
 const LOOP_CAP: u64 = 10_000_000;
 /// Max interpreter steps per test. A legit program won't hit this; a runaway
 /// loop will, and gets turned into an error instead of hanging the whole run.
-const STEP_LIMIT: u64 = 5_000_000;
+/// Kept modest so the ~8k EXPECTF tests (now executed) stay fast in aggregate.
+const STEP_LIMIT: u64 = 1_000_000;
 
 impl Engine {
     fn peek(&self) -> Option<char> {

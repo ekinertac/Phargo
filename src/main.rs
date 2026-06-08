@@ -20,7 +20,7 @@ const CURATED: &str = "_curated";
 struct Phpt {
     file: String,
     expect: Option<String>,
-    has_expectf: bool,
+    expectf: Option<String>,
 }
 
 enum Outcome {
@@ -33,6 +33,17 @@ enum Outcome {
 type Tally = [usize; 4];
 
 fn main() {
+    // Deep recursion (engine + EXPECTF matcher) overflows the 1 MB default
+    // stack on Windows; give the work a big stack.
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(run_scoreboard)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn run_scoreboard() {
     panic::set_hook(Box::new(|_| {})); // silence per-test panic spam; caught in evaluate()
     let root = env!("CARGO_MANIFEST_DIR");
     let curated_dir = Path::new(root).join("tests").join("phpt");
@@ -90,16 +101,148 @@ fn main() {
 }
 
 fn evaluate(t: &Phpt) -> Outcome {
-    let expected = match &t.expect {
-        Some(e) => e,
-        None if t.has_expectf => return Outcome::Unsupported, // EXPECTF: runner can't grade yet
-        None => return Outcome::Unsupported,
-    };
-    // A buggy engine path on one test must never crash the whole run.
-    match panic::catch_unwind(panic::AssertUnwindSafe(|| run(&t.file))) {
-        Ok(Ok(actual)) if actual.trim_end() == expected.trim_end() => Outcome::Pass,
-        _ => Outcome::Fail,
+    // Tests with neither EXPECT nor EXPECTF (EXPECTREGEX, output-less) aren't gradeable.
+    if t.expect.is_none() && t.expectf.is_none() {
+        return Outcome::Unsupported;
     }
+    // A buggy engine path on one test must never crash the whole run.
+    let actual = match panic::catch_unwind(panic::AssertUnwindSafe(|| run(&t.file))) {
+        Ok(Ok(s)) => s,
+        _ => return Outcome::Fail,
+    };
+    if let Some(e) = &t.expect {
+        if actual.trim_end() == e.trim_end() {
+            return Outcome::Pass;
+        }
+        return Outcome::Fail;
+    }
+    if let Some(p) = &t.expectf {
+        if expectf_matches(p, &actual) {
+            return Outcome::Pass;
+        }
+    }
+    Outcome::Fail
+}
+
+// ---- --EXPECTF-- matcher (hand-rolled; no regex dependency) -----------------
+
+#[derive(Clone)]
+enum Tok {
+    Lit(Vec<char>),               // a run of literal characters
+    One,                          // %c — exactly one non-newline char
+    Var(fn(char) -> bool, usize), // greedy run of `pred`, at least `usize`
+}
+
+fn expectf_matches(pattern: &str, actual: &str) -> bool {
+    let toks = parse_expectf(pattern.trim_end());
+    let s: Vec<char> = actual.trim_end().chars().collect();
+    let mut budget: u64 = 300_000;
+    match_toks(&toks, &s, &mut budget)
+}
+
+fn match_toks(toks: &[Tok], s: &[char], budget: &mut u64) -> bool {
+    if *budget == 0 {
+        return false; // give up on pathological backtracking — counts as a non-match
+    }
+    *budget -= 1;
+    match toks.split_first() {
+        None => s.is_empty(),
+        Some((t, rest)) => match t {
+            Tok::Lit(lit) => {
+                s.len() >= lit.len()
+                    && s[..lit.len()] == lit[..]
+                    && match_toks(rest, &s[lit.len()..], budget)
+            }
+            Tok::One => !s.is_empty() && s[0] != '\n' && match_toks(rest, &s[1..], budget),
+            Tok::Var(pred, min) => {
+                let mut max = 0;
+                while max < s.len() && pred(s[max]) {
+                    max += 1;
+                }
+                if max < *min {
+                    return false;
+                }
+                let mut k = max; // greedy, then backtrack down to the minimum
+                loop {
+                    if match_toks(rest, &s[k..], budget) {
+                        return true;
+                    }
+                    if k == *min {
+                        return false;
+                    }
+                    k -= 1;
+                }
+            }
+        },
+    }
+}
+
+fn parse_expectf(p: &str) -> Vec<Tok> {
+    let chars: Vec<char> = p.chars().collect();
+    let mut toks = Vec::new();
+    let mut lit: Vec<char> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '%' && i + 1 < chars.len() {
+            if chars[i + 1] == '%' {
+                lit.push('%'); // %% is a literal percent
+                i += 2;
+                continue;
+            }
+            let t = match chars[i + 1] {
+                'a' => Some(Tok::Var(any_c, 1)),
+                'A' => Some(Tok::Var(any_c, 0)),
+                'w' => Some(Tok::Var(ws_c, 0)),
+                's' => Some(Tok::Var(nonl_c, 1)),
+                'd' => Some(Tok::Var(dig_c, 1)),
+                'i' => Some(Tok::Var(int_c, 1)),
+                'f' => Some(Tok::Var(flt_c, 1)),
+                'x' => Some(Tok::Var(hex_c, 1)),
+                'c' => Some(Tok::One),
+                'e' => Some(Tok::Var(sep_c, 1)),
+                _ => None,
+            };
+            if let Some(t) = t {
+                if !lit.is_empty() {
+                    toks.push(Tok::Lit(std::mem::take(&mut lit)));
+                }
+                toks.push(t);
+                i += 2;
+                continue;
+            }
+        }
+        lit.push(chars[i]);
+        i += 1;
+    }
+    if !lit.is_empty() {
+        toks.push(Tok::Lit(lit));
+    }
+    toks
+}
+
+fn any_c(_: char) -> bool {
+    true
+}
+fn ws_c(c: char) -> bool {
+    c.is_whitespace()
+}
+fn nonl_c(c: char) -> bool {
+    c != '\n' && c != '\r'
+}
+fn dig_c(c: char) -> bool {
+    c.is_ascii_digit()
+}
+fn int_c(c: char) -> bool {
+    c.is_ascii_digit() || c == '+' || c == '-'
+}
+fn flt_c(c: char) -> bool {
+    c.is_ascii_digit() || matches!(c, '+' | '-' | '.' | 'e' | 'E' | 'N' | 'A' | 'I' | 'F')
+}
+fn hex_c(c: char) -> bool {
+    c.is_ascii_hexdigit()
+}
+fn sep_c(c: char) -> bool {
+    c == '/' || c == '\\'
 }
 
 fn pct(part: usize, whole: usize) -> f64 {
@@ -160,7 +303,7 @@ fn write_progress(
     md.push_str("_This counts only the upstream **php-src** test suite — tests we did **not** write. ");
     md.push_str(&format!(
         "Among tests the runner can currently grade ({gradeable}): {:.2}%. \
-         The {na} \"not-yet-gradeable\" tests mostly use `--EXPECTF--`, which the runner doesn't match yet._\n\n",
+         The {na} \"not-yet-gradeable\" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._\n\n",
         pct(pass, gradeable)
     ));
     md.push_str("| ✓ pass | ✗ fail | • not-yet-gradeable | total |\n");
@@ -211,7 +354,7 @@ fn parse_phpt(text: &str) -> Phpt {
     Phpt {
         file: get("FILE").unwrap_or_default(),
         expect: get("EXPECT"),
-        has_expectf: get("EXPECTF").is_some(),
+        expectf: get("EXPECTF"),
     }
 }
 
@@ -284,7 +427,7 @@ const ROADMAP: &str = r#"The ladder to **"WordPress boots in the browser"**. Eac
 - [ ] **🎯 WordPress boots in the browser** (compiled to WASM, smaller than the Emscripten build).
 
 ### Runner TODO
-- [ ] `--EXPECTF--` matcher (unlocks grading of thousands more tests)
+- [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)
 - [ ] honor `--SKIPIF--` / `--EXTENSIONS--`
 - [ ] verify curated smoke tests against a reference PHP (Docker `php:8.3-cli`)
 "#;
