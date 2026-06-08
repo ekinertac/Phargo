@@ -2492,6 +2492,126 @@ impl Engine {
                 self.out.push_str(&out);
                 Value::Int(n)
             }
+            "strtr" => {
+                let s = arg(0).to_php_string();
+                if args.len() == 2 {
+                    match arg(1) {
+                        Value::Array(a) => {
+                            let mut pairs: Vec<(Vec<char>, String)> = a
+                                .entries
+                                .iter()
+                                .map(|(k, v)| {
+                                    let key = match k {
+                                        AKey::Int(n) => n.to_string(),
+                                        AKey::Str(s) => s.clone(),
+                                    };
+                                    (key.chars().collect::<Vec<char>>(), v.to_php_string())
+                                })
+                                .filter(|(k, _)| !k.is_empty())
+                                .collect();
+                            pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+                            let chars: Vec<char> = s.chars().collect();
+                            let mut out = String::new();
+                            let mut i = 0;
+                            'outer: while i < chars.len() {
+                                for (from, to) in &pairs {
+                                    if i + from.len() <= chars.len() && chars[i..i + from.len()] == from[..] {
+                                        out.push_str(to);
+                                        i += from.len();
+                                        continue 'outer;
+                                    }
+                                }
+                                out.push(chars[i]);
+                                i += 1;
+                            }
+                            Value::Str(out)
+                        }
+                        _ => Value::Str(s),
+                    }
+                } else {
+                    let from: Vec<char> = arg(1).to_php_string().chars().collect();
+                    let to: Vec<char> = arg(2).to_php_string().chars().collect();
+                    let n = from.len().min(to.len());
+                    let out: String = s
+                        .chars()
+                        .map(|c| match from[..n].iter().position(|&fc| fc == c) {
+                            Some(idx) => to[idx],
+                            None => c,
+                        })
+                        .collect();
+                    Value::Str(out)
+                }
+            }
+            "chunk_split" => {
+                let s: Vec<char> = arg(0).to_php_string().chars().collect();
+                let len = if args.len() >= 2 {
+                    to_long(&arg(1)).max(1) as usize
+                } else {
+                    76
+                };
+                let end = if args.len() >= 3 {
+                    arg(2).to_php_string()
+                } else {
+                    "\r\n".to_string()
+                };
+                let mut out = String::new();
+                for chunk in s.chunks(len) {
+                    out.extend(chunk.iter());
+                    out.push_str(&end);
+                }
+                Value::Str(out)
+            }
+            "compact" => {
+                let mut r = PArray::default();
+                for a in &args {
+                    let name = a.to_php_string();
+                    if let Some(v) = self.vars.get(&name).cloned() {
+                        r.set(AKey::Str(name), v);
+                    }
+                }
+                Value::Array(r)
+            }
+            "levenshtein" => {
+                let a: Vec<char> = arg(0).to_php_string().chars().collect();
+                let b: Vec<char> = arg(1).to_php_string().chars().collect();
+                let (m, n) = (a.len(), b.len());
+                if m == 0 {
+                    Value::Int(n as i64)
+                } else if n == 0 {
+                    Value::Int(m as i64)
+                } else {
+                    let mut prev: Vec<usize> = (0..=n).collect();
+                    let mut cur = vec![0usize; n + 1];
+                    for i in 1..=m {
+                        cur[0] = i;
+                        for j in 1..=n {
+                            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+                            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+                        }
+                        std::mem::swap(&mut prev, &mut cur);
+                    }
+                    Value::Int(prev[n] as i64)
+                }
+            }
+            "array_is_list" => match arg(0) {
+                Value::Array(a) => Value::Bool(
+                    a.entries
+                        .iter()
+                        .enumerate()
+                        .all(|(i, (k, _))| matches!(k, AKey::Int(n) if *n == i as i64)),
+                ),
+                _ => Value::Bool(false),
+            },
+            "quotemeta" => {
+                let mut out = String::new();
+                for c in arg(0).to_php_string().chars() {
+                    if ".\\+*?[^]$()".contains(c) {
+                        out.push('\\');
+                    }
+                    out.push(c);
+                }
+                Value::Str(out)
+            }
             "htmlspecialchars" => {
                 let s = arg(0).to_php_string();
                 Value::Str(
