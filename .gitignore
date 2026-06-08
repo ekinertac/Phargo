@@ -7,3 +7,6 @@ Cargo.lock.bak
 
 # Harness runtime artifacts
 .claude/scheduled_tasks.lock
+
+# Private working notes (launch strategy, etc.) — not for the public repo
+notes.md

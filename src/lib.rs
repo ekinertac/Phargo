@@ -1090,29 +1090,33 @@ impl Engine {
             }
             "stderr" => Value::Int(data.len() as i64), // not captured by --EXPECT--
             _ => {
-                let mut buf = stream_get(h, "__buf").map(|v| v.to_php_string()).unwrap_or_default();
-                let pos = stream_get(h, "__pos").map(|v| to_long(&v)).unwrap_or(0).max(0) as usize;
-                let dbytes = data.as_bytes();
-                let mut bytes = buf.into_bytes();
-                if pos > bytes.len() {
-                    bytes.resize(pos, b' ');
-                }
-                for (i, b) in dbytes.iter().enumerate() {
-                    if pos + i < bytes.len() {
-                        bytes[pos + i] = *b;
-                    } else {
-                        bytes.push(*b);
+                // Mutate the buffer in place. The common case (cursor at the end)
+                // is an O(data) append; the file is flushed on fclose/fflush so we
+                // never rewrite the whole file per write (that was O(n^2)).
+                if let Value::Object(o) = h {
+                    let mut ob = o.borrow_mut();
+                    let pos = ob.get("__pos").map(|v| to_long(&v)).unwrap_or(0).max(0) as usize;
+                    if let Some((_, Value::Str(s))) =
+                        ob.props.iter_mut().find(|(n, _)| n == "__buf")
+                    {
+                        if pos >= s.len() {
+                            if pos > s.len() {
+                                s.push_str(&" ".repeat(pos - s.len()));
+                            }
+                            s.push_str(data);
+                        } else {
+                            let mut bytes = std::mem::take(s).into_bytes();
+                            for (i, b) in data.bytes().enumerate() {
+                                if pos + i < bytes.len() {
+                                    bytes[pos + i] = b;
+                                } else {
+                                    bytes.push(b);
+                                }
+                            }
+                            *s = String::from_utf8_lossy(&bytes).to_string();
+                        }
                     }
-                }
-                buf = String::from_utf8_lossy(&bytes).to_string();
-                let newpos = pos + dbytes.len();
-                stream_set(h, "__pos", Value::Int(newpos as i64));
-                stream_set(h, "__buf", Value::Str(buf.clone()));
-                if let Some(p) = stream_get(h, "__path") {
-                    let path = p.to_php_string();
-                    if !path.is_empty() {
-                        let _ = std::fs::write(&path, buf.as_bytes());
-                    }
+                    ob.set("__pos", Value::Int((pos + data.len()) as i64));
                 }
                 Value::Int(data.len() as i64)
             }
@@ -1598,17 +1602,87 @@ impl Engine {
         self.expect_char(')')?;
         let body_start = self.pos;
 
+        // Helper to parse the loop body once without executing (to move the
+        // cursor past it when the loop runs zero times).
+        macro_rules! skip_body {
+            () => {{
+                let prev = self.live;
+                self.live = false;
+                self.pos = body_start;
+                let _ = self.block_or_statement()?;
+                self.live = prev;
+            }};
+        }
+
+        if !self.live {
+            skip_body!();
+            return Ok(Flow::Normal);
+        }
+
+        // IteratorAggregate: foreach over getIterator()'s result.
+        let mut iterable = iterable;
+        if let Value::Object(o) = &iterable {
+            let class = o.borrow().class.clone();
+            if self.lookup_method(&class, "getiterator").is_some() {
+                iterable = self.call_method(&iterable.clone(), "getIterator", Vec::new())?;
+            }
+        }
+
+        // Iterator object: drive iteration via rewind/valid/current/key/next.
+        if let Value::Object(o) = &iterable {
+            let class = o.borrow().class.clone();
+            if self.lookup_method(&class, "valid").is_some()
+                && self.lookup_method(&class, "current").is_some()
+            {
+                let it = iterable.clone();
+                self.call_method(&it, "rewind", Vec::new())?;
+                let mut ran = false;
+                loop {
+                    self.tick()?;
+                    if !to_bool(&self.call_method(&it, "valid", Vec::new())?) {
+                        break;
+                    }
+                    ran = true;
+                    let cur = self.call_method(&it, "current", Vec::new())?;
+                    if let Some(kv) = &key_var {
+                        let k = self.call_method(&it, "key", Vec::new())?;
+                        self.vars.insert(kv.clone(), k);
+                    }
+                    self.vars.insert(val_var.clone(), cur);
+                    self.pos = body_start;
+                    let flow = self.block_or_statement()?;
+                    self.call_method(&it, "next", Vec::new())?;
+                    match flow {
+                        Flow::Break(n) => {
+                            return Ok(if n > 1 { Flow::Break(n - 1) } else { Flow::Normal });
+                        }
+                        Flow::Continue(n) if n > 1 => return Ok(Flow::Continue(n - 1)),
+                        Flow::Return => return Ok(Flow::Return),
+                        _ => {}
+                    }
+                }
+                if !ran {
+                    skip_body!();
+                }
+                return Ok(Flow::Normal);
+            }
+        }
+
+        // Array, or plain object (iterate its public properties).
         let entries: Vec<(AKey, Value)> = match &iterable {
             Value::Array(a) => a.entries.clone(),
+            Value::Object(o) => o
+                .borrow()
+                .props
+                .iter()
+                .filter(|(n, _)| !n.starts_with("__"))
+                .map(|(n, v)| (AKey::Str(n.clone()), v.clone()))
+                .collect(),
             _ => Vec::new(),
         };
 
-        // Empty/skipped: parse the body once (not live) to move past it.
-        if !self.live || entries.is_empty() {
-            let prev = self.live;
-            self.live = false;
-            let _ = self.block_or_statement()?;
-            self.live = prev;
+        if entries.is_empty() {
+            skip_body!();
             return Ok(Flow::Normal);
         }
 
@@ -6145,6 +6219,36 @@ impl Engine {
             };
             i += 1;
         }
+
+        // Post-increment/decrement on a property (`$o->p++`) or index
+        // (`$a[k]++`) lvalue — single-level only.
+        let after = self.pos;
+        self.skip_ws();
+        if self.starts_with("++") || self.starts_with("--") {
+            let inc = self.starts_with("++");
+            let single_prop = matches!(accs.as_slice(), [Acc::Prop(_)]);
+            let all_index = !accs.is_empty() && accs.iter().all(|a| matches!(a, Acc::Index(_)));
+            if single_prop || all_index {
+                self.pos += 2;
+                if self.live {
+                    let nv = self.inc_dec(&cur, inc);
+                    if let [Acc::Prop(p)] = accs.as_slice() {
+                        self.assign_property(&name, p, "=", nv)?;
+                    } else {
+                        let indices: Vec<Option<Value>> = accs
+                            .iter()
+                            .map(|a| match a {
+                                Acc::Index(k) => Some(k.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        self.assign_indexed(name, indices, "=", nv)?;
+                    }
+                }
+                return Ok(cur); // post-inc/dec yields the OLD value
+            }
+        }
+        self.pos = after;
         Ok(cur)
     }
 
