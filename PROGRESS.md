@@ -97,41 +97,45 @@ _Curated smoke tests (dev guards, **not** in the number above): 78/78 passing._
 
 The ladder to **"WordPress boots in the browser"**. Each rung is measured against real php-src tests.
 
-- [x] **v0 — Hello, World.** Inline HTML, `echo`, string/int literals, `.` concat.
-- [x] **v1 — Variables & types.** `$vars`, assignment, the zval value model (int/float/bool/null/string), `"$var"` interpolation.
-- [x] **v2 — Operators & expressions.** Arithmetic, comparison, logical, precedence, parentheses, float literals, type juggling.
-- [x] **v3 — Control flow (conditionals & loops).** `if`/`elseif`/`else`, `while`, `do`/`while`, `break`/`continue`, and `//` `#` `/* */` comments.
-- [x] **v3b — `for`, `++`/`--`, assignment-as-expression** (incl. compound `+= -= *= /= %= .= **=`).
-- [ ] **v3c — `switch`** and **`foreach`** (`foreach` needs arrays, v5).
-- [x] **v4a — Built-in function calls.** `var_dump`/`print_r`/`var_export`, `gettype`, `is_*`, `intval`/`strval`/…, core string & math builtins (scalars).
-- [x] **v4b — User-defined functions.** `function` decls, params (+ defaults), `return`, isolated call scope, recursion.
-- [x] **v5 — Arrays.** Ordered-map arrays, `[...]`/`array()` literals, index read/write/append, `foreach`, `var_dump`/`print_r`/`var_export` of arrays, and `count`/`in_array`/`implode`/`explode`/`array_keys`/`array_values`/`array_merge`/`range`/… builtins.
-- [x] **v6 — Ternary `?:` / null-coalescing `??` + string builtins** (`sprintf`/`printf`, `substr`, `str_replace`).
-- [x] **v3c — `switch`.** case/default with fall-through.
-- [ ] **v6 — Classes.** Classes, interfaces, traits — the OOP WordPress actually uses.
-- [ ] **v7 — pcre / mbstring.** Regex + Unicode. (Here be dragons.)
-- [ ] **v8 — Request lifecycle.** Superglobals, output buffering, the Playground host interface.
-- [ ] **v9 — pdo_sqlite.** WordPress-in-Playground runs on SQLite, not MySQL.
-- [ ] **🎯 WordPress boots in the browser** (compiled to WASM, smaller than the Emscripten build).
+- [x] **v0–v3b — Core language.** Inline HTML/`echo`, the zval value model + `"$var"` interpolation, the full operator/precedence/type-juggling engine, `if`/`while`/`do`/`for`/`foreach`/`switch`, `break`/`continue`, `++`/`--`, assignment-as-expression (incl. compound), comments.
+- [x] **v4 — Functions.** Built-in calls (`var_dump`/`is_*`/string+math) and user `function`s (params/defaults/`return`/recursion/scope).
+- [x] **v5 — Arrays.** Ordered-map arrays, `[...]`/`array()` literals, index r/w/append, `foreach`, and the core array/string builtins.
+- [x] **v6 — Ternary `?:` / null-coalescing `??`** + `sprintf`/`substr`/`str_replace`.
+- [x] **v8 — Classes.** `class`/`interface`/`trait`, properties, methods, `$this`, `new`, `->`, `__construct`, single inheritance + polymorphic dispatch.
+- [x] **v9 — `isset` / `empty` / `unset`.**
+- [x] **v10 — `::` + `__toString`.** Class constants, `self::`/`parent::`/`Class::`, `::class`.
+- [x] **v11 — Exceptions + `instanceof`.** `throw`/`try`/`catch`/`finally`, the Exception/Error/SPL hierarchy.
+- [x] **v12 — Callables + higher-order builtins.** `array_map`/`array_filter`/`array_reduce`, `call_user_func`(`_array`), `array_search`/`array_slice`/…
+- [x] **v13 — Closures.** `function(...) use(...) {}` (by-value capture) + arrow `fn(...) => expr`.
+- [x] **v14 — JSON.** `json_encode` / `json_decode`.
+- [x] **v15 — By-reference array fns.** `sort` family + `array_push`/`array_pop`/`array_shift`/`array_unshift`.
+- [x] **v16–v20 — More builtins + language.** array_* / ctype_*, `match`, static class properties, `strtr`, `compact`, `levenshtein`, …
+- [x] **v21 — Heredoc / nowdoc.**
+- [x] **v22 — Array destructuring.** `[$a, $b] = …` / `list(...)`, skipped slots + nesting.
+- [x] **v23–v24 — Hashing / encoding.** `md5`/`sha1`/`crc32`/`base64`/`bin2hex`, `hash()` dispatcher (from-scratch algorithms).
+- [x] **v25 — Regex engine.** From-scratch backtracking VM: `preg_match`/`preg_match_all`/`preg_replace`/`preg_replace_callback`/`preg_split`/`preg_quote`.
+- [x] **v26 — Type casts** (`(int)`/`(string)`/…) + PHP leading-numeric string coercion.
+- [x] **v27 — `@` error-suppression + full numeric literals** (hex/bin/oct/`_` separators).
+- [x] **v28 — Traits, constructor promotion, `#[attributes]`, robust class bodies.**
+- [x] **v29 — User constants, `print`/`clone`, `declare`/`namespace`, output buffering (`ob_*`), setup stubs.**
+- [x] **v30 — ~70 predefined constants** (`DIRECTORY_SEPARATOR`/`SORT_*`/`ENT_*`/`FILTER_*`/…).
+- [x] **v31 — `include` / `require` / `eval`** with real file loading (and real `__FILE__`/`__DIR__`).
+- [x] **v32 — Filesystem + path fns.** `file_put_contents`/`file_get_contents`/`scandir`/`mkdir`/`basename`/`dirname`/`pathinfo`/…
+- [x] **v33 — `serialize` / `unserialize`.**
+- [x] **v34 — Enums** (pure + backed: `::cases`/`from`/`tryFrom`) + postfix chaining on expressions.
+- [x] **v35 — File streams.** `fopen` family (`fread`/`fwrite`/`fgets`/`fgetcsv`/…) + `STDIN`/`STDOUT`/`STDERR`.
+- [x] **v36 — `mbstring`** (UTF-8 basics: `mb_strlen`/`mb_substr`/`mb_*`).
+- [x] **v37 — More standard functions.** `strstr`/`fdiv`/`filter_var`/`array_walk`/`class_alias`/`wordwrap`/…
+- [x] **v38 — `foreach` over `Iterator`/`IteratorAggregate`** + post-inc/dec on property/index lvalues.
 
-- [x] **v7 — Constants + more builtins.** `PHP_EOL`/`PHP_INT_MAX`/`M_PI`/`STR_PAD_*`/…, `str_contains`/`str_starts_with`/`str_ends_with`, `str_pad`, `str_split`, `ucwords`, `number_format`, `dechex`/`hexdec`/…, `htmlspecialchars`, variadic/array `max`/`min`.
-- [x] **v8 — Classes (core).** `class`/`interface`/`trait` decls, properties (+defaults), methods, `$this`, `new`, `->` (read/method/assign), `__construct`, single inheritance + polymorphic dispatch. (TODO: `static`/`::`, visibility enforcement, `__toString`, interfaces semantics.)
-- [x] **v9 — `isset` / `empty` / `unset`** on variables, array elements, and object properties.
-- [x] **v10 — `::` + `__toString`.** Class constants (inherited), `self::`/`parent::`/`Class::` constants & static/method calls (with `$this` preserved), `::class`, and `__toString` for echo/interpolation. (TODO: static properties, late static binding.)
-- [x] **v11 — Exceptions + `instanceof`.** `throw`/`try`/`catch`/`finally`, the Exception/Error/SPL hierarchy (via a parsed PHP prelude), `getMessage`/`getCode`/etc., and `instanceof` over classes + interfaces.
-- [x] **v12 — Callables + higher-order builtins.** String/`[obj,method]` callables; `array_map`/`array_filter`/`array_reduce`/`call_user_func`(`_array`); `array_search`/`array_key_exists`/`array_flip`/`array_unique`/`array_slice`; `strcmp`/`strcasecmp`; `fmod`/`log`/`exp`/trig. (TODO: by-ref `sort`/`usort`.)
-- [x] **v13 — Closures.** Anonymous `function(...) use(...) {}` (by-value capture), arrow `fn(...) => expr` (auto-capture), and direct `$f(...)` invocation.
-- [x] **v14 — JSON.** `json_encode` (lists→arrays, maps/objects→objects, scalars) and `json_decode` (assoc arrays, or `stdClass` objects).
-- [x] **v15 — By-reference array fns.** `sort`/`rsort`/`asort`/`arsort`/`ksort`/`krsort`/`usort`/`uasort`/`uksort` and `array_push`/`array_pop`/`array_shift`/`array_unshift` (mutate the caller's array in place).
-- [x] **v16 — More builtins.** `array_fill`/`array_fill_keys`/`array_combine`/`array_column`/`array_pad`/`array_product`/`array_key_first`/`array_key_last`/`array_diff`/`array_intersect`, `ctype_*`, `substr_count`, `str_word_count`.
-- [x] **v17 — `match` expression.** Strict `===` arms, multi-condition arms, `default`, `UnhandledMatchError` on no match.
-- [x] **v18 — Static class properties.** `public static $x = …`; `Class::$x` / `self::$x` read, write, and compound assignment (inherited via the class chain).
-- [x] **v19 — More builtins.** `array_chunk`/`array_merge_recursive`, `str_ireplace`/`substr_replace`/`nl2br`/`addslashes`/`stripslashes`, `vsprintf`/`vprintf`.
-- [x] **v20 — More builtins.** `strtr` (both forms), `chunk_split`, `compact`, `levenshtein`, `array_is_list`, `quotemeta`.
-- [x] **v21 — Heredoc / nowdoc.** `<<<EOT` (interpolated) and `<<<'EOT'` (raw), with flexible (indented) closing markers.
-- [x] **v22 — Array destructuring.** `[$a, $b] = …` / `list($a, , $c) = …`, with skipped slots and nesting.
-- [x] **v23 — Hashing / encoding.** `md5`, `crc32`, `base64_encode`/`base64_decode`, `bin2hex`/`hex2bin` (from-scratch algorithms).
-- [x] **v24 — `sha1` + `hash()`.** From-scratch `sha1`; `hash('md5'|'sha1'|'crc32b', …)` dispatcher; `hash_equals`.
+### 🎯 North star — WordPress boots in the browser
+- [x] pcre (regex) + mbstring (Unicode) basics.
+- [ ] **SPL** — `ArrayObject`/`ArrayIterator`/`SplStack`/`SplQueue`/… via `ArrayAccess` + the iterator support.
+- [ ] **Date/time** — `date()` / `mktime()` / `strtotime()` / `DateTime`.
+- [ ] **Reflection.**
+- [ ] **Request lifecycle** — superglobals, the Playground host interface.
+- [ ] **pdo_sqlite** — WordPress-in-Playground runs on SQLite, not MySQL.
+- [ ] **WordPress boots in the browser** — compiled to WASM, smaller than the Emscripten build.
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)
