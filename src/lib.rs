@@ -261,22 +261,74 @@ fn is_numeric_str(s: &str) -> bool {
     matches!(t.parse::<f64>(), Ok(x) if x.is_finite())
 }
 
+/// Parse the leading numeric portion of a string, PHP-style: optional leading
+/// whitespace and sign, digits with an optional fraction/exponent. Returns
+/// `Num::I(0)` when there is no numeric prefix (e.g. `"abc"` → 0, `"42abc"` → 42).
+fn leading_number(s: &str) -> Num {
+    let c: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < c.len() && c[i].is_whitespace() {
+        i += 1;
+    }
+    let start = i;
+    if i < c.len() && (c[i] == '+' || c[i] == '-') {
+        i += 1;
+    }
+    let int_start = i;
+    while i < c.len() && c[i].is_ascii_digit() {
+        i += 1;
+    }
+    let mut is_float = false;
+    if i < c.len() && c[i] == '.' {
+        let save = i;
+        i += 1;
+        let frac_start = i;
+        while i < c.len() && c[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i > frac_start || i > int_start + 1 {
+            is_float = true;
+        } else {
+            i = save; // a lone '.' with no digits either side
+        }
+    }
+    if i < c.len() && (c[i] == 'e' || c[i] == 'E') && i > int_start {
+        let save = i;
+        i += 1;
+        if i < c.len() && (c[i] == '+' || c[i] == '-') {
+            i += 1;
+        }
+        let exp_start = i;
+        while i < c.len() && c[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i > exp_start {
+            is_float = true;
+        } else {
+            i = save;
+        }
+    }
+    if i == int_start && !is_float {
+        return Num::I(0);
+    }
+    let slice: String = c[start..i].iter().collect();
+    if is_float {
+        Num::F(slice.parse::<f64>().unwrap_or(0.0))
+    } else {
+        match slice.parse::<i64>() {
+            Ok(n) => Num::I(n),
+            Err(_) => Num::F(slice.parse::<f64>().unwrap_or(0.0)),
+        }
+    }
+}
+
 fn to_num(v: &Value) -> Num {
     match v {
         Value::Int(n) => Num::I(*n),
         Value::Float(x) => Num::F(*x),
         Value::Bool(b) => Num::I(*b as i64),
         Value::Null => Num::I(0),
-        Value::Str(s) => {
-            let t = s.trim();
-            if let Ok(n) = t.parse::<i64>() {
-                Num::I(n)
-            } else if let Ok(x) = t.parse::<f64>() {
-                Num::F(x)
-            } else {
-                Num::I(0)
-            }
-        }
+        Value::Str(s) => leading_number(s),
         Value::Array(a) => Num::I(if a.entries.is_empty() { 0 } else { 1 }),
         Value::Object(_) => Num::I(1),
         Value::Closure(_) => Num::I(1),
@@ -1776,7 +1828,109 @@ impl Engine {
                 let v = self.parse_binary(POW_PREC)?;
                 Ok(numeric(&v))
             }
+            Some('(') => {
+                if let Some(ct) = self.try_cast() {
+                    let v = self.parse_unary()?;
+                    Ok(self.apply_cast(&ct, v))
+                } else {
+                    self.primary()
+                }
+            }
             _ => self.primary(),
+        }
+    }
+
+    /// If the cursor sits on a type-cast `(int)`, `(string)`, … consume it and
+    /// return the lowercased type name. Otherwise leave the cursor untouched.
+    fn try_cast(&mut self) -> Option<String> {
+        let save = self.pos;
+        debug_assert_eq!(self.peek(), Some('('));
+        self.pos += 1;
+        self.skip_ws();
+        let start = self.pos;
+        while matches!(self.peek(), Some(c) if c.is_ascii_alphabetic()) {
+            self.pos += 1;
+        }
+        let word: String = self.src[start..self.pos].iter().collect::<String>().to_ascii_lowercase();
+        self.skip_ws();
+        let is_cast = matches!(
+            word.as_str(),
+            "int" | "integer"
+                | "bool"
+                | "boolean"
+                | "float"
+                | "double"
+                | "real"
+                | "string"
+                | "binary"
+                | "array"
+                | "object"
+                | "unset"
+        );
+        if is_cast && self.peek() == Some(')') {
+            self.pos += 1;
+            Some(word)
+        } else {
+            self.pos = save;
+            None
+        }
+    }
+
+    fn apply_cast(&self, ty: &str, v: Value) -> Value {
+        if !self.live {
+            return Value::Null;
+        }
+        match ty {
+            "int" | "integer" => Value::Int(to_long(&v)),
+            "bool" | "boolean" => Value::Bool(to_bool(&v)),
+            "float" | "double" | "real" => Value::Float(to_f64(&v)),
+            "string" | "binary" => Value::Str(v.to_php_string()),
+            "unset" => Value::Null,
+            "array" => match v {
+                Value::Array(_) => v,
+                Value::Null => Value::Array(PArray::default()),
+                Value::Object(o) => {
+                    let mut a = PArray::default();
+                    for (k, val) in &o.borrow().props {
+                        a.set(AKey::Str(k.clone()), val.clone());
+                    }
+                    Value::Array(a)
+                }
+                other => {
+                    let mut a = PArray::default();
+                    a.push(other);
+                    Value::Array(a)
+                }
+            },
+            "object" => match v {
+                Value::Object(_) => v,
+                Value::Array(a) => {
+                    let props = a
+                        .entries
+                        .into_iter()
+                        .map(|(k, val)| {
+                            let name = match k {
+                                AKey::Int(i) => i.to_string(),
+                                AKey::Str(s) => s,
+                            };
+                            (name, val)
+                        })
+                        .collect();
+                    Value::Object(Rc::new(RefCell::new(Obj {
+                        class: "stdClass".into(),
+                        props,
+                    })))
+                }
+                Value::Null => Value::Object(Rc::new(RefCell::new(Obj {
+                    class: "stdClass".into(),
+                    props: Vec::new(),
+                }))),
+                scalar => Value::Object(Rc::new(RefCell::new(Obj {
+                    class: "stdClass".into(),
+                    props: vec![("scalar".to_string(), scalar)],
+                }))),
+            },
+            _ => v,
         }
     }
 
