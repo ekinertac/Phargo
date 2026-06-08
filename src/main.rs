@@ -9,7 +9,7 @@
 //! Results are bucketed by area (per-extension, Zend, core) so the report stays
 //! readable across ~22k tests. Writes PROGRESS.md so the climb is always public.
 
-use ferrophp::run;
+use ferrophp::run_with_path;
 use std::collections::BTreeMap;
 use std::panic;
 use std::fs;
@@ -21,6 +21,7 @@ struct Phpt {
     file: String,
     expect: Option<String>,
     expectf: Option<String>,
+    path: PathBuf,
 }
 
 enum Outcome {
@@ -76,7 +77,8 @@ fn run_scoreboard() {
         let _ = fs::write(&breadcrumb, path.to_string_lossy().as_bytes());
         let bytes = fs::read(path).unwrap_or_default();
         let text = String::from_utf8_lossy(&bytes);
-        let t = parse_phpt(&text);
+        let mut t = parse_phpt(&text);
+        t.path = path.clone();
         let idx = match evaluate(&t) {
             Outcome::Pass => 0,
             Outcome::Fail => 1,
@@ -108,7 +110,9 @@ fn evaluate(t: &Phpt) -> Outcome {
         return Outcome::Unsupported;
     }
     // A buggy engine path on one test must never crash the whole run.
-    let actual = match panic::catch_unwind(panic::AssertUnwindSafe(|| run(&t.file))) {
+    let actual = match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        run_with_path(&t.file, Some(t.path.clone()))
+    })) {
         Ok(Ok(s)) => s,
         _ => return Outcome::Fail,
     };
@@ -357,6 +361,7 @@ fn parse_phpt(text: &str) -> Phpt {
         file: get("FILE").unwrap_or_default(),
         expect: get("EXPECT"),
         expectf: get("EXPECTF"),
+        path: PathBuf::new(),
     }
 }
 

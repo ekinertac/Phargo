@@ -8,7 +8,8 @@ fn main() {
     } else {
         src
     };
-    match ferrophp::run(&code) {
+    let path = std::env::args().nth(1).map(std::path::PathBuf::from);
+    match ferrophp::run_with_path(&code, path) {
         Ok(out) => print!("{out}"),
         Err(e) => eprintln!("ERROR: {e:?}"),
     }

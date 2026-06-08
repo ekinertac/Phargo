@@ -17,6 +17,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 #[derive(Debug)]
@@ -489,6 +490,12 @@ fn format_php_float(x: f64) -> String {
 
 /// Execute PHP `source` and return everything it would have printed to stdout.
 pub fn run(source: &str) -> R<String> {
+    run_with_path(source, None)
+}
+
+/// Like [`run`], but records the script's file path so `__FILE__`/`__DIR__` and
+/// relative `include`/`require` resolve against it.
+pub fn run_with_path(source: &str, path: Option<PathBuf>) -> R<String> {
     // The prelude registers the exception/SPL classes, then the script runs.
     let full = format!("{PRELUDE}{source}");
     let mut engine = Engine {
@@ -507,8 +514,13 @@ pub fn run(source: &str) -> R<String> {
         thrown: None,
         consts: HashMap::new(),
         ob_stack: Vec::new(),
+        cur_file: path,
+        included: HashSet::new(),
     };
-    engine.program()?;
+    // Bound the main run by the length captured now: `include`/`eval` append to
+    // `src` during execution, and the top-level loop must not run into them.
+    let end = engine.src.len();
+    engine.program_ranged(end)?;
     Ok(engine.out)
 }
 
@@ -540,6 +552,10 @@ struct Engine {
     consts: HashMap<String, Value>,
     /// Output-buffering watermarks into `out` (one per active `ob_start`).
     ob_stack: Vec<usize>,
+    /// The file currently executing (for `__FILE__`/`__DIR__` and relative includes).
+    cur_file: Option<PathBuf>,
+    /// Canonical paths already pulled in via `include_once`/`require_once`.
+    included: HashSet<String>,
 }
 
 /// A minimal exception/SPL class hierarchy, parsed before every script so that
@@ -712,36 +728,6 @@ impl Engine {
             Err(EngineError("step limit exceeded (possible infinite loop)".into()))
         } else {
             Ok(())
-        }
-    }
-
-    fn program(&mut self) -> R<()> {
-        while self.pos < self.src.len() {
-            if self.starts_with("<?php") {
-                self.pos += 5;
-                self.php_body()?;
-            } else {
-                self.out.push(self.src[self.pos]);
-                self.pos += 1;
-            }
-        }
-        Ok(())
-    }
-
-    fn php_body(&mut self) -> R<()> {
-        loop {
-            self.skip_ws();
-            if self.pos >= self.src.len() {
-                return Ok(());
-            }
-            if self.starts_with("?>") {
-                self.pos += 2;
-                if self.peek() == Some('\n') {
-                    self.pos += 1;
-                }
-                return Ok(());
-            }
-            self.statement()?; // top-level break/continue is invalid PHP; ignore the Flow
         }
     }
 
@@ -948,6 +934,141 @@ impl Engine {
         Ok(Flow::Normal)
     }
 
+    /// Resolve an `include`/`require` path against the current file's directory,
+    /// then the working directory.
+    fn resolve_include_path(&self, filename: &str) -> Option<PathBuf> {
+        let p = Path::new(filename);
+        if p.is_absolute() {
+            return p.exists().then(|| p.to_path_buf());
+        }
+        if let Some(dir) = self.cur_file.as_ref().and_then(|f| f.parent()) {
+            let cand = dir.join(filename);
+            if cand.exists() {
+                return Some(cand);
+            }
+        }
+        p.exists().then(|| p.to_path_buf())
+    }
+
+    /// `include`/`require`(`_once`): load a file and run it inline, sharing the
+    /// current scope. Returns the file's `return` value (or 1).
+    fn do_include(&mut self, filename: &str, once: bool, required: bool) -> R<Value> {
+        if !self.live {
+            return Ok(Value::Null);
+        }
+        let path = match self.resolve_include_path(filename) {
+            Some(p) => p,
+            None => {
+                if required {
+                    return Err(EngineError(format!(
+                        "require(): failed opening required '{filename}'"
+                    )));
+                }
+                return Ok(Value::Bool(false));
+            }
+        };
+        let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let canon_str = canon.to_string_lossy().to_string();
+        if once && self.included.contains(&canon_str) {
+            return Ok(Value::Bool(true));
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => {
+                if required {
+                    return Err(EngineError(format!(
+                        "require(): failed opening required '{filename}'"
+                    )));
+                }
+                return Ok(Value::Bool(false));
+            }
+        };
+        self.included.insert(canon_str);
+        // Append the file's source so every body position stays valid forever.
+        let start = self.src.len();
+        self.src.extend(content.chars());
+        let end = self.src.len();
+        let saved_pos = self.pos;
+        let saved_file = self.cur_file.replace(canon);
+        self.pos = start;
+        let flow = self.program_ranged(end);
+        self.cur_file = saved_file;
+        self.pos = saved_pos;
+        let flow = flow?;
+        Ok(match flow {
+            Flow::Return => self.return_val.take().unwrap_or(Value::Int(1)),
+            _ => Value::Int(1),
+        })
+    }
+
+    /// `eval($code)`: run a PHP code string (no `<?php` tag) inline.
+    fn do_eval(&mut self, code: &str) -> R<Value> {
+        if !self.live {
+            return Ok(Value::Null);
+        }
+        let start = self.src.len();
+        self.src.extend(code.chars());
+        let end = self.src.len();
+        let saved_pos = self.pos;
+        self.pos = start;
+        let flow = self.php_body_ranged(end);
+        self.pos = saved_pos;
+        let flow = flow?;
+        Ok(match flow {
+            Flow::Return => self.return_val.take().unwrap_or(Value::Null),
+            _ => Value::Null,
+        })
+    }
+
+    /// Program loop (HTML + `<?php`) bounded by `end`, capturing a top-level
+    /// `return` (which an included file may use).
+    fn program_ranged(&mut self, end: usize) -> R<Flow> {
+        while self.pos < end {
+            if self.starts_with("<?php") {
+                self.pos += 5;
+                let f = self.php_body_ranged(end)?;
+                if matches!(f, Flow::Return) {
+                    return Ok(f);
+                }
+            } else if self.starts_with("<?=") {
+                self.pos += 3;
+                let v = self.expression()?;
+                if self.live {
+                    let s = self.stringify(&v)?;
+                    self.out.push_str(&s);
+                }
+                self.skip_ws();
+                if self.peek() == Some(';') {
+                    self.pos += 1;
+                }
+            } else {
+                self.out.push(self.src[self.pos]);
+                self.pos += 1;
+            }
+        }
+        Ok(Flow::Normal)
+    }
+
+    fn php_body_ranged(&mut self, end: usize) -> R<Flow> {
+        loop {
+            self.skip_ws();
+            if self.pos >= end {
+                return Ok(Flow::Normal);
+            }
+            if self.starts_with("?>") {
+                self.pos += 2;
+                if self.peek() == Some('\n') {
+                    self.pos += 1;
+                }
+                return Ok(Flow::Normal);
+            }
+            let f = self.statement()?;
+            if matches!(f, Flow::Return) {
+                return Ok(f);
+            }
+        }
+    }
+
     /// Resolve a magic constant (`__CLASS__`, `__LINE__`, …). Returns `None`
     /// for any other identifier.
     fn magic_constant(&self, id: &str) -> Option<Value> {
@@ -957,7 +1078,19 @@ impl Engine {
             }
             "__NAMESPACE__" => Value::Str(String::new()),
             "__METHOD__" | "__FUNCTION__" => Value::Str(String::new()),
-            "__DIR__" | "__FILE__" => Value::Str(String::new()),
+            "__FILE__" => Value::Str(
+                self.cur_file
+                    .as_ref()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            ),
+            "__DIR__" => Value::Str(
+                self.cur_file
+                    .as_ref()
+                    .and_then(|f| f.parent())
+                    .map(|d| d.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            ),
             "__LINE__" => {
                 let upto = self.pos.min(self.src.len());
                 let nl = self.src[..upto].iter().filter(|c| **c == '\n').count();
@@ -4884,6 +5017,20 @@ impl Engine {
                             self.out.push_str(&s);
                         }
                         Ok(Value::Int(1))
+                    }
+                    "include" | "require" | "include_once" | "require_once" => {
+                        let once = id.ends_with("_once") || id.ends_with("_ONCE");
+                        let required = id.to_ascii_lowercase().starts_with("require");
+                        let fname = self.parse_ternary()?;
+                        self.do_include(&fname.to_php_string(), once, required)
+                    }
+                    "eval" => {
+                        self.skip_ws();
+                        self.expect_char('(')?;
+                        let code = self.expression()?;
+                        self.skip_ws();
+                        self.expect_char(')')?;
+                        self.do_eval(&code.to_php_string())
                     }
                     "clone" => {
                         let v = self.parse_unary()?;
