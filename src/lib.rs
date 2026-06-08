@@ -62,6 +62,8 @@ struct ClassDef {
     props: Vec<(String, Option<usize>)>,
     /// (constant name, value-expression position).
     consts: Vec<(String, usize)>,
+    /// Implemented interfaces / extended interfaces.
+    interfaces: Vec<String>,
     /// Methods keyed by lowercased name.
     methods: HashMap<String, FuncDef>,
 }
@@ -285,6 +287,13 @@ fn numeric(v: &Value) -> Value {
 }
 
 fn strict_eq(a: &Value, b: &Value) -> bool {
+    strict_eq_d(a, b, 0)
+}
+
+fn strict_eq_d(a: &Value, b: &Value, depth: usize) -> bool {
+    if depth > 256 {
+        return false; // recursion guard for cyclic structures
+    }
     use Value::*;
     match (a, b) {
         (Null, Null) => true,
@@ -297,7 +306,7 @@ fn strict_eq(a: &Value, b: &Value) -> bool {
                 && x.entries
                     .iter()
                     .zip(&y.entries)
-                    .all(|((ka, va), (kb, vb))| ka == kb && strict_eq(va, vb))
+                    .all(|((ka, va), (kb, vb))| ka == kb && strict_eq_d(va, vb, depth + 1))
         }
         (Object(x), Object(y)) => Rc::ptr_eq(x, y),
         _ => false,
@@ -305,6 +314,13 @@ fn strict_eq(a: &Value, b: &Value) -> bool {
 }
 
 fn loose_eq(a: &Value, b: &Value) -> bool {
+    loose_eq_d(a, b, 0)
+}
+
+fn loose_eq_d(a: &Value, b: &Value, depth: usize) -> bool {
+    if depth > 256 {
+        return false; // recursion guard for cyclic structures (PHP fatals here)
+    }
     use Value::*;
     match (a, b) {
         (Null, Null) => true,
@@ -313,7 +329,7 @@ fn loose_eq(a: &Value, b: &Value) -> bool {
             x.entries.len() == y.entries.len()
                 && x.entries
                     .iter()
-                    .all(|(k, v)| matches!(y.get(k), Some(w) if loose_eq(v, w)))
+                    .all(|(k, v)| matches!(y.get(k), Some(w) if loose_eq_d(v, w, depth + 1)))
         }
         (Array(_), _) | (_, Array(_)) => false,
         (Object(x), Object(y)) => {
@@ -323,7 +339,7 @@ fn loose_eq(a: &Value, b: &Value) -> bool {
                     && a.props.len() == b.props.len()
                     && a.props
                         .iter()
-                        .all(|(n, v)| matches!(b.get(n), Some(w) if loose_eq(v, &w)))
+                        .all(|(n, v)| matches!(b.get(n), Some(w) if loose_eq_d(v, &w, depth + 1)))
             }
         }
         (Object(_), _) | (_, Object(_)) => false,
@@ -393,8 +409,10 @@ fn format_php_float(x: f64) -> String {
 
 /// Execute PHP `source` and return everything it would have printed to stdout.
 pub fn run(source: &str) -> R<String> {
+    // The prelude registers the exception/SPL classes, then the script runs.
+    let full = format!("{PRELUDE}{source}");
     let mut engine = Engine {
-        src: source.chars().collect(),
+        src: full.chars().collect(),
         pos: 0,
         out: String::new(),
         vars: HashMap::new(),
@@ -405,6 +423,7 @@ pub fn run(source: &str) -> R<String> {
         current_class: None,
         return_val: None,
         call_depth: 0,
+        thrown: None,
     };
     engine.program()?;
     Ok(engine.out)
@@ -430,7 +449,79 @@ struct Engine {
     return_val: Option<Value>,
     /// Current function-call nesting depth (guards against stack overflow).
     call_depth: usize,
+    /// The in-flight thrown exception value (set by `throw`, cleared by `catch`).
+    thrown: Option<Value>,
 }
+
+/// A minimal exception/SPL class hierarchy, parsed before every script so that
+/// `new Exception(...)`, `getMessage()`, `instanceof`, and `catch` work via the
+/// normal class machinery.
+const PRELUDE: &str = r##"<?php
+interface Throwable {}
+interface Stringable {}
+interface Traversable {}
+interface Iterator extends Traversable {}
+interface IteratorAggregate extends Traversable {}
+interface ArrayAccess {}
+interface Countable {}
+interface JsonSerializable {}
+class Exception implements Throwable {
+    protected $message = "";
+    protected $code = 0;
+    protected $file = "";
+    protected $line = 0;
+    public function __construct($message = "", $code = 0, $previous = null) {
+        $this->message = $message;
+        $this->code = $code;
+        $this->previous = $previous;
+    }
+    public function getMessage() { return $this->message; }
+    public function getCode() { return $this->code; }
+    public function getLine() { return $this->line; }
+    public function getFile() { return $this->file; }
+    public function getPrevious() { return $this->previous; }
+    public function getTrace() { return []; }
+    public function getTraceAsString() { return "#0 {main}"; }
+    public function __toString() { return $this->message; }
+}
+class Error implements Throwable {
+    protected $message = "";
+    protected $code = 0;
+    public function __construct($message = "", $code = 0, $previous = null) {
+        $this->message = $message;
+        $this->code = $code;
+        $this->previous = $previous;
+    }
+    public function getMessage() { return $this->message; }
+    public function getCode() { return $this->code; }
+    public function getPrevious() { return $this->previous; }
+    public function getTrace() { return []; }
+    public function getTraceAsString() { return "#0 {main}"; }
+    public function __toString() { return $this->message; }
+}
+class ErrorException extends Exception {}
+class TypeError extends Error {}
+class ValueError extends Error {}
+class ArithmeticError extends Error {}
+class DivisionByZeroError extends ArithmeticError {}
+class ArgumentCountError extends TypeError {}
+class UnhandledMatchError extends Error {}
+class LogicException extends Exception {}
+class BadFunctionCallException extends LogicException {}
+class BadMethodCallException extends BadFunctionCallException {}
+class DomainException extends LogicException {}
+class InvalidArgumentException extends LogicException {}
+class LengthException extends LogicException {}
+class OutOfRangeException extends LogicException {}
+class RuntimeException extends Exception {}
+class OutOfBoundsException extends RuntimeException {}
+class OverflowException extends RuntimeException {}
+class RangeException extends RuntimeException {}
+class UnderflowException extends RuntimeException {}
+class UnexpectedValueException extends RuntimeException {}
+class JsonException extends Exception {}
+?>
+"##;
 
 const POW_PREC: u8 = 8;
 const LOOP_CAP: u64 = 10_000_000;
@@ -554,6 +645,8 @@ impl Engine {
                 "for" => return self.for_statement(),
                 "foreach" => return self.foreach_statement(),
                 "switch" => return self.switch_statement(),
+                "throw" => return self.throw_statement(),
+                "try" => return self.try_statement(),
                 "class" | "interface" | "trait" => return self.class_decl(),
                 "abstract" | "final" | "readonly" => {
                     self.skip_ws();
@@ -1094,6 +1187,130 @@ impl Engine {
         }
     }
 
+    fn throw_statement(&mut self) -> R<Flow> {
+        self.skip_ws();
+        let v = self.expression()?;
+        self.end_statement()?;
+        if self.live {
+            self.thrown = Some(v);
+            Err(EngineError("uncaught exception".into()))
+        } else {
+            Ok(Flow::Normal)
+        }
+    }
+
+    fn try_statement(&mut self) -> R<Flow> {
+        self.skip_ws();
+        if self.peek() != Some('{') {
+            return Err(EngineError("expected `{` after try".into()));
+        }
+        let try_start = self.pos;
+        self.pos += 1;
+        self.skip_to_block_end()?;
+        let try_end = self.pos;
+
+        // Run the try block; a thrown exception arrives as Err with self.thrown set.
+        self.pos = try_start;
+        let mut pending: Option<Value> = None;
+        let mut result_flow = Flow::Normal;
+        match self.block() {
+            Ok(f) => result_flow = f,
+            Err(e) => match self.thrown.take() {
+                Some(thrown) => pending = Some(thrown),
+                None => return Err(e), // a real engine error, not a PHP throw
+            },
+        }
+        self.pos = try_end;
+
+        // catch clauses
+        loop {
+            let save = self.pos;
+            self.skip_ws();
+            if self.try_identifier().map(|s| s.to_ascii_lowercase()).as_deref() != Some("catch") {
+                self.pos = save;
+                break;
+            }
+            self.expect_char('(')?;
+            let mut types: Vec<String> = Vec::new();
+            loop {
+                self.skip_ws();
+                if self.peek() == Some('\\') {
+                    self.pos += 1;
+                }
+                if let Some(t) = self.try_identifier() {
+                    types.push(t);
+                } else {
+                    break;
+                }
+                self.skip_ws();
+                if self.peek() == Some('|') {
+                    self.pos += 1;
+                    continue;
+                }
+                break;
+            }
+            self.skip_ws();
+            let catchvar = if self.peek() == Some('$') {
+                Some(self.parse_variable_name()?)
+            } else {
+                None
+            };
+            self.expect_char(')')?;
+            self.skip_ws();
+            if self.peek() != Some('{') {
+                return Err(EngineError("expected `{` after catch".into()));
+            }
+            let catch_start = self.pos;
+            self.pos += 1;
+            self.skip_to_block_end()?;
+            let catch_end = self.pos;
+
+            let matched = match &pending {
+                Some(Value::Object(o)) => {
+                    let tclass = o.borrow().class.clone();
+                    types.iter().any(|t| self.is_instance(&tclass, t))
+                }
+                _ => false,
+            };
+            if matched {
+                if let (Some(var), Some(thrown)) = (&catchvar, &pending) {
+                    if self.live {
+                        self.vars.insert(var.clone(), thrown.clone());
+                    }
+                }
+                pending = None;
+                self.pos = catch_start;
+                result_flow = self.block()?;
+                self.pos = catch_end;
+            } else {
+                self.pos = catch_end;
+            }
+        }
+
+        // finally — always runs
+        let save = self.pos;
+        self.skip_ws();
+        if self.try_identifier().map(|s| s.to_ascii_lowercase()).as_deref() == Some("finally") {
+            self.skip_ws();
+            if self.peek() != Some('{') {
+                return Err(EngineError("expected `{` after finally".into()));
+            }
+            let ff = self.block()?;
+            if ff != Flow::Normal {
+                return Ok(ff); // break/continue/return in finally overrides everything
+            }
+        } else {
+            self.pos = save;
+        }
+
+        // Uncaught — re-raise after finally.
+        if let Some(thrown) = pending {
+            self.thrown = Some(thrown);
+            return Err(EngineError("uncaught exception".into()));
+        }
+        Ok(result_flow)
+    }
+
     // ---- expression parsing ------------------------------------------------
 
     fn expression(&mut self) -> R<Value> {
@@ -1309,6 +1526,32 @@ impl Engine {
         }
     }
 
+    fn maybe_instanceof(&mut self, left: Value) -> R<Value> {
+        let save = self.pos;
+        self.skip_ws();
+        if self.try_identifier().map(|s| s.to_ascii_lowercase()).as_deref() == Some("instanceof") {
+            self.skip_ws();
+            let cname = if self.peek() == Some('$') {
+                match self.parse_unary()? {
+                    Value::Object(o) => o.borrow().class.clone(),
+                    other => other.to_php_string(),
+                }
+            } else {
+                if self.peek() == Some('\\') {
+                    self.pos += 1;
+                }
+                self.try_identifier().unwrap_or_default()
+            };
+            let result = match &left {
+                Value::Object(o) => self.is_instance(&o.borrow().class, &cname),
+                _ => false,
+            };
+            return Ok(Value::Bool(self.live && result));
+        }
+        self.pos = save;
+        Ok(left)
+    }
+
     fn peek_operator(&self) -> Option<(&'static str, u8, bool)> {
         for &(s, p, r) in &[("===", 3, false), ("!==", 3, false), ("<=>", 3, false)] {
             if self.starts_with(s) {
@@ -1347,6 +1590,7 @@ impl Engine {
 
     fn parse_binary(&mut self, min_prec: u8) -> R<Value> {
         let mut left = self.parse_unary()?;
+        left = self.maybe_instanceof(left)?;
         loop {
             self.skip_ws();
             // don't mistake compound-assign / `++` etc. for a binary operator
@@ -1997,26 +2241,58 @@ impl Engine {
             None => return Err(EngineError("expected class name".into())),
         };
         let mut parent = None;
-        // optional `extends Parent` / `implements ...` (skip up to `{`)
-        loop {
-            self.skip_ws();
-            match self.try_identifier().as_deref() {
-                Some("extends") => {
+        let mut interfaces: Vec<String> = Vec::new();
+        self.skip_ws();
+        {
+            let save = self.pos;
+            if self.try_identifier().map(|s| s.to_ascii_lowercase()).as_deref() == Some("extends") {
+                let mut first = true;
+                loop {
                     self.skip_ws();
-                    parent = self.try_identifier();
-                }
-                Some("implements") => {
-                    // skip interface list
-                    while !matches!(self.peek(), Some('{') | None) {
+                    if self.peek() == Some('\\') {
                         self.pos += 1;
                     }
+                    match self.try_identifier() {
+                        Some(n) if first => {
+                            parent = Some(n);
+                            first = false;
+                        }
+                        Some(n) => interfaces.push(n), // interface extending multiple
+                        None => break,
+                    }
+                    self.skip_ws();
+                    if self.peek() == Some(',') {
+                        self.pos += 1;
+                        continue;
+                    }
+                    break;
                 }
-                Some(_) => {}
-                None => break,
+            } else {
+                self.pos = save;
             }
-            self.skip_ws();
-            if matches!(self.peek(), Some('{') | None) {
-                break;
+        }
+        self.skip_ws();
+        {
+            let save = self.pos;
+            if self.try_identifier().map(|s| s.to_ascii_lowercase()).as_deref() == Some("implements") {
+                loop {
+                    self.skip_ws();
+                    if self.peek() == Some('\\') {
+                        self.pos += 1;
+                    }
+                    match self.try_identifier() {
+                        Some(n) => interfaces.push(n),
+                        None => break,
+                    }
+                    self.skip_ws();
+                    if self.peek() == Some(',') {
+                        self.pos += 1;
+                        continue;
+                    }
+                    break;
+                }
+            } else {
+                self.pos = save;
             }
         }
         self.expect_char('{')?;
@@ -2125,6 +2401,7 @@ impl Engine {
                     parent,
                     props,
                     consts,
+                    interfaces,
                     methods,
                 },
             );
@@ -2184,22 +2461,25 @@ impl Engine {
         if let Some(t) = this {
             self.vars.insert("this".to_string(), t);
         }
-        let ret = if func.body_start == usize::MAX {
-            Value::Null // abstract / no body
+        let body_result = if func.body_start == usize::MAX {
+            Ok(Flow::Normal) // abstract / no body
         } else {
             self.pos = func.body_start;
-            let flow = self.block()?;
-            if matches!(flow, Flow::Return) {
-                self.return_val.take().unwrap_or(Value::Null)
-            } else {
-                Value::Null
-            }
+            self.block()
         };
+        // The return value is read before we restore the previous frame.
+        let ret = match &body_result {
+            Ok(Flow::Return) => self.return_val.take().unwrap_or(Value::Null),
+            _ => Value::Null,
+        };
+        // Restore the caller's frame ALWAYS — even when unwinding a thrown
+        // exception — so a `catch` higher up resumes with correct state.
         self.vars = saved_vars;
         self.return_val = saved_ret;
         self.current_class = saved_class;
         self.pos = saved_pos;
         self.call_depth -= 1;
+        body_result?; // propagate a thrown exception (or error) after cleanup
         Ok(ret)
     }
 
@@ -2207,7 +2487,12 @@ impl Engine {
     fn lookup_method(&self, class: &str, method: &str) -> Option<FuncDef> {
         let mlow = method.to_ascii_lowercase();
         let mut cur = Some(class.to_ascii_lowercase());
+        let mut guard = 0;
         while let Some(cn) = cur {
+            guard += 1;
+            if guard > 10_000 {
+                return None; // cyclic inheritance guard
+            }
             let cd = self.classes.get(&cn)?;
             if let Some(m) = cd.methods.get(&mlow) {
                 return Some(m.clone());
@@ -2231,7 +2516,7 @@ impl Engine {
             class: bare.to_string(),
             props: Vec::new(),
         };
-        self.init_props(&cd, &mut obj)?;
+        self.init_props(&cd, &mut obj, 0)?;
         let oref = Rc::new(RefCell::new(obj));
         if let Some(ctor) = self.lookup_method(bare, "__construct") {
             self.call_user_function(
@@ -2245,10 +2530,13 @@ impl Engine {
     }
 
     /// Set property defaults (parents first, so child defaults win).
-    fn init_props(&mut self, cd: &ClassDef, obj: &mut Obj) -> R<()> {
+    fn init_props(&mut self, cd: &ClassDef, obj: &mut Obj, depth: usize) -> R<()> {
+        if depth > 1000 {
+            return Ok(());
+        }
         if let Some(p) = &cd.parent {
             if let Some(pd) = self.classes.get(&p.to_ascii_lowercase()).cloned() {
-                self.init_props(&pd, obj)?;
+                self.init_props(&pd, obj, depth + 1)?;
             }
         }
         for (pname, defpos) in &cd.props {
@@ -2360,9 +2648,66 @@ impl Engine {
         }
     }
 
+    /// Is `class` a `target` (same class, a subclass, or implements the interface)?
+    fn is_instance(&self, class: &str, target: &str) -> bool {
+        let t = target.trim_start_matches('\\').to_ascii_lowercase();
+        if t == "mixed" {
+            return true;
+        }
+        let mut cur = Some(class.to_ascii_lowercase());
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 10_000 {
+                return false;
+            }
+            if cn == t {
+                return true;
+            }
+            let cd = match self.classes.get(&cn) {
+                Some(c) => c,
+                None => return false,
+            };
+            for iface in &cd.interfaces {
+                if self.iface_is(&iface.to_ascii_lowercase(), &t, 0) {
+                    return true;
+                }
+            }
+            cur = cd.parent.as_ref().map(|p| p.to_ascii_lowercase());
+        }
+        false
+    }
+
+    fn iface_is(&self, iface: &str, target: &str, depth: usize) -> bool {
+        if depth > 1000 {
+            return false;
+        }
+        if iface == target {
+            return true;
+        }
+        if let Some(cd) = self.classes.get(iface) {
+            if let Some(p) = &cd.parent {
+                if self.iface_is(&p.to_ascii_lowercase(), target, depth + 1) {
+                    return true;
+                }
+            }
+            for i in &cd.interfaces {
+                if self.iface_is(&i.to_ascii_lowercase(), target, depth + 1) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn lookup_const(&self, class: &str, name: &str) -> Option<usize> {
         let mut cur = Some(class.to_ascii_lowercase());
+        let mut guard = 0;
         while let Some(cn) = cur {
+            guard += 1;
+            if guard > 10_000 {
+                return None;
+            }
             let cd = self.classes.get(&cn)?;
             if let Some((_, pos)) = cd.consts.iter().find(|(n, _)| n == name) {
                 return Some(*pos);

@@ -4,26 +4,26 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 550 / 21862  (2.52% of the entire PHP test suite)**
+**`.phpt` pass rate: 610 / 21862  (2.79% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 2.52%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 2.80%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 550 | 21246 | 66 | 21862 |
+| 610 | 21186 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 51/51 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 52/52 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 167 | 5329 | 3.1% |
+| `Zend` | 220 | 5329 | 4.1% |
 | `ext/standard` | 81 | 3877 | 2.1% |
-| `ext/opcache` | 202 | 916 | 22.1% |
+| `ext/opcache` | 207 | 916 | 22.6% |
 | `core` | 72 | 868 | 8.3% |
 | `ext/dom` | 6 | 868 | 0.7% |
-| `ext/spl` | 1 | 796 | 0.1% |
+| `ext/spl` | 3 | 796 | 0.4% |
 | `ext/date` | 0 | 689 | 0.0% |
 | `ext/soap` | 0 | 593 | 0.0% |
 | `ext/phar` | 13 | 574 | 2.3% |
@@ -118,6 +118,7 @@ The ladder to **"WordPress boots in the browser"**. Each rung is measured agains
 - [x] **v8 — Classes (core).** `class`/`interface`/`trait` decls, properties (+defaults), methods, `$this`, `new`, `->` (read/method/assign), `__construct`, single inheritance + polymorphic dispatch. (TODO: `static`/`::`, visibility enforcement, `__toString`, interfaces semantics.)
 - [x] **v9 — `isset` / `empty` / `unset`** on variables, array elements, and object properties.
 - [x] **v10 — `::` + `__toString`.** Class constants (inherited), `self::`/`parent::`/`Class::` constants & static/method calls (with `$this` preserved), `::class`, and `__toString` for echo/interpolation. (TODO: static properties, late static binding.)
+- [x] **v11 — Exceptions + `instanceof`.** `throw`/`try`/`catch`/`finally`, the Exception/Error/SPL hierarchy (via a parsed PHP prelude), `getMessage`/`getCode`/etc., and `instanceof` over classes + interfaces.
 
 ### Runner TODO
 - [x] `--EXPECTF--` matcher (hand-rolled; makes ~8k more tests gradeable)
