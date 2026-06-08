@@ -1,0 +1,4 @@
+# Keep line endings LF everywhere — this repo is cross-platform and the .phpt
+# oracle/comparison is line-ending sensitive.
+* text=auto eol=lf
+*.phpt text eol=lf

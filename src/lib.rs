@@ -1,16 +1,19 @@
 //! FerroPHP — a from-scratch, memory-safe PHP engine written in Rust.
 //!
-//! **v2.** Building on v1 (the zval [`Value`] model + variables), this adds a
-//! real expression engine:
-//!   * arithmetic `+ - * / % **`, string concat `.`
-//!   * comparison `== != === !== < <= > >= <=>`
-//!   * logical `&& || !`, unary `- +`
-//!   * parentheses, float literals, and the `true`/`false`/`null` constants
-//!   * PHP's type-juggling rules (string⇄number, truthiness)
+//! **v3.** Building on v2 (the expression engine), this adds control flow:
+//!   * `if` / `elseif` / `else` (incl. `else if`)
+//!   * `while` and `do … while`
+//!   * `break` / `continue` (with optional level)
+//!   * `//`, `#`, and `/* … */` comments
 //!
-//! Operator precedence follows PHP 8 (notably: `.` is *lower* than `+`/`-`).
-//! Anything unsupported returns an [`EngineError`] so the matching `.phpt`
-//! test fails honestly. See PROGRESS.md for the climb.
+//! Control flow is implemented over the streaming interpreter via two ideas:
+//!   * a [`Flow`] signal returned by every statement (Normal/Break/Continue)
+//!   * a `live` flag — when false, statements are *parsed but not executed*
+//!     (no output, no assignment, no arithmetic errors). Untaken branches and
+//!     skipped loop bodies run with `live = false`.
+//!
+//! `for`/`foreach`/`switch` (and `++`/`--`) are the next rung. Anything
+//! unsupported returns an [`EngineError`] so the matching `.phpt` fails honestly.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -28,6 +31,14 @@ impl fmt::Display for EngineError {
 impl std::error::Error for EngineError {}
 
 type R<T> = Result<T, EngineError>;
+
+/// Control-flow signal bubbled up from statement execution.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Flow {
+    Normal,
+    Break(u32),
+    Continue(u32),
+}
 
 /// A PHP value — the engine's "zval". Scalars only, so far.
 #[derive(Clone, Debug)]
@@ -55,7 +66,6 @@ impl Value {
 
 // ---- value coercion helpers (PHP type juggling) ----------------------------
 
-/// A numeric view of a value: still int or already float.
 enum Num {
     I(i64),
     F(f64),
@@ -85,7 +95,7 @@ fn is_numeric_str(s: &str) -> bool {
     if t.is_empty() {
         return false;
     }
-    if let Ok(_) = t.parse::<i64>() {
+    if t.parse::<i64>().is_ok() {
         return true;
     }
     matches!(t.parse::<f64>(), Ok(x) if x.is_finite())
@@ -104,7 +114,7 @@ fn to_num(v: &Value) -> Num {
             } else if let Ok(x) = t.parse::<f64>() {
                 Num::F(x)
             } else {
-                Num::I(0) // TODO: leading-numeric-prefix parsing
+                Num::I(0)
             }
         }
     }
@@ -151,7 +161,6 @@ fn loose_eq(a: &Value, b: &Value) -> bool {
     use Value::*;
     match (a, b) {
         (Null, Null) => true,
-        // bool/null involved: compare truthiness (a small, documented simplification)
         (Bool(_), _) | (_, Bool(_)) | (Null, _) | (_, Null) => to_bool(a) == to_bool(b),
         (Str(x), Str(y)) => {
             if is_numeric_str(x) && is_numeric_str(y) {
@@ -160,7 +169,6 @@ fn loose_eq(a: &Value, b: &Value) -> bool {
                 x == y
             }
         }
-        // number vs string (PHP 8): numeric string -> numeric compare, else string compare
         (Int(_) | Float(_), Str(s)) | (Str(s), Int(_) | Float(_)) => {
             if is_numeric_str(s) {
                 to_f64(a) == to_f64(b)
@@ -194,8 +202,6 @@ fn ipow(mut base: i64, mut exp: i64) -> Option<i64> {
     Some(result)
 }
 
-/// PHP prints whole-valued floats without a decimal point (`1.0` -> "1"), and
-/// otherwise with up to 14 significant digits, trailing zeros trimmed.
 fn format_php_float(x: f64) -> String {
     if x.is_nan() {
         return "NAN".into();
@@ -227,6 +233,8 @@ pub fn run(source: &str) -> R<String> {
         pos: 0,
         out: String::new(),
         vars: HashMap::new(),
+        live: true,
+        steps: 0,
     };
     engine.program()?;
     Ok(engine.out)
@@ -237,11 +245,18 @@ struct Engine {
     pos: usize,
     out: String,
     vars: HashMap<String, Value>,
+    /// When false, statements are parsed but not executed (skipped branches).
+    live: bool,
+    /// Hard budget on interpreter steps — a backstop against infinite loops
+    /// (`catch_unwind` stops panics, not hangs).
+    steps: u64,
 }
 
-/// Highest binary precedence (`**`). Unary `-`/`+` bind their operand here so
-/// that `-2 ** 2` parses as `-(2 ** 2)`, matching PHP.
 const POW_PREC: u8 = 8;
+const LOOP_CAP: u64 = 10_000_000;
+/// Max interpreter steps per test. A legit program won't hit this; a runaway
+/// loop will, and gets turned into an error instead of hanging the whole run.
+const STEP_LIMIT: u64 = 5_000_000;
 
 impl Engine {
     fn peek(&self) -> Option<char> {
@@ -258,9 +273,45 @@ impl Engine {
             .all(|(i, c)| self.src.get(self.pos + i).copied() == Some(c))
     }
 
+    /// Skip whitespace AND comments (`//`, `#`, `/* */`).
     fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(c) if c.is_whitespace()) {
+        loop {
+            match self.peek() {
+                Some(c) if c.is_whitespace() => self.pos += 1,
+                Some('/') if self.peek_at(1) == Some('/') => self.line_comment(),
+                Some('/') if self.peek_at(1) == Some('*') => self.block_comment(),
+                Some('#') if self.peek_at(1) != Some('[') => self.line_comment(),
+                _ => break,
+            }
+        }
+    }
+
+    fn line_comment(&mut self) {
+        while let Some(c) = self.peek() {
+            if c == '\n' || self.starts_with("?>") {
+                break;
+            }
             self.pos += 1;
+        }
+    }
+
+    fn block_comment(&mut self) {
+        self.pos += 2; // consume /*
+        while self.pos < self.src.len() {
+            if self.starts_with("*/") {
+                self.pos += 2;
+                return;
+            }
+            self.pos += 1;
+        }
+    }
+
+    fn tick(&mut self) -> R<()> {
+        self.steps += 1;
+        if self.steps > STEP_LIMIT {
+            Err(EngineError("step limit exceeded (possible infinite loop)".into()))
+        } else {
+            Ok(())
         }
     }
 
@@ -290,47 +341,66 @@ impl Engine {
                 }
                 return Ok(());
             }
-            self.statement()?;
+            self.statement()?; // top-level break/continue is invalid PHP; ignore the Flow
         }
     }
 
-    fn statement(&mut self) -> R<()> {
+    fn statement(&mut self) -> R<Flow> {
+        self.tick()?;
         self.skip_ws();
-        if self.peek() == Some(';') {
-            self.pos += 1;
-            return Ok(());
-        }
-
-        // Assignment or bare expression statement starting with a variable.
-        if self.peek() == Some('$') {
-            let save = self.pos;
-            let name = self.parse_variable_name()?;
-            self.skip_ws();
-            if self.peek() == Some('=') && self.peek_at(1) != Some('=') {
-                self.pos += 1; // '='
-                self.skip_ws();
-                let value = self.expression()?;
-                self.vars.insert(name, value);
-                return self.end_statement();
+        match self.peek() {
+            None => return Ok(Flow::Normal),
+            Some(';') => {
+                self.pos += 1;
+                return Ok(Flow::Normal);
             }
-            self.pos = save; // not an assignment: re-parse as an expression
-            let _ = self.expression()?;
-            return self.end_statement();
+            Some('{') => return self.block(),
+            Some('$') => return self.variable_statement(),
+            _ => {}
         }
-
+        if self.starts_with("?>") {
+            // php_body consumes `?>` itself; reaching here means it's inside a
+            // block/branch (interleaved HTML), which we don't support yet.
+            return Err(EngineError("`?>` inside a block is not supported yet".into()));
+        }
         if let Some(word) = self.try_identifier() {
-            if word.eq_ignore_ascii_case("echo") {
-                return self.echo_statement();
-            }
-            return Err(EngineError(format!(
-                "v2 does not support the `{word}` statement yet"
-            )));
+            return match word.to_ascii_lowercase().as_str() {
+                "echo" => self.echo_statement(),
+                "if" => self.if_statement(),
+                "while" => self.while_statement(),
+                "do" => self.do_while_statement(),
+                "break" => self.break_continue(true),
+                "continue" => self.break_continue(false),
+                _ => Err(EngineError(format!(
+                    "v3 does not support the `{word}` statement yet"
+                ))),
+            };
         }
-
         Err(EngineError(format!(
-            "v2 cannot parse statement near {:?}",
+            "v3 cannot parse statement near {:?}",
             self.snippet()
         )))
+    }
+
+    /// Assignment (`$x = …;`) or a bare expression statement starting with `$`.
+    fn variable_statement(&mut self) -> R<Flow> {
+        let save = self.pos;
+        let name = self.parse_variable_name()?;
+        self.skip_ws();
+        if self.peek() == Some('=') && self.peek_at(1) != Some('=') {
+            self.pos += 1;
+            self.skip_ws();
+            let value = self.expression()?;
+            if self.live {
+                self.vars.insert(name, value);
+            }
+            self.end_statement()?;
+            return Ok(Flow::Normal);
+        }
+        self.pos = save;
+        let _ = self.expression()?;
+        self.end_statement()?;
+        Ok(Flow::Normal)
     }
 
     fn end_statement(&mut self) -> R<()> {
@@ -345,10 +415,12 @@ impl Engine {
         }
     }
 
-    fn echo_statement(&mut self) -> R<()> {
+    fn echo_statement(&mut self) -> R<Flow> {
         loop {
             let value = self.expression()?;
-            self.out.push_str(&value.to_php_string());
+            if self.live {
+                self.out.push_str(&value.to_php_string());
+            }
             self.skip_ws();
             if self.peek() == Some(',') {
                 self.pos += 1;
@@ -357,7 +429,233 @@ impl Engine {
             }
             break;
         }
-        self.end_statement()
+        self.end_statement()?;
+        Ok(Flow::Normal)
+    }
+
+    fn break_continue(&mut self, is_break: bool) -> R<Flow> {
+        self.skip_ws();
+        let mut level = 1u32;
+        if matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+            level = to_long(&self.number()).max(1) as u32;
+        }
+        self.end_statement()?;
+        if self.live {
+            Ok(if is_break {
+                Flow::Break(level)
+            } else {
+                Flow::Continue(level)
+            })
+        } else {
+            Ok(Flow::Normal)
+        }
+    }
+
+    // ---- control flow ------------------------------------------------------
+
+    /// `( expr )`
+    fn paren_expr(&mut self) -> R<Value> {
+        self.skip_ws();
+        if self.peek() != Some('(') {
+            return Err(EngineError("expected `(`".into()));
+        }
+        self.pos += 1;
+        let v = self.expression()?;
+        self.skip_ws();
+        if self.peek() != Some(')') {
+            return Err(EngineError("expected `)`".into()));
+        }
+        self.pos += 1;
+        Ok(v)
+    }
+
+    /// Execute either a `{ … }` block or a single statement.
+    fn block_or_statement(&mut self) -> R<Flow> {
+        self.skip_ws();
+        if self.peek() == Some('{') {
+            self.block()
+        } else {
+            self.statement()
+        }
+    }
+
+    /// Execute a `{ … }` block. On a non-Normal Flow, skips the rest of the
+    /// block (so the cursor lands past the closing `}`) and propagates it.
+    fn block(&mut self) -> R<Flow> {
+        self.pos += 1; // consume {
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some('}') => {
+                    self.pos += 1;
+                    return Ok(Flow::Normal);
+                }
+                None => return Err(EngineError("unterminated `{` block".into())),
+                _ => {
+                    let f = self.statement()?;
+                    if f != Flow::Normal {
+                        self.skip_to_block_end()?;
+                        return Ok(f);
+                    }
+                }
+            }
+        }
+    }
+
+    /// From inside a block (one `{` already open), consume up to and including
+    /// its matching `}`, respecting nested braces, strings, and comments.
+    fn skip_to_block_end(&mut self) -> R<()> {
+        let mut depth = 1;
+        while depth > 0 {
+            self.skip_ws();
+            match self.peek() {
+                None => return Err(EngineError("unterminated `{` block".into())),
+                Some('{') => {
+                    depth += 1;
+                    self.pos += 1;
+                }
+                Some('}') => {
+                    depth -= 1;
+                    self.pos += 1;
+                }
+                Some('\'') => {
+                    let _ = self.single_quoted()?;
+                }
+                Some('"') => {
+                    let _ = self.double_quoted()?;
+                }
+                Some(_) => self.pos += 1,
+            }
+        }
+        Ok(())
+    }
+
+    /// Run a branch (block or statement) with `live` ANDed with `take`.
+    fn exec_branch(&mut self, take: bool) -> R<Flow> {
+        let prev = self.live;
+        self.live = prev && take;
+        let f = self.block_or_statement()?;
+        self.live = prev;
+        Ok(f)
+    }
+
+    fn if_statement(&mut self) -> R<Flow> {
+        let cond = self.paren_expr()?;
+        let take = self.live && to_bool(&cond);
+        let mut flow = self.exec_branch(take)?;
+        let mut done = take;
+        loop {
+            let save = self.pos;
+            self.skip_ws();
+            let kw = self.try_identifier().map(|s| s.to_ascii_lowercase());
+            match kw.as_deref() {
+                Some("elseif") => {
+                    let c = self.paren_expr()?;
+                    let t = self.live && !done && to_bool(&c);
+                    let f = self.exec_branch(t)?;
+                    if t {
+                        flow = f;
+                    }
+                    done |= t;
+                }
+                Some("else") => {
+                    let save2 = self.pos;
+                    self.skip_ws();
+                    let next = self.try_identifier().map(|s| s.to_ascii_lowercase());
+                    if next.as_deref() == Some("if") {
+                        let c = self.paren_expr()?;
+                        let t = self.live && !done && to_bool(&c);
+                        let f = self.exec_branch(t)?;
+                        if t {
+                            flow = f;
+                        }
+                        done |= t;
+                    } else {
+                        self.pos = save2;
+                        let t = self.live && !done;
+                        let f = self.exec_branch(t)?;
+                        if t {
+                            flow = f;
+                        }
+                        return Ok(flow);
+                    }
+                }
+                _ => {
+                    self.pos = save;
+                    return Ok(flow);
+                }
+            }
+        }
+    }
+
+    fn while_statement(&mut self) -> R<Flow> {
+        self.skip_ws();
+        if self.peek() != Some('(') {
+            return Err(EngineError("expected `(` after `while`".into()));
+        }
+        let cond_start = self.pos;
+        let mut guard = 0u64;
+        loop {
+            self.tick()?;
+            self.pos = cond_start;
+            let cond = self.paren_expr()?;
+            if self.live && to_bool(&cond) {
+                guard += 1;
+                if guard > LOOP_CAP {
+                    return Err(EngineError("while loop exceeded iteration cap".into()));
+                }
+                match self.block_or_statement()? {
+                    Flow::Break(n) => {
+                        return Ok(if n > 1 { Flow::Break(n - 1) } else { Flow::Normal });
+                    }
+                    Flow::Continue(n) if n > 1 => return Ok(Flow::Continue(n - 1)),
+                    _ => {}
+                }
+            } else {
+                // skip the body once so the cursor lands after the loop
+                let prev = self.live;
+                self.live = false;
+                let _ = self.block_or_statement()?;
+                self.live = prev;
+                return Ok(Flow::Normal);
+            }
+        }
+    }
+
+    fn do_while_statement(&mut self) -> R<Flow> {
+        self.skip_ws();
+        let body_start = self.pos;
+        let mut guard = 0u64;
+        loop {
+            self.tick()?;
+            self.pos = body_start;
+            let f = self.block_or_statement()?;
+            self.skip_ws();
+            let kw = self.try_identifier().map(|s| s.to_ascii_lowercase());
+            if kw.as_deref() != Some("while") {
+                return Err(EngineError("expected `while` after `do` block".into()));
+            }
+            let cond = self.paren_expr()?;
+            self.end_statement()?;
+            let again = match f {
+                Flow::Break(n) => {
+                    if n > 1 {
+                        return Ok(Flow::Break(n - 1));
+                    }
+                    false
+                }
+                Flow::Continue(n) if n > 1 => return Ok(Flow::Continue(n - 1)),
+                _ => self.live && to_bool(&cond),
+            };
+            if again {
+                guard += 1;
+                if guard > LOOP_CAP {
+                    return Err(EngineError("do-while exceeded iteration cap".into()));
+                }
+                continue;
+            }
+            return Ok(Flow::Normal);
+        }
     }
 
     // ---- expression parsing (precedence climbing) --------------------------
@@ -366,10 +664,6 @@ impl Engine {
         self.parse_binary(0)
     }
 
-    /// Returns `(operator, precedence, right_associative)` if a binary operator
-    /// starts at the cursor. Multi-char operators are checked before their
-    /// single-char prefixes. Assignment `=` and unary `!` are intentionally
-    /// excluded.
     fn peek_operator(&self) -> Option<(&'static str, u8, bool)> {
         for &(s, p, r) in &[("===", 3, false), ("!==", 3, false), ("<=>", 3, false)] {
             if self.starts_with(s) {
@@ -417,7 +711,8 @@ impl Engine {
             if prec < min_prec {
                 break;
             }
-            self.pos += op.len(); // operators are ASCII
+            self.tick()?;
+            self.pos += op.len();
             self.skip_ws();
             let next_min = if right_assoc { prec } else { prec + 1 };
             let right = self.parse_binary(next_min)?;
@@ -450,6 +745,9 @@ impl Engine {
 
     fn apply_binary(&self, op: &str, l: Value, r: Value) -> R<Value> {
         use Value::*;
+        if !self.live {
+            return Ok(Null); // skipped code: parse only, never compute or error
+        }
         let v = match op {
             "." => Str(format!("{}{}", l.to_php_string(), r.to_php_string())),
             "+" | "-" | "*" => arith(op, &l, &r),
@@ -523,12 +821,12 @@ impl Engine {
                     "false" => Ok(Value::Bool(false)),
                     "null" => Ok(Value::Null),
                     _ => Err(EngineError(format!(
-                        "v2 cannot use identifier `{id}` in an expression yet"
+                        "v3 cannot use identifier `{id}` in an expression yet"
                     ))),
                 }
             }
             other => Err(EngineError(format!(
-                "v2 cannot parse expression near {other:?} ({:?})",
+                "v3 cannot parse expression near {other:?} ({:?})",
                 self.snippet()
             ))),
         }
@@ -552,8 +850,6 @@ impl Engine {
         Ok(self.src[start..self.pos].iter().collect())
     }
 
-    /// Parse an int or float literal. A `.` is only part of the number when
-    /// followed by a digit (otherwise it's the concatenation operator).
     fn number(&mut self) -> Value {
         let start = self.pos;
         while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
@@ -579,7 +875,7 @@ impl Engine {
                     self.pos += 1;
                 }
             } else {
-                self.pos = save; // not an exponent after all
+                self.pos = save;
             }
         }
         let text: String = self.src[start..self.pos].iter().collect();
@@ -688,7 +984,7 @@ fn arith(op: &str, l: &Value, r: &Value) -> Value {
             };
             match checked {
                 Some(n) => Value::Int(n),
-                None => Value::Float(apply_f(op, x as f64, y as f64)), // overflow -> float
+                None => Value::Float(apply_f(op, x as f64, y as f64)),
             }
         }
         (a, b) => Value::Float(apply_f(op, a.as_f64(), b.as_f64())),

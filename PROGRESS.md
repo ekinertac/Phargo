@@ -4,22 +4,24 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 63 / 21878  (0.29% of the entire PHP test suite)**
+**`.phpt` pass rate: 55 / 21862  (0.25% of the entire PHP test suite)**
 
-_Among tests the runner can currently grade (13766): 0.46%. The 8112 "not-yet-gradeable" tests mostly use `--EXPECTF--`, which the runner doesn't match yet._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (13750): 0.40%. The 8112 "not-yet-gradeable" tests mostly use `--EXPECTF--`, which the runner doesn't match yet._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 63 | 13703 | 8112 | 21878 |
+| 55 | 13695 | 8112 | 21862 |
+
+_Curated smoke tests (dev guards, **not** in the number above): 21/21 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 7 | 5329 | 0.1% |
+| `Zend` | 8 | 5329 | 0.2% |
 | `ext/standard` | 1 | 3877 | 0.0% |
 | `ext/opcache` | 6 | 916 | 0.7% |
-| `core` | 10 | 868 | 1.2% |
+| `core` | 15 | 868 | 1.7% |
 | `ext/dom` | 6 | 868 | 0.7% |
 | `ext/spl` | 0 | 796 | 0.0% |
 | `ext/date` | 0 | 689 | 0.0% |
@@ -76,7 +78,7 @@ _Among tests the runner can currently grade (13766): 0.46%. The 8112 "not-yet-gr
 | `ext/pdo_firebird` | 0 | 49 | 0.0% |
 | `ext/com_dotnet` | 0 | 38 | 0.0% |
 | `ext/snmp` | 0 | 38 | 0.0% |
-| `ext/sodium` | 0 | 37 | 0.0% |
+| `ext/sodium` | 1 | 37 | 2.7% |
 | `ext/enchant` | 0 | 33 | 0.0% |
 | `ext/libxml` | 0 | 32 | 0.0% |
 | `ext/pdo_dblib` | 0 | 31 | 0.0% |
@@ -84,7 +86,6 @@ _Among tests the runner can currently grade (13766): 0.46%. The 8112 "not-yet-gr
 | `ext/readline` | 0 | 25 | 0.0% |
 | `sapi/cgi` | 1 | 24 | 4.2% |
 | `ext/gettext` | 0 | 19 | 0.0% |
-| `_curated (ours)` | 15 | 16 | 93.8% |
 | `ext/pdo_odbc` | 0 | 16 | 0.0% |
 | `ext/sysvshm` | 0 | 12 | 0.0% |
 | `ext/sysvmsg` | 0 | 7 | 0.0% |
@@ -94,12 +95,13 @@ _Among tests the runner can currently grade (13766): 0.46%. The 8112 "not-yet-gr
 
 ## Roadmap (the climb)
 
-The ladder to **"WordPress boots in the browser"**. Each rung gets its own slice of real `.phpt` tests as the oracle.
+The ladder to **"WordPress boots in the browser"**. Each rung is measured against real php-src tests.
 
 - [x] **v0 — Hello, World.** Inline HTML, `echo`, string/int literals, `.` concat.
 - [x] **v1 — Variables & types.** `$vars`, assignment, the zval value model (int/float/bool/null/string), `"$var"` interpolation.
 - [x] **v2 — Operators & expressions.** Arithmetic, comparison, logical, precedence, parentheses, float literals, type juggling.
-- [ ] **v3 — Control flow.** `if`/`else`, `while`, `for`, `foreach`, `switch`.
+- [x] **v3 — Control flow (conditionals & loops).** `if`/`elseif`/`else`, `while`, `do`/`while`, `break`/`continue`, and `//` `#` `/* */` comments.
+- [ ] **v3b — `for` / `foreach` / `switch`.** Needs `++`/`--` and assignment-as-expression; `foreach` needs arrays (v5).
 - [ ] **v4 — Functions.** User functions, parameters, return, scope.
 - [ ] **v5 — Arrays & strings.** PHP arrays (ordered maps) + the core built-ins WordPress leans on.
 - [ ] **v6 — Classes.** Classes, interfaces, traits — the OOP WordPress actually uses.
@@ -111,3 +113,4 @@ The ladder to **"WordPress boots in the browser"**. Each rung gets its own slice
 ### Runner TODO
 - [ ] `--EXPECTF--` matcher (unlocks grading of thousands more tests)
 - [ ] honor `--SKIPIF--` / `--EXTENSIONS--`
+- [ ] verify curated smoke tests against a reference PHP (Docker `php:8.3-cli`)

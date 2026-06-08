@@ -1,17 +1,21 @@
 //! FerroPHP scoreboard.
 //!
-//! Scans every `.phpt` test — our curated set in `tests/phpt/` plus the full
-//! upstream corpus in `vendor/php-src/` if present — runs each against the
-//! engine, compares output to the test's own `--EXPECT--` section, and writes a
-//! `PROGRESS.md` summarising the pass-rate overall and by area.
+//! The **official metric is corpus-only**: the pass-rate over the upstream
+//! php-src `.phpt` suite in `vendor/php-src/` — tests we did not write. Our own
+//! curated tests in `tests/phpt/` are reported separately as "smoke tests" and
+//! are NOT counted toward the headline number (writing the test and the
+//! implementation proves nothing — independence is the whole point).
 //!
-//! At this scale we do NOT list every test (there are ~18k). We bucket results
-//! by area (per-extension, Zend, core) so the report stays readable.
+//! Results are bucketed by area (per-extension, Zend, core) so the report stays
+//! readable across ~22k tests. Writes PROGRESS.md so the climb is always public.
 
 use ferrophp::run;
 use std::collections::BTreeMap;
+use std::panic;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+const CURATED: &str = "_curated";
 
 struct Phpt {
     file: String,
@@ -29,20 +33,20 @@ enum Outcome {
 type Tally = [usize; 4];
 
 fn main() {
+    panic::set_hook(Box::new(|_| {})); // silence per-test panic spam; caught in evaluate()
     let root = env!("CARGO_MANIFEST_DIR");
-    let curated = Path::new(root).join("tests").join("phpt");
-    let corpus = Path::new(root).join("vendor").join("php-src");
+    let curated_dir = Path::new(root).join("tests").join("phpt");
+    let corpus_dir = Path::new(root).join("vendor").join("php-src");
 
-    // Gather (group, path) for every test.
     let mut tests: Vec<(String, PathBuf)> = Vec::new();
     let mut cu = Vec::new();
-    collect_phpt(&curated, &mut cu);
+    collect_phpt(&curated_dir, &mut cu);
     for p in cu {
-        tests.push(("_curated (ours)".to_string(), p));
+        tests.push((CURATED.to_string(), p));
     }
-    if corpus.exists() {
+    if corpus_dir.exists() {
         let mut co = Vec::new();
-        collect_phpt(&corpus, &mut co);
+        collect_phpt(&corpus_dir, &mut co);
         for p in co {
             let g = group_of(&p);
             tests.push((g, p));
@@ -52,30 +56,36 @@ fn main() {
     }
 
     let mut groups: BTreeMap<String, Tally> = BTreeMap::new();
-    let mut overall: Tally = [0; 4];
+    let mut corpus: Tally = [0; 4]; // official metric
+    let mut curated: Tally = [0; 4]; // smoke tests, not counted
 
     let n = tests.len();
     for (i, (group, path)) in tests.iter().enumerate() {
         let bytes = fs::read(path).unwrap_or_default();
         let text = String::from_utf8_lossy(&bytes);
         let t = parse_phpt(&text);
-        let slot = groups.entry(group.clone()).or_insert([0; 4]);
         let idx = match evaluate(&t) {
             Outcome::Pass => 0,
             Outcome::Fail => 1,
             Outcome::Unsupported => 2,
         };
-        slot[idx] += 1;
-        slot[3] += 1;
-        overall[idx] += 1;
-        overall[3] += 1;
+        if group == CURATED {
+            curated[idx] += 1;
+            curated[3] += 1;
+        } else {
+            let slot = groups.entry(group.clone()).or_insert([0; 4]);
+            slot[idx] += 1;
+            slot[3] += 1;
+            corpus[idx] += 1;
+            corpus[3] += 1;
+        }
         if n > 2000 && i % 4000 == 0 && i > 0 {
             eprintln!("  …{i}/{n}");
         }
     }
 
-    print_summary(&overall, &groups);
-    write_progress(root, &overall, &groups);
+    print_summary(&corpus, &curated, &groups);
+    write_progress(root, &corpus, &curated, &groups);
     println!("\nWrote PROGRESS.md");
 }
 
@@ -85,8 +95,9 @@ fn evaluate(t: &Phpt) -> Outcome {
         None if t.has_expectf => return Outcome::Unsupported, // EXPECTF: runner can't grade yet
         None => return Outcome::Unsupported,
     };
-    match run(&t.file) {
-        Ok(actual) if actual.trim_end() == expected.trim_end() => Outcome::Pass,
+    // A buggy engine path on one test must never crash the whole run.
+    match panic::catch_unwind(panic::AssertUnwindSafe(|| run(&t.file))) {
+        Ok(Ok(actual)) if actual.trim_end() == expected.trim_end() => Outcome::Pass,
         _ => Outcome::Fail,
     }
 }
@@ -99,11 +110,10 @@ fn pct(part: usize, whole: usize) -> f64 {
     }
 }
 
-fn print_summary(overall: &Tally, groups: &BTreeMap<String, Tally>) {
-    let [pass, fail, na, total] = *overall;
+fn print_summary(corpus: &Tally, curated: &Tally, groups: &BTreeMap<String, Tally>) {
+    let [pass, fail, na, total] = *corpus;
     let gradeable = pass + fail;
 
-    // Largest areas first.
     let mut sorted: Vec<(&String, &Tally)> = groups.iter().collect();
     sorted.sort_by(|a, b| b.1[3].cmp(&a.1[3]));
 
@@ -117,16 +127,26 @@ fn print_summary(overall: &Tally, groups: &BTreeMap<String, Tally>) {
     }
 
     println!("\n====================================");
-    println!("PASS {pass}   FAIL {fail}   N/A {na}   TOTAL {total}");
+    println!("OFFICIAL (php-src corpus, tests we did not write):");
+    println!("  PASS {pass}   FAIL {fail}   N/A {na}   TOTAL {total}");
     println!(
-        "Pass rate: {pass}/{total} ({:.2}% of all .phpt) | {:.2}% of gradeable ({gradeable})",
+        "  Pass rate: {pass}/{total} ({:.2}% of all .phpt) | {:.2}% of gradeable ({gradeable})",
         pct(pass, total),
         pct(pass, gradeable),
     );
+    println!(
+        "Smoke tests (curated, NOT counted): {}/{} passing",
+        curated[0], curated[3]
+    );
 }
 
-fn write_progress(root: &str, overall: &Tally, groups: &BTreeMap<String, Tally>) {
-    let [pass, fail, na, total] = *overall;
+fn write_progress(
+    root: &str,
+    corpus: &Tally,
+    curated: &Tally,
+    groups: &BTreeMap<String, Tally>,
+) {
+    let [pass, fail, na, total] = *corpus;
     let gradeable = pass + fail;
 
     let mut md = String::new();
@@ -137,14 +157,19 @@ fn write_progress(root: &str, overall: &Tally, groups: &BTreeMap<String, Tally>)
         "**`.phpt` pass rate: {pass} / {total}  ({:.2}% of the entire PHP test suite)**\n\n",
         pct(pass, total)
     ));
+    md.push_str("_This counts only the upstream **php-src** test suite — tests we did **not** write. ");
     md.push_str(&format!(
-        "_Among tests the runner can currently grade ({gradeable}): {:.2}%. \
+        "Among tests the runner can currently grade ({gradeable}): {:.2}%. \
          The {na} \"not-yet-gradeable\" tests mostly use `--EXPECTF--`, which the runner doesn't match yet._\n\n",
         pct(pass, gradeable)
     ));
     md.push_str("| ✓ pass | ✗ fail | • not-yet-gradeable | total |\n");
     md.push_str("|---:|---:|---:|---:|\n");
     md.push_str(&format!("| {pass} | {fail} | {na} | {total} |\n\n"));
+    md.push_str(&format!(
+        "_Curated smoke tests (dev guards, **not** in the number above): {}/{} passing._\n\n",
+        curated[0], curated[3]
+    ));
 
     md.push_str("## By area\n\n| area | ✓ pass | total | % |\n|---|---:|---:|---:|\n");
     let mut sorted: Vec<(&String, &Tally)> = groups.iter().collect();
@@ -240,12 +265,13 @@ fn trunc(s: &str, max: usize) -> String {
     }
 }
 
-const ROADMAP: &str = r#"The ladder to **"WordPress boots in the browser"**. Each rung gets its own slice of real `.phpt` tests as the oracle.
+const ROADMAP: &str = r#"The ladder to **"WordPress boots in the browser"**. Each rung is measured against real php-src tests.
 
 - [x] **v0 — Hello, World.** Inline HTML, `echo`, string/int literals, `.` concat.
 - [x] **v1 — Variables & types.** `$vars`, assignment, the zval value model (int/float/bool/null/string), `"$var"` interpolation.
 - [x] **v2 — Operators & expressions.** Arithmetic, comparison, logical, precedence, parentheses, float literals, type juggling.
-- [ ] **v3 — Control flow.** `if`/`else`, `while`, `for`, `foreach`, `switch`.
+- [x] **v3 — Control flow (conditionals & loops).** `if`/`elseif`/`else`, `while`, `do`/`while`, `break`/`continue`, and `//` `#` `/* */` comments.
+- [ ] **v3b — `for` / `foreach` / `switch`.** Needs `++`/`--` and assignment-as-expression; `foreach` needs arrays (v5).
 - [ ] **v4 — Functions.** User functions, parameters, return, scope.
 - [ ] **v5 — Arrays & strings.** PHP arrays (ordered maps) + the core built-ins WordPress leans on.
 - [ ] **v6 — Classes.** Classes, interfaces, traits — the OOP WordPress actually uses.
@@ -257,4 +283,5 @@ const ROADMAP: &str = r#"The ladder to **"WordPress boots in the browser"**. Eac
 ### Runner TODO
 - [ ] `--EXPECTF--` matcher (unlocks grading of thousands more tests)
 - [ ] honor `--SKIPIF--` / `--EXTENSIONS--`
+- [ ] verify curated smoke tests against a reference PHP (Docker `php:8.3-cli`)
 "#;
