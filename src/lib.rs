@@ -1760,8 +1760,50 @@ impl Engine {
         }
     }
 
+    /// Parse one foreach target after `as`/`=>`: a `$var` or a `[..]`/`list(..)`
+    /// destructuring pattern.
+    fn parse_foreach_target(&mut self) -> R<(Option<String>, Option<Vec<DTarget>>)> {
+        self.skip_ws();
+        if self.peek() == Some('[') || self.starts_with("list") {
+            match self.try_destructure_targets()? {
+                Some(t) => Ok((None, Some(t))),
+                None => Err(EngineError("expected variable in foreach".into())),
+            }
+        } else if self.peek() == Some('$') {
+            Ok((Some(self.parse_variable_name()?), None))
+        } else {
+            Err(EngineError("expected variable in foreach".into()))
+        }
+    }
+
+    fn fe_bind_value(&mut self, vv: &Option<String>, vd: &Option<Vec<DTarget>>, v: Value) {
+        if let Some(name) = vv {
+            self.vars.insert(name.clone(), v);
+        } else if let Some(t) = vd {
+            self.bind_destructure(t, &v);
+        }
+    }
+
     fn foreach_statement(&mut self) -> R<Flow> {
         self.expect_char('(')?;
+        // Capture a simple `$var` iterable so `foreach ($a as &$v)` can write back.
+        self.skip_ws();
+        let src_var = {
+            let save = self.pos;
+            let mut sv = None;
+            if self.peek() == Some('$') {
+                if let Ok(nm) = self.parse_variable_name() {
+                    self.skip_ws();
+                    if self.starts_with("as")
+                        && !matches!(self.peek_at(2), Some(c) if c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        sv = Some(nm);
+                    }
+                }
+            }
+            self.pos = save;
+            sv
+        };
         let iterable = self.expression()?;
         self.skip_ws();
         let as_kw = self.try_identifier().map(|s| s.to_ascii_lowercase());
@@ -1769,21 +1811,33 @@ impl Engine {
             return Err(EngineError("expected `as` in foreach".into()));
         }
         self.skip_ws();
-        if self.peek() != Some('$') {
-            return Err(EngineError("expected variable in foreach".into()));
-        }
-        let v1 = self.parse_variable_name()?;
-        self.skip_ws();
-        let (key_var, val_var) = if self.starts_with("=>") {
-            self.pos += 2;
+        let mut by_ref = false;
+        if self.peek() == Some('&') {
+            by_ref = true;
+            self.pos += 1;
             self.skip_ws();
-            if self.peek() != Some('$') {
-                return Err(EngineError("expected value variable in foreach".into()));
+        }
+        let (t1_var, t1_de) = self.parse_foreach_target()?;
+        self.skip_ws();
+        let (key_var, val_var, val_destruct);
+        if self.starts_with("=>") {
+            self.pos += 2;
+            key_var = t1_var; // key must be a plain var
+            by_ref = false;
+            self.skip_ws();
+            if self.peek() == Some('&') {
+                by_ref = true;
+                self.pos += 1;
+                self.skip_ws();
             }
-            (Some(v1), self.parse_variable_name()?)
+            let (v_var, v_de) = self.parse_foreach_target()?;
+            val_var = v_var;
+            val_destruct = v_de;
         } else {
-            (None, v1)
-        };
+            key_var = None;
+            val_var = t1_var;
+            val_destruct = t1_de;
+        }
         self.expect_char(')')?;
         let body_start = self.pos;
 
@@ -1833,7 +1887,7 @@ impl Engine {
                         let k = self.call_method(&it, "key", Vec::new())?;
                         self.vars.insert(kv.clone(), k);
                     }
-                    self.vars.insert(val_var.clone(), cur);
+                    self.fe_bind_value(&val_var, &val_destruct, cur);
                     self.pos = body_start;
                     let flow = self.block_or_statement()?;
                     self.call_method(&it, "next", Vec::new())?;
@@ -1876,9 +1930,20 @@ impl Engine {
             if let Some(kv) = &key_var {
                 self.vars.insert(kv.clone(), akey_to_value(&k));
             }
-            self.vars.insert(val_var.clone(), v);
+            self.fe_bind_value(&val_var, &val_destruct, v);
             self.pos = body_start;
-            match self.block_or_statement()? {
+            let flow = self.block_or_statement()?;
+            // by-reference: write the (possibly modified) value back into the
+            // source array at the current key (simple `$var` iterables only).
+            if by_ref {
+                if let (Some(src), Some(vv)) = (&src_var, &val_var) {
+                    let nv = self.vars.get(vv).cloned().unwrap_or(Value::Null);
+                    if let Some(Value::Array(a)) = self.vars.get_mut(src) {
+                        a.set(k.clone(), nv);
+                    }
+                }
+            }
+            match flow {
                 Flow::Break(n) => {
                     return Ok(if n > 1 { Flow::Break(n - 1) } else { Flow::Normal });
                 }
@@ -2896,6 +2961,11 @@ impl Engine {
                     }
                 }
             } else {
+                // call-time pass-by-reference `foo(&$x)` — accepted, by-value
+                if self.peek() == Some('&') {
+                    self.pos += 1;
+                    self.skip_ws();
+                }
                 args.push(self.expression()?);
             }
             self.skip_ws();
