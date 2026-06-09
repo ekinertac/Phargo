@@ -93,6 +93,8 @@ const STEP_LIMIT: u64 = 20_000_000;
 /// from pathological corpus tests (huge `.=` / `str_repeat` / `range`).
 const MAX_STR: usize = 64 * 1024 * 1024;
 const MAX_RANGE: usize = 8_000_000;
+/// Cap on total nodes in a single array value (memory-bomb guard).
+const MAX_ARRAY_NODES: usize = 4_000_000;
 
 impl Eval {
     pub fn new() -> Self {
@@ -903,6 +905,11 @@ impl Eval {
 
     // ---- assignment targets --------------------------------------------
     fn assign_to(&mut self, target: &Expr, val: Value) -> R<()> {
+        // Guard against pathological array explosion (e.g. self-referential
+        // value-copy where references aren't modeled yet).
+        if matches!(val, Value::Array(_)) && value_size(&val, MAX_ARRAY_NODES) > MAX_ARRAY_NODES {
+            return Err(self.throw_error("Error", "Allocated array exceeds memory limit"));
+        }
         match target {
             Expr::Var(name) => {
                 self.vars().insert(name.clone(), val);
@@ -2191,6 +2198,27 @@ fn print_r(v: &Value, indent: usize, out: &mut String) {
 }
 
 // ---- helpers -----------------------------------------------------------
+
+/// Count nodes in a value (arrays only — the explosion vector), iteratively and
+/// bounded by `limit`. Guards against pathological array growth, e.g. value-copy
+/// fallback for `$a[$i] =& $a` (references not yet modeled) blowing up
+/// exponentially. Iterative so it can't itself overflow the stack.
+fn value_size(v: &Value, limit: usize) -> usize {
+    let mut count = 0usize;
+    let mut stack: Vec<&Value> = vec![v];
+    while let Some(cur) = stack.pop() {
+        count += 1;
+        if count > limit {
+            return count;
+        }
+        if let Value::Array(a) = cur {
+            for (_, e) in &a.entries {
+                stack.push(e);
+            }
+        }
+    }
+    count
+}
 
 fn string_char(s: &[u8], k: &Key) -> Value {
     let i = match k {
