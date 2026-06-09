@@ -102,6 +102,85 @@ class UnexpectedValueException extends RuntimeException {}
 class UnderflowException extends RuntimeException {}
 class OverflowException extends RuntimeException {}
 class JsonException extends Exception {}
+
+class ReflectionClass {
+    public $name;
+    public function __construct($arg) { $this->name = is_object($arg) ? get_class($arg) : $arg; }
+    public function getName() { return $this->name; }
+    public function getShortName() { $p = strrpos($this->name, "\\"); return $p === false ? $this->name : substr($this->name, $p + 1); }
+    public function getParentClass() { $p = get_parent_class($this->name); return $p === false ? false : new ReflectionClass($p); }
+    public function hasMethod($m) { return method_exists($this->name, $m); }
+    public function hasProperty($p) { return property_exists($this->name, $p); }
+    public function getMethod($m) { return new ReflectionMethod($this->name, $m); }
+    public function getProperty($p) { return new ReflectionProperty($this->name, $p); }
+    public function getMethods() { $r = []; foreach (get_class_methods($this->name) as $m) { $r[] = new ReflectionMethod($this->name, $m); } return $r; }
+    public function getInterfaceNames() { return array_values(class_implements($this->name)); }
+    public function getInterfaces() { $r = []; foreach (class_implements($this->name) as $i) { $r[$i] = new ReflectionClass($i); } return $r; }
+    public function implementsInterface($i) { $n = strtolower($i); foreach (class_implements($this->name) as $x) { if (strtolower($x) === $n) return true; } return false; }
+    public function isSubclassOf($c) { return is_subclass_of($this->name, $c); }
+    public function isInstance($obj) { return is_a($obj, $this->name); }
+    public function isInterface() { return false; }
+    public function isAbstract() { return false; }
+    public function isFinal() { return false; }
+    public function isInstantiable() { return true; }
+    public function getConstants() { return phargo_class_constants($this->name); }
+    public function getConstant($n) { $c = phargo_class_constants($this->name); return $c[$n] ?? false; }
+    public function hasConstant($n) { return isset(phargo_class_constants($this->name)[$n]); }
+    public function getConstructor() { return method_exists($this->name, "__construct") ? new ReflectionMethod($this->name, "__construct") : null; }
+    public function getProperties() { $r = []; foreach (array_keys(get_class_vars($this->name)) as $p) { $r[] = new ReflectionProperty($this->name, $p); } return $r; }
+    public function getDefaultProperties() { return get_class_vars($this->name); }
+    public function newInstance(...$args) { $n = $this->name; return new $n(...$args); }
+    public function newInstanceArgs($args = []) { $n = $this->name; return new $n(...$args); }
+    public function newInstanceWithoutConstructor() { $n = $this->name; return new $n(); }
+}
+class ReflectionObject extends ReflectionClass {}
+class ReflectionEnum extends ReflectionClass {}
+class ReflectionMethod {
+    public $class; public $name;
+    public function __construct($c, $m = null) { if ($m === null) { $parts = explode("::", $c); $c = $parts[0]; $m = $parts[1]; } $this->class = is_object($c) ? get_class($c) : $c; $this->name = $m; }
+    public function getName() { return $this->name; }
+    public function getDeclaringClass() { return new ReflectionClass($this->class); }
+    public function invoke($obj, ...$args) { $n = $this->name; return $obj->$n(...$args); }
+    public function invokeArgs($obj, $args = []) { $n = $this->name; return $obj->$n(...$args); }
+    public function getParameters() { $r = []; foreach (phargo_func_params($this->class, $this->name) as $p) { $r[] = new ReflectionParameter($p); } return $r; }
+    public function getNumberOfParameters() { return count(phargo_func_params($this->class, $this->name)); }
+    public function getNumberOfRequiredParameters() { $n = 0; foreach (phargo_func_params($this->class, $this->name) as $p) { if (!$p["optional"]) $n++; } return $n; }
+    public function isStatic() { return false; }
+    public function isPublic() { return true; }
+    public function isAbstract() { return false; }
+    public function setAccessible($a) {}
+}
+class ReflectionParameter {
+    public $name; private $info;
+    public function __construct($info) { $this->info = $info; $this->name = $info["name"]; }
+    public function getName() { return $this->name; }
+    public function isOptional() { return $this->info["optional"]; }
+    public function isVariadic() { return $this->info["variadic"]; }
+    public function hasType() { return $this->info["type"] !== null; }
+    public function getType() { return $this->info["type"]; }
+}
+class ReflectionProperty {
+    public $class; public $name;
+    public function __construct($c, $n) { $this->class = is_object($c) ? get_class($c) : $c; $this->name = $n; }
+    public function getName() { return $this->name; }
+    public function getValue($obj = null) { $n = $this->name; return $obj->$n; }
+    public function setValue($obj, $v) { $n = $this->name; $obj->$n = $v; }
+    public function isPublic() { return true; }
+    public function isStatic() { return false; }
+    public function setAccessible($a) {}
+}
+class ReflectionFunction {
+    public $name;
+    public function __construct($n) { $this->name = $n; }
+    public function getName() { return $this->name; }
+    public function invoke(...$args) { return call_user_func_array($this->name, $args); }
+    public function invokeArgs($args = []) { return call_user_func_array($this->name, $args); }
+    public function getParameters() { $r = []; foreach (phargo_func_params("", $this->name) as $p) { $r[] = new ReflectionParameter($p); } return $r; }
+    public function getNumberOfParameters() { return count(phargo_func_params("", $this->name)); }
+    public function getNumberOfRequiredParameters() { $n = 0; foreach (phargo_func_params("", $this->name) as $p) { if (!$p["optional"]) $n++; } return $n; }
+}
+class ReflectionNamedType { public $name; public function __construct($n) { $this->name = $n; } public function getName() { return $this->name; } public function allowsNull() { return false; } }
+class ReflectionException extends Exception {}
 "##;
 
 const STEP_LIMIT: u64 = 20_000_000;
@@ -1713,6 +1792,8 @@ impl Eval {
             "is_bool" => Value::Bool(matches!(a(0), Value::Bool(_))),
             "is_array" => Value::Bool(matches!(a(0), Value::Array(_))),
             "is_null" => Value::Bool(matches!(a(0), Value::Null)),
+            "is_object" => Value::Bool(matches!(a(0), Value::Object(_) | Value::Closure(_))),
+            "is_iterable" => Value::Bool(matches!(a(0), Value::Array(_) | Value::Object(_))),
             "is_numeric" => Value::Bool(match a(0) {
                 Value::Int(_) | Value::Float(_) => true,
                 Value::Str(s) => is_numeric_str(&s),
@@ -1849,6 +1930,29 @@ impl Eval {
             "strpos" => {
                 let hay = to_bytes(&a(0));
                 let needle = to_bytes(&a(1));
+                match find_bytes(&hay, &needle, to_i64(&a(2)).max(0) as usize) {
+                    Some(i) => Value::Int(i as i64),
+                    None => Value::Bool(false),
+                }
+            }
+            "strrpos" => {
+                let hay = to_bytes(&a(0));
+                let needle = to_bytes(&a(1));
+                if needle.is_empty() {
+                    Value::Int(hay.len() as i64)
+                } else {
+                    match (0..=hay.len().saturating_sub(needle.len()))
+                        .rev()
+                        .find(|&i| hay[i..i + needle.len()] == needle[..])
+                    {
+                        Some(i) => Value::Int(i as i64),
+                        None => Value::Bool(false),
+                    }
+                }
+            }
+            "stripos" => {
+                let hay = to_bytes(&a(0)).to_ascii_lowercase();
+                let needle = to_bytes(&a(1)).to_ascii_lowercase();
                 match find_bytes(&hay, &needle, to_i64(&a(2)).max(0) as usize) {
                     Some(i) => Value::Int(i as i64),
                     None => Value::Bool(false),
@@ -2143,6 +2247,136 @@ impl Eval {
                 } else {
                     sub
                 })
+            }
+            "get_class_methods" => {
+                let cn = match a(0) {
+                    Value::Object(rc) => rc.borrow().class.clone(),
+                    v => String::from_utf8_lossy(&to_bytes(&v)).into_owned(),
+                };
+                let mut arr = Arr::new();
+                let mut seen = HashSet::new();
+                for c in self.ancestry(&cn) {
+                    for m in &c.methods {
+                        if seen.insert(m.name.to_ascii_lowercase()) {
+                            arr.push(Value::Str(m.name.as_bytes().to_vec()));
+                        }
+                    }
+                }
+                Value::Array(arr)
+            }
+            "get_class_vars" => {
+                let cn = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let mut arr = Arr::new();
+                for c in self.ancestry(&cn).into_iter().rev() {
+                    for p in &c.props {
+                        if !p.is_static {
+                            let v = match &p.default {
+                                Some(d) => self.eval(&d.clone())?,
+                                None => Value::Null,
+                            };
+                            arr.insert(Key::Str(p.name.as_bytes().to_vec()), v);
+                        }
+                    }
+                }
+                Value::Array(arr)
+            }
+            "class_implements" => {
+                let cn = match a(0) {
+                    Value::Object(rc) => rc.borrow().class.clone(),
+                    v => String::from_utf8_lossy(&to_bytes(&v)).into_owned(),
+                };
+                let mut arr = Arr::new();
+                for c in self.ancestry(&cn) {
+                    for i in &c.interfaces {
+                        let nm = i.last().to_string();
+                        arr.insert(Key::Str(nm.clone().into_bytes()), Value::Str(nm.into_bytes()));
+                    }
+                }
+                Value::Array(arr)
+            }
+            "class_parents" => {
+                let cn = match a(0) {
+                    Value::Object(rc) => rc.borrow().class.clone(),
+                    v => String::from_utf8_lossy(&to_bytes(&v)).into_owned(),
+                };
+                let mut arr = Arr::new();
+                for c in self.ancestry(&cn).into_iter().skip(1) {
+                    arr.insert(
+                        Key::Str(c.name.clone().into_bytes()),
+                        Value::Str(c.name.clone().into_bytes()),
+                    );
+                }
+                Value::Array(arr)
+            }
+            "class_uses" => {
+                let cn = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let mut arr = Arr::new();
+                if let Some(c) = self.find_class(&cn) {
+                    for t in &c.uses_traits {
+                        let nm = t.last().to_string();
+                        arr.insert(Key::Str(nm.clone().into_bytes()), Value::Str(nm.into_bytes()));
+                    }
+                }
+                Value::Array(arr)
+            }
+            "phargo_class_constants" => {
+                let cn = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let mut arr = Arr::new();
+                for c in self.ancestry(&cn) {
+                    for cc in &c.consts {
+                        let key = Key::Str(cc.name.as_bytes().to_vec());
+                        if arr.get(&key).is_none() {
+                            let v = self.eval(&cc.value.clone())?;
+                            arr.insert(key, v);
+                        }
+                    }
+                }
+                Value::Array(arr)
+            }
+            "phargo_func_params" => {
+                let cls = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let fname = String::from_utf8_lossy(&to_bytes(&a(1))).into_owned();
+                let params = if cls.is_empty() {
+                    self.funcs.get(&fname.to_ascii_lowercase()).map(|f| f.params.clone())
+                } else {
+                    self.find_method(&cls, &fname).map(|(_, m)| m.params.clone())
+                };
+                let mut arr = Arr::new();
+                if let Some(ps) = params {
+                    for p in ps {
+                        let mut info = Arr::new();
+                        info.insert(Key::Str(b"name".to_vec()), Value::Str(p.name.as_bytes().to_vec()));
+                        info.insert(
+                            Key::Str(b"optional".to_vec()),
+                            Value::Bool(p.default.is_some() || p.variadic),
+                        );
+                        info.insert(Key::Str(b"variadic".to_vec()), Value::Bool(p.variadic));
+                        info.insert(
+                            Key::Str(b"type".to_vec()),
+                            match &p.type_hint {
+                                Some(t) => Value::Str(t.as_bytes().to_vec()),
+                                None => Value::Null,
+                            },
+                        );
+                        arr.push(Value::Array(info));
+                    }
+                }
+                Value::Array(arr)
+            }
+            "tempnam" => {
+                let dir = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let prefix = String::from_utf8_lossy(&to_bytes(&a(1))).into_owned();
+                let base = std::path::PathBuf::from(&dir);
+                // deterministic-ish unique name from the step counter
+                let cand = base.join(format!("{prefix}{}", self.steps));
+                match std::fs::OpenOptions::new().create_new(true).write(true).open(&cand) {
+                    Ok(_) => Value::Str(cand.to_string_lossy().as_bytes().to_vec()),
+                    Err(_) => Value::Bool(false),
+                }
+            }
+            "chdir" => {
+                let dir = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                Value::Bool(std::env::set_current_dir(&dir).is_ok())
             }
             // ---- filesystem ----
             "file_get_contents" => {
