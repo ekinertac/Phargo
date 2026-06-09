@@ -3478,7 +3478,10 @@ fn php_const(n: &str) -> Option<Value> {
 
 // ---- serialize / unserialize (byte-based, for the v2 Value) -------------
 fn php_serialize(v: &Value, out: &mut Vec<u8>, depth: usize) {
-    if depth > 256 {
+    // Depth cap + a hard output-size cap: this serializer doesn't emit `r:`/`R:`
+    // back-references, so shared/cyclic object graphs would otherwise blow up
+    // exponentially (bug36424).
+    if depth > 256 || out.len() > MAX_STR {
         out.extend_from_slice(b"N;");
         return;
     }
