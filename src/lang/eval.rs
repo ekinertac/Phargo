@@ -421,6 +421,29 @@ impl Eval {
                 }
             }
             Stmt::Expr(e) => {
+                // Fast path for `$v .= expr;` as a statement: append in place and
+                // DON'T clone the (possibly huge) result — the value is discarded.
+                // (Cloning it each iteration made `.=` loops O(n^2): concat_003.)
+                if let Expr::AssignOp(BinOp::Concat, lhs, rhs) = e {
+                    if let Expr::Var(name) = &**lhs {
+                        let rv = self.eval(rhs)?;
+                        let rb = self.stringify(&rv)?;
+                        let slot = self
+                            .vars()
+                            .entry(name.clone())
+                            .or_insert(Value::Str(Vec::new()));
+                        if let Value::Str(s) = slot {
+                            if s.len() + rb.len() <= MAX_STR {
+                                s.extend_from_slice(&rb);
+                            }
+                        } else {
+                            let mut s = to_bytes(slot);
+                            s.extend_from_slice(&rb);
+                            *slot = Value::Str(s);
+                        }
+                        return Ok(Flow::Normal);
+                    }
+                }
                 self.eval(e)?;
             }
             Stmt::Block(b) => return self.exec_block(b),
