@@ -974,23 +974,22 @@ impl Eval {
                 }
                 self.assign_index(inner, ikey, cur)
             }
-            // `$obj->prop[...] = v` — objects are shared, so mutate in place.
+            // `$obj->prop[...] = v` — mutate the property array IN PLACE (cloning
+            // it on every append is O(n^2); `$this->arr[] = …` loops crawl).
             Expr::Prop(objexpr, name, _) => {
                 let o = self.eval(objexpr)?;
                 let pname = self.prop_name_str(name)?;
                 if let Value::Object(rc) = o {
                     let mut b = rc.borrow_mut();
-                    let mut cur = b.get(&pname).cloned().unwrap_or(Value::Array(Arr::new()));
-                    if !matches!(cur, Value::Array(_)) {
-                        cur = Value::Array(Arr::new());
+                    if !matches!(b.get(&pname), Some(Value::Array(_))) {
+                        b.set(&pname, Value::Array(Arr::new()));
                     }
-                    if let Value::Array(a) = &mut cur {
+                    if let Some(Value::Array(a)) = b.get_mut(&pname) {
                         match key {
                             Some(k) => a.insert(k, val),
                             None => a.push(val),
                         }
                     }
-                    b.set(&pname, cur);
                 }
                 Ok(())
             }

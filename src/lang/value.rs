@@ -56,6 +56,9 @@ impl Obj {
             self.props.push((name.to_string(), v));
         }
     }
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut Value> {
+        self.props.iter_mut().find(|(k, _)| k == name).map(|(_, v)| v)
+    }
 }
 
 pub fn new_obj(class: &str) -> Value {
