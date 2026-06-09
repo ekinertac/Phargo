@@ -1322,6 +1322,13 @@ impl Eval {
                     }
                     return Ok(Value::Int(count));
                 }
+                "array_push" | "array_pop" | "array_shift" | "array_unshift" | "sort" | "rsort"
+                | "asort" | "arsort" | "ksort" | "krsort" | "usort" | "uasort" | "uksort"
+                | "array_splice" | "shuffle"
+                    if !args.is_empty() =>
+                {
+                    return self.array_byref(&name, args, &argv);
+                }
                 _ => {}
             }
             if let Some(f) = self.funcs.get(&name).cloned() {
@@ -1397,6 +1404,160 @@ impl Eval {
             }
         }
         p
+    }
+
+    /// In-place array builtins: read `args[0]` as an array lvalue, mutate, assign back.
+    fn array_byref(&mut self, name: &str, args: &[Arg], argv: &[Value]) -> R<Value> {
+        let mut arr = match self.eval(&args[0].value)? {
+            Value::Array(a) => a,
+            _ => Arr::new(),
+        };
+        let rebuilt = |entries: Vec<(Key, Value)>| -> Arr {
+            let mut a = Arr::new();
+            for (k, v) in entries {
+                a.insert(k, v);
+            }
+            a
+        };
+        let reindex_vals = |vals: Vec<Value>| -> Arr {
+            let mut a = Arr::new();
+            for v in vals {
+                a.push(v);
+            }
+            a
+        };
+        let result = match name {
+            "array_push" => {
+                for v in &argv[1..] {
+                    arr.push(v.clone());
+                }
+                Value::Int(arr.len() as i64)
+            }
+            "array_pop" => match arr.entries.pop() {
+                Some((_, v)) => {
+                    arr = rebuilt(arr.entries);
+                    v
+                }
+                None => Value::Null,
+            },
+            "array_shift" => {
+                if arr.entries.is_empty() {
+                    Value::Null
+                } else {
+                    let (_, v) = arr.entries.remove(0);
+                    let mut new = Arr::new();
+                    for (k, val) in std::mem::take(&mut arr.entries) {
+                        match k {
+                            Key::Int(_) => new.push(val),
+                            Key::Str(_) => new.insert(k, val),
+                        }
+                    }
+                    arr = new;
+                    v
+                }
+            }
+            "array_unshift" => {
+                let mut new = Arr::new();
+                for v in &argv[1..] {
+                    new.push(v.clone());
+                }
+                for (k, val) in std::mem::take(&mut arr.entries) {
+                    match k {
+                        Key::Int(_) => new.push(val),
+                        Key::Str(_) => new.insert(k, val),
+                    }
+                }
+                arr = new;
+                Value::Int(arr.len() as i64)
+            }
+            "sort" | "rsort" => {
+                let mut vals: Vec<Value> = arr.entries.iter().map(|(_, v)| v.clone()).collect();
+                vals.sort_by(|a, b| compare(a, b));
+                if name == "rsort" {
+                    vals.reverse();
+                }
+                arr = reindex_vals(vals);
+                Value::Bool(true)
+            }
+            "asort" | "arsort" => {
+                let mut entries = std::mem::take(&mut arr.entries);
+                entries.sort_by(|(_, a), (_, b)| compare(a, b));
+                if name == "arsort" {
+                    entries.reverse();
+                }
+                arr = rebuilt(entries);
+                Value::Bool(true)
+            }
+            "ksort" | "krsort" => {
+                let mut entries = std::mem::take(&mut arr.entries);
+                entries.sort_by(|(a, _), (b, _)| key_cmp(a, b));
+                if name == "krsort" {
+                    entries.reverse();
+                }
+                arr = rebuilt(entries);
+                Value::Bool(true)
+            }
+            "usort" | "uasort" | "uksort" => {
+                let cb = argv.get(1).cloned().unwrap_or(Value::Null);
+                let mut entries = std::mem::take(&mut arr.entries);
+                let on_keys = name == "uksort";
+                entries.sort_by(|(ka, va), (kb, vb)| {
+                    let (l, r) = if on_keys {
+                        (akey_to_value(ka), akey_to_value(kb))
+                    } else {
+                        (va.clone(), vb.clone())
+                    };
+                    let c = self.call_value(cb.clone(), vec![l, r]).map(|v| to_i64(&v)).unwrap_or(0);
+                    c.cmp(&0)
+                });
+                arr = if name == "usort" {
+                    reindex_vals(entries.into_iter().map(|(_, v)| v).collect())
+                } else {
+                    rebuilt(entries)
+                };
+                Value::Bool(true)
+            }
+            "array_splice" => {
+                let len = arr.entries.len() as i64;
+                let mut off = to_i64(argv.get(1).unwrap_or(&Value::Null));
+                if off < 0 {
+                    off = (len + off).max(0);
+                }
+                let off = off.min(len) as usize;
+                let rem = if argv.len() > 2 {
+                    let l = to_i64(&argv[2]);
+                    if l < 0 { ((len + l) as usize).saturating_sub(off) } else { l as usize }
+                } else {
+                    arr.entries.len() - off
+                };
+                let end = (off + rem).min(arr.entries.len());
+                let removed: Vec<Value> = arr.entries[off..end].iter().map(|(_, v)| v.clone()).collect();
+                let repl: Vec<Value> = match argv.get(3) {
+                    Some(Value::Array(a)) => a.entries.iter().map(|(_, v)| v.clone()).collect(),
+                    Some(v) => vec![v.clone()],
+                    None => vec![],
+                };
+                let mut new_entries: Vec<(Key, Value)> = arr.entries[..off].to_vec();
+                for v in repl {
+                    new_entries.push((Key::Int(0), v)); // key reassigned by rebuilt-as-pushed
+                }
+                new_entries.extend_from_slice(&arr.entries[end..]);
+                // reindex integer keys, keep string keys
+                let mut new = Arr::new();
+                for (k, v) in new_entries {
+                    match k {
+                        Key::Int(_) => new.push(v),
+                        Key::Str(_) => new.insert(k, v),
+                    }
+                }
+                arr = new;
+                Value::Array(reindex_vals(removed))
+            }
+            "shuffle" => Value::Bool(true), // no RNG; leave order (deterministic)
+            _ => Value::Null,
+        };
+        self.assign_to(&args[0].value, Value::Array(arr))?;
+        Ok(result)
     }
 
     /// Run a `preg_match`/`preg_match_all`, returning (count, matches-array),
@@ -2156,6 +2317,168 @@ impl Eval {
                             }
                         }
                     }
+                }
+                Value::Array(out)
+            }
+            "array_reverse" => {
+                let preserve = to_bool(&a(1));
+                let mut out = Arr::new();
+                if let Value::Array(arr) = a(0) {
+                    for (k, v) in arr.entries.into_iter().rev() {
+                        match k {
+                            Key::Int(_) if !preserve => out.push(v),
+                            _ => out.insert(k, v),
+                        }
+                    }
+                }
+                Value::Array(out)
+            }
+            "array_slice" => {
+                let preserve = to_bool(&a(3));
+                let (entries, len) = match a(0) {
+                    Value::Array(arr) => {
+                        let l = arr.entries.len();
+                        (arr.entries, l)
+                    }
+                    _ => (Vec::new(), 0),
+                };
+                let mut off = to_i64(&a(1));
+                if off < 0 {
+                    off = (len as i64 + off).max(0);
+                }
+                let off = off.min(len as i64) as usize;
+                let end = if args.len() > 2 && !matches!(a(2), Value::Null) {
+                    let l = to_i64(&a(2));
+                    if l < 0 { ((len as i64 + l).max(off as i64)) as usize } else { (off + l as usize).min(len) }
+                } else {
+                    len
+                };
+                let mut out = Arr::new();
+                for (k, v) in entries.into_iter().take(end).skip(off) {
+                    match k {
+                        Key::Int(_) if !preserve => out.push(v),
+                        _ => out.insert(k, v),
+                    }
+                }
+                Value::Array(out)
+            }
+            "array_flip" => {
+                let mut out = Arr::new();
+                if let Value::Array(arr) = a(0) {
+                    for (k, v) in arr.entries {
+                        out.insert(Arr::norm_key(&v), akey_to_value(&k));
+                    }
+                }
+                Value::Array(out)
+            }
+            "array_unique" => {
+                let mut out = Arr::new();
+                let mut seen: Vec<Vec<u8>> = Vec::new();
+                if let Value::Array(arr) = a(0) {
+                    for (k, v) in arr.entries {
+                        let key = to_bytes(&v);
+                        if !seen.contains(&key) {
+                            seen.push(key);
+                            out.insert(k, v);
+                        }
+                    }
+                }
+                Value::Array(out)
+            }
+            "array_search" => {
+                let needle = a(0);
+                let strict = to_bool(&a(2));
+                let mut found = Value::Bool(false);
+                if let Value::Array(arr) = a(1) {
+                    for (k, v) in &arr.entries {
+                        if (strict && strict_eq(&needle, v)) || (!strict && loose_eq(&needle, v)) {
+                            found = akey_to_value(k);
+                            break;
+                        }
+                    }
+                }
+                found
+            }
+            "array_key_exists" | "key_exists" => {
+                let key = Arr::norm_key(&a(0));
+                Value::Bool(matches!(a(1), Value::Array(arr) if arr.get(&key).is_some()))
+            }
+            "array_key_first" => match a(0) {
+                Value::Array(arr) => arr.entries.first().map(|(k, _)| akey_to_value(k)).unwrap_or(Value::Null),
+                _ => Value::Null,
+            },
+            "array_key_last" => match a(0) {
+                Value::Array(arr) => arr.entries.last().map(|(k, _)| akey_to_value(k)).unwrap_or(Value::Null),
+                _ => Value::Null,
+            },
+            "array_combine" => {
+                let mut out = Arr::new();
+                if let (Value::Array(ks), Value::Array(vs)) = (a(0), a(1)) {
+                    for ((_, k), (_, v)) in ks.entries.into_iter().zip(vs.entries) {
+                        out.insert(Arr::norm_key(&k), v);
+                    }
+                }
+                Value::Array(out)
+            }
+            "array_fill" => {
+                let start = to_i64(&a(0));
+                let count = to_i64(&a(1)).max(0).min(MAX_ARRAY_NODES as i64) as usize;
+                let val = a(2);
+                let mut out = Arr::new();
+                for i in 0..count {
+                    out.insert(Key::Int(start + i as i64), val.clone());
+                }
+                Value::Array(out)
+            }
+            "array_column" => {
+                let col = a(1);
+                let idx = a(2);
+                let mut out = Arr::new();
+                if let Value::Array(arr) = a(0) {
+                    for (_, row) in arr.entries {
+                        if let Value::Array(r) = &row {
+                            let cell = if matches!(col, Value::Null) {
+                                row.clone()
+                            } else {
+                                r.get(&Arr::norm_key(&col)).cloned().unwrap_or(Value::Null)
+                            };
+                            if !matches!(idx, Value::Null) {
+                                if let Some(kv) = r.get(&Arr::norm_key(&idx)) {
+                                    out.insert(Arr::norm_key(kv), cell);
+                                    continue;
+                                }
+                            }
+                            out.push(cell);
+                        }
+                    }
+                }
+                Value::Array(out)
+            }
+            "array_is_list" => Value::Bool(match a(0) {
+                Value::Array(arr) => arr.entries.iter().enumerate().all(|(i, (k, _))| matches!(k, Key::Int(n) if *n == i as i64)),
+                _ => false,
+            }),
+            "array_pad" => {
+                let size = to_i64(&a(1));
+                let val = a(2);
+                let mut items: Vec<Value> = match a(0) {
+                    Value::Array(arr) => arr.entries.into_iter().map(|(_, v)| v).collect(),
+                    _ => Vec::new(),
+                };
+                let n = size.unsigned_abs() as usize;
+                if items.len() < n {
+                    let pad = n - items.len();
+                    if size < 0 {
+                        let mut front = vec![val; pad];
+                        front.extend(items);
+                        items = front;
+                    } else {
+                        items.extend(vec![val; pad]);
+                    }
+                }
+                let mut out = Arr::new();
+                for v in items {
+                    out.push(v);
                 }
                 Value::Array(out)
             }
@@ -3824,6 +4147,23 @@ fn php_unserialize(b: &[u8], pos: &mut usize, depth: usize) -> Option<Value> {
             Some(Value::Object(obj))
         }
         _ => None,
+    }
+}
+
+fn akey_to_value(k: &Key) -> Value {
+    match k {
+        Key::Int(n) => Value::Int(*n),
+        Key::Str(s) => Value::Str(s.clone()),
+    }
+}
+
+fn key_cmp(a: &Key, b: &Key) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Key::Int(x), Key::Int(y)) => x.cmp(y),
+        (Key::Str(x), Key::Str(y)) => x.cmp(y),
+        (Key::Int(_), Key::Str(_)) => Ordering::Less,
+        (Key::Str(_), Key::Int(_)) => Ordering::Greater,
     }
 }
 
