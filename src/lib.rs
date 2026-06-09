@@ -6599,6 +6599,10 @@ impl Engine {
             Some('\'') => Ok(Value::Str(self.single_quoted()?)),
             Some('$') => self.variable(),
             Some(c) if c.is_ascii_digit() => Ok(self.number()),
+            // leading-dot float literal: `.5`, `.25e3`
+            Some('.') if matches!(self.peek_at(1), Some(d) if d.is_ascii_digit()) => {
+                Ok(self.number())
+            }
             Some(c) if c.is_ascii_alphabetic() || c == '_' => {
                 let id = self.try_identifier().unwrap();
                 match id.to_ascii_lowercase().as_str() {
@@ -9568,6 +9572,37 @@ fn php_constant(name: &str) -> Option<Value> {
         "STR_PAD_BOTH" => Value::Int(2),
         "COUNT_NORMAL" => Value::Int(0),
         "COUNT_RECURSIVE" => Value::Int(1),
+        "STREAM_FILTER_READ" => Value::Int(1),
+        "STREAM_FILTER_WRITE" => Value::Int(2),
+        "STREAM_FILTER_ALL" => Value::Int(3),
+        "STREAM_USE_PATH" => Value::Int(1),
+        "STREAM_CLIENT_CONNECT" => Value::Int(4),
+        "STREAM_SERVER_BIND" => Value::Int(4),
+        "STREAM_SERVER_LISTEN" => Value::Int(8),
+        "STREAM_SHUT_RD" => Value::Int(0),
+        "STREAM_SHUT_WR" => Value::Int(1),
+        "STREAM_SHUT_RDWR" => Value::Int(2),
+        "STREAM_META_TOUCH" => Value::Int(1),
+        "PSFS_PASS_ON" => Value::Int(2),
+        "PSFS_FEED_ME" => Value::Int(1),
+        "PSFS_ERR_FATAL" => Value::Int(0),
+        "PHP_DEBUG" => Value::Int(0),
+        "PHP_ZTS" => Value::Int(0),
+        "PHP_MANDIR" => Value::Str("/usr/local/man".into()),
+        "MB_CASE_UPPER" => Value::Int(0),
+        "MB_CASE_LOWER" => Value::Int(1),
+        "MB_CASE_TITLE" => Value::Int(2),
+        "JSON_NUMERIC_CHECK" => Value::Int(32),
+        "JSON_FORCE_OBJECT" => Value::Int(16),
+        "JSON_PARTIAL_OUTPUT_ON_ERROR" => Value::Int(512),
+        "JSON_PRESERVE_ZERO_FRACTION" => Value::Int(1024),
+        "JSON_INVALID_UTF8_IGNORE" => Value::Int(1048576),
+        "JSON_INVALID_UTF8_SUBSTITUTE" => Value::Int(2097152),
+        "JSON_OBJECT_AS_ARRAY" => Value::Int(1),
+        "JSON_BIGINT_AS_STRING" => Value::Int(2),
+        "M_1_PI" => Value::Float(std::f64::consts::FRAC_1_PI),
+        "PREG_UNMATCHED_AS_NULL" => Value::Int(512),
+        "PREG_GREP_INVERT" => Value::Int(1),
         "FILE_APPEND" => Value::Int(8),
         "FILE_USE_INCLUDE_PATH" => Value::Int(1),
         "FILE_IGNORE_NEW_LINES" => Value::Int(2),
