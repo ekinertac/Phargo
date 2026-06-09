@@ -647,6 +647,11 @@ class ArrayIterator implements Iterator, ArrayAccess, Countable {
     public function offsetUnset($k): void { unset($this->__d[$k]); }
     public function count(): int { return count($this->__d); }
     public function getArrayCopy() { return $this->__d; }
+    public function append($v) { $this->__d[] = $v; }
+    public function ksort() { ksort($this->__d); return true; }
+    public function asort() { asort($this->__d); return true; }
+    public function uasort($cb) { uasort($this->__d, $cb); return true; }
+    public function uksort($cb) { uksort($this->__d, $cb); return true; }
 }
 class ArrayObject implements ArrayAccess, IteratorAggregate, Countable {
     private $__d;
@@ -696,7 +701,9 @@ class SplFixedArray implements ArrayAccess, Countable, Iterator {
     public function offsetUnset($k): void { $this->__d[$k] = null; }
     public function count(): int { return $this->__size; }
     public function getSize() { return $this->__size; }
+    public function setSize($s) { $this->__size = $s; return true; }
     public function toArray() { return $this->__d; }
+    public static function fromArray($a) { $f = new SplFixedArray(count($a)); $i = 0; foreach ($a as $v) { $f[$i] = $v; $i++; } return $f; }
     public function rewind(): void { $this->__p = 0; }
     public function valid(): bool { return $this->__p < $this->__size; }
     public function current(): mixed { return $this->__d[$this->__p] ?? null; }
@@ -729,6 +736,8 @@ class DateTime implements DateTimeInterface {
     public function setTimestamp($ts) { $this->__ts = $ts; return $this; }
     public function setDate($y, $m, $d) { $this->__ts = mktime((int)date("H", $this->__ts), (int)date("i", $this->__ts), (int)date("s", $this->__ts), $m, $d, $y); return $this; }
     public function setTime($h, $i, $s = 0) { $this->__ts = mktime($h, $i, $s, (int)date("n", $this->__ts), (int)date("j", $this->__ts), (int)date("Y", $this->__ts)); return $this; }
+    public function getTimezone() { return new DateTimeZone("UTC"); }
+    public function setTimezone($tz) { return $this; }
     public static function createFromFormat($fmt, $s) { $d = new DateTime($s); return $d; }
 }
 class DateTimeImmutable implements DateTimeInterface {
@@ -752,6 +761,11 @@ class ReflectionClass {
     public function implementsInterface($i) { $n = strtolower($i); foreach (class_implements($this->name) as $x) { if (strtolower($x) === $n) { return true; } } return false; }
     public function isSubclassOf($c) { return is_subclass_of($this->name, $c); }
     public function isInstance($obj) { return is_a($obj, $this->name); }
+    public function getConstants() { return phargo_class_constants($this->name); }
+    public function getConstant($n) { $c = phargo_class_constants($this->name); return $c[$n] ?? false; }
+    public function hasConstant($n) { return isset(phargo_class_constants($this->name)[$n]); }
+    public function getConstructor() { return method_exists($this->name, "__construct") ? new ReflectionMethod($this->name, "__construct") : null; }
+    public function getProperties() { $r = []; foreach (array_keys(get_class_vars($this->name)) as $p) { $r[] = new ReflectionProperty($this->name, $p); } return $r; }
     public function newInstance(...$args) { $n = $this->name; return new $n(...$args); }
     public function newInstanceArgs($args = []) { $n = $this->name; return new $n(...$args); }
     public function newInstanceWithoutConstructor() { $n = $this->name; return new $n(); }
@@ -764,6 +778,22 @@ class ReflectionMethod {
     public function getDeclaringClass() { return new ReflectionClass($this->class); }
     public function invoke($obj, ...$args) { $n = $this->name; return $obj->$n(...$args); }
     public function invokeArgs($obj, $args = []) { $n = $this->name; return $obj->$n(...$args); }
+    public function getParameters() { $r = []; foreach (phargo_func_params($this->class, $this->name) as $p) { $r[] = new ReflectionParameter($p); } return $r; }
+    public function getNumberOfParameters() { return count(phargo_func_params($this->class, $this->name)); }
+    public function getNumberOfRequiredParameters() { $n = 0; foreach (phargo_func_params($this->class, $this->name) as $p) { if (!$p["optional"]) { $n++; } } return $n; }
+    public function setAccessible($a) {}
+}
+class ReflectionParameter {
+    public $name; private $info;
+    public function __construct($info) { $this->info = $info; $this->name = $info["name"]; }
+    public function getName() { return $this->name; }
+    public function isOptional() { return $this->info["optional"]; }
+    public function isVariadic() { return $this->info["variadic"]; }
+}
+class DateTimeZone {
+    public $name;
+    public function __construct($name = "UTC") { $this->name = $name; }
+    public function getName() { return $this->name; }
 }
 class ReflectionProperty {
     public $class; public $name;
@@ -779,6 +809,9 @@ class ReflectionFunction {
     public function getName() { return $this->name; }
     public function invoke(...$args) { return call_user_func_array($this->name, $args); }
     public function invokeArgs($args = []) { return call_user_func_array($this->name, $args); }
+    public function getParameters() { $r = []; foreach (phargo_func_params("", $this->name) as $p) { $r[] = new ReflectionParameter($p); } return $r; }
+    public function getNumberOfParameters() { return count(phargo_func_params("", $this->name)); }
+    public function getNumberOfRequiredParameters() { $n = 0; foreach (phargo_func_params("", $this->name) as $p) { if (!$p["optional"]) { $n++; } } return $n; }
 }
 class ReflectionException extends Exception {}
 ?>
@@ -4493,6 +4526,83 @@ impl Engine {
                 None => Value::Bool(false),
             },
             "class_uses" => Value::Array(PArray::default()), // trait provenance not tracked post-merge
+            "get_class_vars" => match self.class_name_arg(&arg(0)) {
+                Some(cls) => {
+                    let mut r = PArray::default();
+                    let mut seen: HashSet<String> = HashSet::new();
+                    for cn in self.class_chain(&cls) {
+                        if let Some(cd) = self.classes.get(&cn).cloned() {
+                            for (pname, pos) in &cd.props {
+                                if seen.insert(pname.clone()) {
+                                    let v = match pos {
+                                        Some(p) => {
+                                            let save = self.pos;
+                                            self.pos = *p;
+                                            let val = self.expression().unwrap_or(Value::Null);
+                                            self.pos = save;
+                                            val
+                                        }
+                                        None => Value::Null,
+                                    };
+                                    r.set(AKey::Str(pname.clone()), v);
+                                }
+                            }
+                        }
+                    }
+                    Value::Array(r)
+                }
+                None => Value::Bool(false),
+            },
+            // Reflection support: parameter descriptors for a function/method.
+            "phargo_func_params" => {
+                let cls = arg(0).to_php_string();
+                let fname = arg(1).to_php_string();
+                let func = if cls.is_empty() {
+                    self.funcs.get(&fname.to_ascii_lowercase()).cloned()
+                } else {
+                    self.lookup_method(&cls, &fname)
+                };
+                match func {
+                    Some(f) => {
+                        let mut r = PArray::default();
+                        for p in &f.params {
+                            let mut info = PArray::default();
+                            info.set(AKey::Str("name".into()), Value::Str(p.name.clone()));
+                            info.set(
+                                AKey::Str("optional".into()),
+                                Value::Bool(p.default.is_some() || p.variadic),
+                            );
+                            info.set(AKey::Str("variadic".into()), Value::Bool(p.variadic));
+                            r.push(Value::Array(info));
+                        }
+                        Value::Array(r)
+                    }
+                    None => Value::Bool(false),
+                }
+            }
+            // Reflection support: evaluated class constants (child overrides parent).
+            "phargo_class_constants" => {
+                let cls = arg(0).to_php_string();
+                let mut r = PArray::default();
+                let mut seen: HashSet<String> = HashSet::new();
+                for cn in self.class_chain(&cls) {
+                    if let Some(cd) = self.classes.get(&cn).cloned() {
+                        for (cname, pos) in &cd.consts {
+                            if seen.insert(cname.clone()) {
+                                let save = self.pos;
+                                let savecls = self.current_class.clone();
+                                self.pos = *pos;
+                                self.current_class = Some(cn.clone());
+                                let v = self.expression().unwrap_or(Value::Null);
+                                self.pos = save;
+                                self.current_class = savecls;
+                                r.set(AKey::Str(cname.clone()), v);
+                            }
+                        }
+                    }
+                }
+                Value::Array(r)
+            }
             // ---- date / time -------------------------------------------------
             "time" => Value::Int(now_unix()),
             "date" | "gmdate" => {
