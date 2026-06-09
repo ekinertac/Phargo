@@ -8,6 +8,7 @@
 
 use super::ast::*;
 use super::value::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -28,7 +29,12 @@ pub struct Eval {
     /// Scope stack; `scopes[0]` is the global scope. Functions get a fresh scope.
     scopes: Vec<HashMap<String, Value>>,
     funcs: HashMap<String, Rc<FuncDecl>>,
+    classes: HashMap<String, Rc<ClassDecl>>,
     consts: HashMap<String, Value>,
+    /// Static property storage, keyed by (lowercased class, prop name).
+    static_props: HashMap<(String, String), Value>,
+    /// Class of the currently executing method, for `self`/`parent`/`static`.
+    current_class: Option<String>,
     steps: u64,
 }
 
@@ -40,7 +46,10 @@ impl Eval {
             out: Vec::new(),
             scopes: vec![HashMap::new()],
             funcs: HashMap::new(),
+            classes: HashMap::new(),
             consts: HashMap::new(),
+            static_props: HashMap::new(),
+            current_class: None,
             steps: 0,
         }
     }
@@ -56,8 +65,14 @@ impl Eval {
     /// Hoist top-level function declarations so call-before-definition works.
     fn hoist(&mut self, stmts: &[Stmt]) {
         for s in stmts {
-            if let Stmt::Func(f) = s {
-                self.funcs.insert(f.name.to_ascii_lowercase(), Rc::new(f.clone()));
+            match s {
+                Stmt::Func(f) => {
+                    self.funcs.insert(f.name.to_ascii_lowercase(), Rc::new(f.clone()));
+                }
+                Stmt::Class(c) => {
+                    self.classes.insert(c.name.to_ascii_lowercase(), Rc::new(c.clone()));
+                }
+                _ => {}
             }
         }
     }
@@ -92,7 +107,7 @@ impl Eval {
             Stmt::Echo(items) => {
                 for e in items {
                     let v = self.eval(e)?;
-                    let b = to_bytes(&v);
+                    let b = self.stringify(&v)?;
                     self.out.extend_from_slice(&b);
                 }
             }
@@ -247,9 +262,11 @@ impl Eval {
                     self.vars().insert(n.clone(), v);
                 }
             }
+            Stmt::Class(c) => {
+                self.classes.insert(c.name.to_ascii_lowercase(), Rc::new(c.clone()));
+            }
             // not yet implemented in this increment — parsed but skipped
-            Stmt::Class(_)
-            | Stmt::Try { .. }
+            Stmt::Try { .. }
             | Stmt::Throw(_)
             | Stmt::StaticVar(_)
             | Stmt::Namespace { .. }
@@ -279,7 +296,8 @@ impl Eval {
                         TplPart::Lit(b) => out.extend_from_slice(b),
                         TplPart::Expr(e) => {
                             let v = self.eval(e)?;
-                            out.extend_from_slice(&to_bytes(&v));
+                            let b = self.stringify(&v)?;
+                            out.extend_from_slice(&b);
                         }
                     }
                 }
@@ -433,6 +451,68 @@ impl Eval {
                 }
                 result.ok_or_else(|| RunError("UnhandledMatchError".into()))?
             }
+            Expr::New(class, args) => {
+                let cname = self.resolve_class_name(class)?;
+                let argv = self.eval_args(args)?;
+                self.instantiate(&cname, argv)?
+            }
+            Expr::Prop(obj, name, nullsafe) => {
+                let o = self.eval(obj)?;
+                if *nullsafe && matches!(o, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let pname = self.prop_name_str(name)?;
+                match &o {
+                    Value::Object(rc) => {
+                        rc.borrow().get(&pname).cloned().unwrap_or(Value::Null)
+                    }
+                    _ => Value::Null,
+                }
+            }
+            Expr::MethodCall(obj, name, args, nullsafe) => {
+                let o = self.eval(obj)?;
+                if *nullsafe && matches!(o, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let mname = self.prop_name_str(name)?;
+                let argv = self.eval_args(args)?;
+                self.call_method(o, &mname, argv)?
+            }
+            Expr::StaticCall(class, name, args) => {
+                let cname = self.resolve_class_name(class)?;
+                let mname = self.prop_name_str(name)?;
+                let argv = self.eval_args(args)?;
+                // `parent::`/`self::` keep the current $this if present
+                let this = self.vars().get("this").cloned();
+                self.call_static(&cname, &mname, argv, this)?
+            }
+            Expr::ClassConst(class, name) => {
+                if name == "class" {
+                    let cname = self.resolve_class_name(class)?;
+                    Value::Str(cname.into_bytes())
+                } else {
+                    let cname = self.resolve_class_name(class)?;
+                    self.class_const(&cname, name)?
+                }
+            }
+            Expr::StaticProp(class, name) => {
+                let cname = self.resolve_class_name(class)?;
+                self.static_props
+                    .get(&(cname.to_ascii_lowercase(), name.clone()))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            }
+            Expr::InstanceOf(e, class) => {
+                let v = self.eval(e)?;
+                let target = self.resolve_class_name(class)?;
+                Value::Bool(match &v {
+                    Value::Object(rc) => {
+                        let c = rc.borrow().class.clone();
+                        self.is_subclass(&c, &target)
+                    }
+                    _ => false,
+                })
+            }
             // constructs not in this increment
             _ => Value::Null,
         })
@@ -452,6 +532,14 @@ impl Eval {
             BinOp::Coalesce => {
                 let lv = self.eval(l)?;
                 return Ok(if matches!(lv, Value::Null) { self.eval(r)? } else { lv });
+            }
+            BinOp::Concat => {
+                // honor __toString on either operand
+                let lv = self.eval(l)?;
+                let rv = self.eval(r)?;
+                let mut s = self.stringify(&lv)?;
+                s.extend_from_slice(&self.stringify(&rv)?);
+                return Ok(Value::Str(s));
             }
             _ => {}
         }
@@ -604,6 +692,18 @@ impl Eval {
                 };
                 self.assign_index(base, key, val)?;
             }
+            Expr::Prop(obj, name, _) => {
+                let o = self.eval(obj)?;
+                let pname = self.prop_name_str(name)?;
+                if let Value::Object(rc) = o {
+                    rc.borrow_mut().set(&pname, val);
+                }
+            }
+            Expr::StaticProp(class, name) => {
+                let cname = self.resolve_class_name(class)?;
+                self.static_props
+                    .insert((cname.to_ascii_lowercase(), name.clone()), val);
+            }
             // list/array destructuring: [$a, $b] = ...  and  list($a, $b) = ...
             Expr::Array(_) | Expr::List(_) => {
                 self.destructure(target, val)?;
@@ -650,6 +750,26 @@ impl Eval {
                     }
                 }
                 self.assign_index(inner, ikey, cur)
+            }
+            // `$obj->prop[...] = v` — objects are shared, so mutate in place.
+            Expr::Prop(objexpr, name, _) => {
+                let o = self.eval(objexpr)?;
+                let pname = self.prop_name_str(name)?;
+                if let Value::Object(rc) = o {
+                    let mut b = rc.borrow_mut();
+                    let mut cur = b.get(&pname).cloned().unwrap_or(Value::Array(Arr::new()));
+                    if !matches!(cur, Value::Array(_)) {
+                        cur = Value::Array(Arr::new());
+                    }
+                    if let Value::Array(a) = &mut cur {
+                        match key {
+                            Some(k) => a.insert(k, val),
+                            None => a.push(val),
+                        }
+                    }
+                    b.set(&pname, cur);
+                }
+                Ok(())
             }
             _ => Ok(()),
         }
@@ -740,6 +860,321 @@ impl Eval {
             Flow::Return(v) => Ok(v),
             _ => Ok(Value::Null),
         }
+    }
+}
+
+// ---- objects & classes -------------------------------------------------
+impl Eval {
+    fn find_class(&self, name: &str) -> Option<Rc<ClassDecl>> {
+        self.classes.get(&name.to_ascii_lowercase()).cloned()
+    }
+
+    /// Resolve a class reference expression to a class name.
+    fn resolve_class_name(&mut self, e: &Expr) -> R<String> {
+        match e {
+            Expr::ConstFetch(n) => {
+                let last = n.last();
+                match last.to_ascii_lowercase().as_str() {
+                    "self" | "static" => Ok(self
+                        .current_class
+                        .clone()
+                        .unwrap_or_else(|| last.to_string())),
+                    "parent" => {
+                        let cur = self.current_class.clone().unwrap_or_default();
+                        Ok(self
+                            .find_class(&cur)
+                            .and_then(|c| c.parent.as_ref().map(|p| p.last().to_string()))
+                            .unwrap_or(cur))
+                    }
+                    _ => Ok(last.to_string()),
+                }
+            }
+            _ => {
+                let v = self.eval(e)?;
+                match v {
+                    Value::Str(s) => Ok(String::from_utf8_lossy(&s).into_owned()),
+                    Value::Object(rc) => Ok(rc.borrow().class.clone()),
+                    _ => Ok(String::new()),
+                }
+            }
+        }
+    }
+
+    /// Convert a value to bytes for output, honoring `__toString` on objects.
+    fn stringify(&mut self, v: &Value) -> R<Vec<u8>> {
+        if let Value::Object(rc) = v {
+            let class = rc.borrow().class.clone();
+            if self.find_method(&class, "__tostring").is_some() {
+                let r = self.call_method(v.clone(), "__toString", vec![])?;
+                return Ok(to_bytes(&r));
+            }
+        }
+        Ok(to_bytes(v))
+    }
+
+    fn prop_name_str(&mut self, p: &PropName) -> R<String> {
+        Ok(match p {
+            PropName::Id(s) => s.clone(),
+            PropName::Expr(e) => String::from_utf8_lossy(&to_bytes(&self.eval(e)?)).into_owned(),
+        })
+    }
+
+    fn eval_args(&mut self, args: &[Arg]) -> R<Vec<Value>> {
+        let mut out = Vec::new();
+        for a in args {
+            if a.name.as_deref() == Some("...") {
+                continue;
+            }
+            if a.spread {
+                if let Value::Array(arr) = self.eval(&a.value)? {
+                    for (_, v) in arr.entries {
+                        out.push(v);
+                    }
+                }
+            } else {
+                out.push(self.eval(&a.value)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The ancestor chain (self first, then parents), as class decls.
+    fn ancestry(&self, name: &str) -> Vec<Rc<ClassDecl>> {
+        let mut out = Vec::new();
+        let mut cur = self.find_class(name);
+        let mut guard = 0;
+        while let Some(c) = cur {
+            out.push(c.clone());
+            guard += 1;
+            if guard > 50 {
+                break;
+            }
+            cur = c.parent.as_ref().and_then(|p| self.find_class(p.last()));
+        }
+        out
+    }
+
+    fn is_subclass(&self, class: &str, target: &str) -> bool {
+        let t = target.to_ascii_lowercase();
+        for c in self.ancestry(class) {
+            if c.name.to_ascii_lowercase() == t {
+                return true;
+            }
+            for i in &c.interfaces {
+                if i.last().to_ascii_lowercase() == t {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Find a method (and its declaring class) walking up the hierarchy.
+    fn find_method(&self, class: &str, method: &str) -> Option<(String, MethodDecl)> {
+        let m = method.to_ascii_lowercase();
+        for c in self.ancestry(class) {
+            // traits first (declared in the class), then own methods
+            for t in &c.uses_traits {
+                if let Some(tc) = self.find_class(t.last()) {
+                    if let Some(md) = tc.methods.iter().find(|x| x.name.to_ascii_lowercase() == m) {
+                        return Some((c.name.clone(), md.clone()));
+                    }
+                }
+            }
+            if let Some(md) = c.methods.iter().find(|x| x.name.to_ascii_lowercase() == m) {
+                return Some((c.name.clone(), md.clone()));
+            }
+        }
+        None
+    }
+
+    fn instantiate(&mut self, class: &str, args: Vec<Value>) -> R<Value> {
+        let decl = match self.find_class(class) {
+            Some(d) => d,
+            None => return Err(RunError(format!("class {class} not found"))),
+        };
+        let obj = Rc::new(RefCell::new(Obj { class: decl.name.clone(), props: Vec::new() }));
+        // initialize declared (instance) properties from the whole hierarchy,
+        // base-most first so overrides win.
+        let chain = self.ancestry(class);
+        for c in chain.iter().rev() {
+            for p in &c.props {
+                if p.is_static {
+                    continue;
+                }
+                let v = match &p.default {
+                    Some(d) => self.eval(d)?,
+                    None => Value::Null,
+                };
+                obj.borrow_mut().set(&p.name, v);
+            }
+        }
+        let ov = Value::Object(obj);
+        // constructor
+        if self.find_method(class, "__construct").is_some() {
+            self.call_method(ov.clone(), "__construct", args)?;
+        }
+        Ok(ov)
+    }
+
+    fn call_method(&mut self, recv: Value, method: &str, args: Vec<Value>) -> R<Value> {
+        let class = match &recv {
+            Value::Object(rc) => rc.borrow().class.clone(),
+            _ => return Ok(Value::Null),
+        };
+        let (decl_class, m) = match self.find_method(&class, method) {
+            Some(x) => x,
+            None => {
+                // __call magic fallback
+                if let Some((dc, _)) = self.find_method(&class, "__call") {
+                    let mut a = Arr::new();
+                    for v in args {
+                        a.push(v);
+                    }
+                    let cargs = vec![Value::Str(method.as_bytes().to_vec()), Value::Array(a)];
+                    return self.invoke_method(recv, &dc, &self.find_method(&class, "__call").unwrap().1.clone(), cargs);
+                }
+                return Err(RunError(format!("call to undefined method {class}::{method}()")));
+            }
+        };
+        self.invoke_method(recv, &decl_class, &m, args)
+    }
+
+    fn invoke_method(
+        &mut self,
+        recv: Value,
+        decl_class: &str,
+        m: &MethodDecl,
+        args: Vec<Value>,
+    ) -> R<Value> {
+        let body = match &m.body {
+            Some(b) => b.clone(),
+            None => return Ok(Value::Null),
+        };
+        let mut scope = HashMap::new();
+        if !m.is_static {
+            scope.insert("this".to_string(), recv.clone());
+        }
+        self.bind_params(&mut scope, &m.params, &args)?;
+        // constructor property promotion
+        if m.name.eq_ignore_ascii_case("__construct") {
+            if let Value::Object(rc) = &recv {
+                for (i, p) in m.params.iter().enumerate() {
+                    if p.promote.is_some() {
+                        let v = args
+                            .get(i)
+                            .cloned()
+                            .or_else(|| scope.get(&p.name).cloned())
+                            .unwrap_or(Value::Null);
+                        rc.borrow_mut().set(&p.name, v);
+                    }
+                }
+            }
+        }
+        let prev_class = self.current_class.replace(decl_class.to_string());
+        self.scopes.push(scope);
+        let r = self.exec_block(&body);
+        self.scopes.pop();
+        self.current_class = prev_class;
+        match r? {
+            Flow::Return(v) => Ok(v),
+            _ => Ok(Value::Null),
+        }
+    }
+
+    fn call_static(
+        &mut self,
+        class: &str,
+        method: &str,
+        args: Vec<Value>,
+        this: Option<Value>,
+    ) -> R<Value> {
+        let (decl_class, m) = match self.find_method(class, method) {
+            Some(x) => x,
+            None => return Err(RunError(format!("call to undefined method {class}::{method}()"))),
+        };
+        let body = match &m.body {
+            Some(b) => b.clone(),
+            None => return Ok(Value::Null),
+        };
+        let mut scope = HashMap::new();
+        // a non-static method reached via parent::/self:: keeps $this
+        if !m.is_static {
+            if let Some(t) = this {
+                scope.insert("this".to_string(), t);
+            }
+        }
+        self.bind_params(&mut scope, &m.params, &args)?;
+        let prev_class = self.current_class.replace(decl_class.clone());
+        self.scopes.push(scope);
+        let r = self.exec_block(&body);
+        self.scopes.pop();
+        self.current_class = prev_class;
+        match r? {
+            Flow::Return(v) => Ok(v),
+            _ => Ok(Value::Null),
+        }
+    }
+
+    fn bind_params(
+        &mut self,
+        scope: &mut HashMap<String, Value>,
+        params: &[Param],
+        args: &[Value],
+    ) -> R<()> {
+        for (i, p) in params.iter().enumerate() {
+            if p.variadic {
+                let mut rest = Arr::new();
+                for v in args.iter().skip(i) {
+                    rest.push(v.clone());
+                }
+                scope.insert(p.name.clone(), Value::Array(rest));
+                break;
+            }
+            let v = match args.get(i) {
+                Some(v) => v.clone(),
+                None => match &p.default {
+                    Some(d) => self.eval(d)?,
+                    None => Value::Null,
+                },
+            };
+            scope.insert(p.name.clone(), v);
+        }
+        Ok(())
+    }
+
+    fn class_const(&mut self, class: &str, name: &str) -> R<Value> {
+        // enum case?
+        if let Some(c) = self.find_class(class) {
+            if c.kind == ClassKind::Enum {
+                if c.cases.iter().any(|e| e.name == name) {
+                    // model an enum case as an object with `name` (+ `value`)
+                    let obj = Rc::new(RefCell::new(Obj { class: c.name.clone(), props: Vec::new() }));
+                    obj.borrow_mut().set("name", Value::Str(name.as_bytes().to_vec()));
+                    if let Some(ec) = c.cases.iter().find(|e| e.name == name) {
+                        if let Some(v) = &ec.value {
+                            let val = self.eval(v)?;
+                            obj.borrow_mut().set("value", val);
+                        }
+                    }
+                    return Ok(Value::Object(obj));
+                }
+            }
+        }
+        for c in self.ancestry(class) {
+            if let Some(cc) = c.consts.iter().find(|x| x.name == name) {
+                return self.eval(&cc.value.clone());
+            }
+            // interface constants
+            for i in &c.interfaces {
+                if let Some(ic) = self.find_class(i.last()) {
+                    if let Some(cc) = ic.consts.iter().find(|x| x.name == name) {
+                        return self.eval(&cc.value.clone());
+                    }
+                }
+            }
+        }
+        Err(RunError(format!("undefined constant {class}::{name}")))
     }
 }
 
@@ -1276,6 +1711,15 @@ fn var_dump(v: &Value, indent: usize, out: &mut String) {
                         out.push_str(&format!("{pad}  [\"{}\"]=>\n", String::from_utf8_lossy(s)))
                     }
                 }
+                var_dump(val, indent + 1, out);
+            }
+            out.push_str(&format!("{pad}}}\n"));
+        }
+        Value::Object(o) => {
+            let o = o.borrow();
+            out.push_str(&format!("{pad}object({})#1 ({}) {{\n", o.class, o.props.len()));
+            for (k, val) in &o.props {
+                out.push_str(&format!("{pad}  [\"{k}\"]=>\n"));
                 var_dump(val, indent + 1, out);
             }
             out.push_str(&format!("{pad}}}\n"));

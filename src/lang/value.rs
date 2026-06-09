@@ -6,7 +6,9 @@
 //! builtins are built on top.
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -16,6 +18,32 @@ pub enum Value {
     Float(f64),
     Str(Vec<u8>),
     Array(Arr),
+    Object(Rc<RefCell<Obj>>),
+}
+
+/// A PHP object instance: a class name plus insertion-ordered properties.
+/// Objects are reference types, so `Value::Object` is an `Rc<RefCell<…>>`.
+#[derive(Debug)]
+pub struct Obj {
+    pub class: String,
+    pub props: Vec<(String, Value)>,
+}
+
+impl Obj {
+    pub fn get(&self, name: &str) -> Option<&Value> {
+        self.props.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    }
+    pub fn set(&mut self, name: &str, v: Value) {
+        if let Some(slot) = self.props.iter_mut().find(|(k, _)| k == name) {
+            slot.1 = v;
+        } else {
+            self.props.push((name.to_string(), v));
+        }
+    }
+}
+
+pub fn new_obj(class: &str) -> Value {
+    Value::Object(Rc::new(RefCell::new(Obj { class: class.to_string(), props: Vec::new() })))
 }
 
 /// Array key: PHP normalizes integer-like string keys to ints.
@@ -58,7 +86,7 @@ impl Arr {
                     Key::Str(s.clone())
                 }
             }
-            Value::Array(_) => Key::Int(0),
+            Value::Array(_) | Value::Object(_) => Key::Int(0),
         }
     }
 
@@ -141,6 +169,7 @@ pub fn to_bool(v: &Value) -> bool {
         Value::Float(f) => *f != 0.0,
         Value::Str(s) => !(s.is_empty() || s == b"0"),
         Value::Array(a) => !a.is_empty(),
+        Value::Object(_) => true,
     }
 }
 
@@ -152,6 +181,7 @@ pub fn to_i64(v: &Value) -> i64 {
         Value::Float(f) => *f as i64,
         Value::Str(s) => leading_number(s).as_i64(),
         Value::Array(a) => !a.is_empty() as i64,
+        Value::Object(_) => 1,
     }
 }
 
@@ -163,6 +193,7 @@ pub fn to_f64(v: &Value) -> f64 {
         Value::Float(f) => *f,
         Value::Str(s) => leading_number(s).as_f64(),
         Value::Array(a) => !a.is_empty() as i64 as f64,
+        Value::Object(_) => 1.0,
     }
 }
 
@@ -175,6 +206,8 @@ pub fn to_bytes(v: &Value) -> Vec<u8> {
         Value::Float(f) => format_float(*f).into_bytes(),
         Value::Str(s) => s.clone(),
         Value::Array(_) => b"Array".to_vec(),
+        // __toString is handled by the evaluator's stringify(); this is the fallback.
+        Value::Object(_) => Vec::new(),
     }
 }
 
@@ -186,6 +219,7 @@ pub fn type_name(v: &Value) -> &'static str {
         Value::Float(_) => "double",
         Value::Str(_) => "string",
         Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -285,6 +319,7 @@ pub fn to_num(v: &Value) -> Num {
         Value::Null => Num::Int(0),
         Value::Str(s) => leading_number(s),
         Value::Array(_) => Num::Int(0),
+        Value::Object(_) => Num::Int(1),
     }
 }
 
@@ -348,6 +383,18 @@ pub fn loose_eq(a: &Value, b: &Value) -> bool {
             }
         }
         (Array(x), Array(y)) => array_loose_eq(x, y),
+        (Object(x), Object(y)) => {
+            // same instance, or same class with loosely-equal properties
+            if Rc::ptr_eq(x, y) {
+                return true;
+            }
+            let (x, y) = (x.borrow(), y.borrow());
+            x.class == y.class
+                && x.props.len() == y.props.len()
+                && x.props.iter().all(|(k, v)| {
+                    y.get(k).map(|w| loose_eq(v, w)).unwrap_or(false)
+                })
+        }
         _ => false,
     }
 }
@@ -383,6 +430,7 @@ pub fn strict_eq(a: &Value, b: &Value) -> bool {
                     ka == kb && strict_eq(va, vb)
                 })
         }
+        (Object(x), Object(y)) => Rc::ptr_eq(x, y), // strict: same instance
         _ => false,
     }
 }
