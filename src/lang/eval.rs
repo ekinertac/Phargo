@@ -455,6 +455,10 @@ impl Eval {
         match e.exec_block(program) {
             Ok(_) => Ok(e.out),
             Err(err) => {
+                // `exit`/`die`: a normal halt, not an error.
+                if err.0 == "__phargo_exit__" {
+                    return Ok(e.out);
+                }
                 // An uncaught exception becomes a PHP fatal-error message in the
                 // output (matching PHP). Other engine errors (step limit, unknown
                 // function, parse) propagate with their message so the scoreboard
@@ -1550,6 +1554,16 @@ impl Eval {
                 "eval" => {
                     let code = to_bytes(argv.get(0).unwrap_or(&Value::Null));
                     return self.do_eval(&code);
+                }
+                "exit" | "die" => {
+                    // a string arg is printed; an int is the exit status (no output)
+                    if let Some(arg) = argv.first() {
+                        if !matches!(arg, Value::Int(_)) {
+                            let b = self.stringify(arg)?;
+                            self.out.extend_from_slice(&b);
+                        }
+                    }
+                    return Err(RunError("__phargo_exit__".into()));
                 }
                 "preg_match" | "preg_match_all" => {
                     let all = name == "preg_match_all";
