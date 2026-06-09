@@ -5437,6 +5437,79 @@ impl Engine {
                 }
                 Value::Str(out)
             }
+            "strip_tags" => {
+                let s: Vec<char> = arg(0).to_php_string().chars().collect();
+                // allowed tags: a string like "<b><a>" or an array of names
+                let mut allowed: HashSet<String> = HashSet::new();
+                match args.get(1) {
+                    Some(Value::Array(a)) => {
+                        for (_, v) in &a.entries {
+                            allowed.insert(v.to_php_string().to_ascii_lowercase());
+                        }
+                    }
+                    Some(other) => {
+                        let spec = other.to_php_string();
+                        let mut name = String::new();
+                        for c in spec.chars() {
+                            if c == '<' {
+                                name.clear();
+                            } else if c == '>' {
+                                if !name.is_empty() {
+                                    allowed.insert(name.to_ascii_lowercase());
+                                }
+                            } else if c.is_ascii_alphanumeric() {
+                                name.push(c);
+                            }
+                        }
+                    }
+                    None => {}
+                }
+                let mut out = String::new();
+                let mut i = 0;
+                while i < s.len() {
+                    if s[i] != '<' {
+                        out.push(s[i]);
+                        i += 1;
+                        continue;
+                    }
+                    // find the end of this tag, respecting quotes; PHP comments/`<?…?>`
+                    let start = i;
+                    let mut j = i + 1;
+                    let mut quote: Option<char> = None;
+                    while j < s.len() {
+                        let c = s[j];
+                        if let Some(q) = quote {
+                            if c == q {
+                                quote = None;
+                            }
+                        } else if c == '"' || c == '\'' {
+                            quote = Some(c);
+                        } else if c == '>' {
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if j >= s.len() {
+                        // unterminated `<` — PHP drops the remainder
+                        break;
+                    }
+                    // tag name: skip a leading `/`, then take the alnum run
+                    let mut k = i + 1;
+                    if k < j && s[k] == '/' {
+                        k += 1;
+                    }
+                    let mut tname = String::new();
+                    while k < j && (s[k].is_ascii_alphanumeric() || s[k] == '-') {
+                        tname.push(s[k]);
+                        k += 1;
+                    }
+                    if !tname.is_empty() && allowed.contains(&tname.to_ascii_lowercase()) {
+                        out.extend(&s[start..=j]);
+                    }
+                    i = j + 1;
+                }
+                Value::Str(out)
+            }
             "html_entity_decode" | "htmlspecialchars_decode" => {
                 let s = arg(0)
                     .to_php_string()
