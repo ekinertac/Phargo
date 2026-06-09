@@ -360,7 +360,9 @@ impl<'a> Lexer<'a> {
         // find the closing label: at line start, optional indentation, label,
         // then a non-identifier char (PHP 7.3 flexible heredoc).
         let (body_end, after, _indent) = self.find_heredoc_close(label.as_bytes())?;
-        let body = &self.src[body_start..body_end];
+        // an empty heredoc (label immediately on the next line) yields
+        // body_end = body_start - 1; clamp so the slice can't underflow.
+        let body = &self.src[body_start..body_end.max(body_start)];
         self.pos = after;
         if nowdoc {
             Ok(Token { kind: Kind::Str(body.to_vec()), span: self.span(start) })
