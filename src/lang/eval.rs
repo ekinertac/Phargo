@@ -1774,7 +1774,7 @@ impl Eval {
                 Value::Array(arr) => arr.len() == 2,
                 _ => false,
             }),
-            "range" => self.range(&a(0), &a(1), &a(2)),
+            "range" => self.range(&a(0), &a(1), &a(2))?,
             "sprintf" => Value::Str(self.sprintf(&args)),
             "printf" => {
                 let s = self.sprintf(&args);
@@ -1828,15 +1828,21 @@ impl Eval {
         best.unwrap_or(Value::Null)
     }
 
-    fn range(&self, start: &Value, end: &Value, step: &Value) -> Value {
+    fn range(&mut self, start: &Value, end: &Value, step: &Value) -> R<Value> {
         let mut arr = Arr::new();
         let st = if matches!(step, Value::Null) { 1.0 } else { to_f64(step).abs().max(1e-9) };
         // integer range when both ends are int-ish and step is whole
         let ints = matches!(start, Value::Int(_)) && matches!(end, Value::Int(_)) && st.fract() == 0.0;
         let (a, b) = (to_f64(start), to_f64(end));
+        // PHP throws ValueError for infinite/NaN bounds (and this also stops the
+        // NaN-count case from slipping past the size guard into an infinite loop).
+        if !a.is_finite() || !b.is_finite() || !st.is_finite() {
+            return Err(self.throw_error("ValueError", "range(): Arguments must be finite"));
+        }
         // bail out of pathological huge ranges (memory bomb guard)
-        if ((a - b).abs() / st) as usize > MAX_RANGE {
-            return Value::Array(arr);
+        let count = ((a - b).abs() / st) as usize;
+        if count > MAX_RANGE {
+            return Ok(Value::Array(arr));
         }
         if a <= b {
             let mut x = a;
@@ -1851,7 +1857,7 @@ impl Eval {
                 x -= st;
             }
         }
-        Value::Array(arr)
+        Ok(Value::Array(arr))
     }
 
     fn sprintf(&self, args: &[Value]) -> Vec<u8> {
