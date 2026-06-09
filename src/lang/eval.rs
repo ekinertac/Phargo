@@ -1830,30 +1830,55 @@ impl Eval {
 
     fn range(&mut self, start: &Value, end: &Value, step: &Value) -> R<Value> {
         let mut arr = Arr::new();
+        // integer range when both bounds are ints and the step is whole — iterate
+        // in integer (i128) arithmetic. Doing this in f64 breaks near i64::MIN/MAX
+        // (the ulp exceeds 1, so `x += 1.0` is a no-op → infinite loop).
+        let step_whole = matches!(step, Value::Null) || to_f64(step).fract() == 0.0;
+        if matches!(start, Value::Int(_)) && matches!(end, Value::Int(_)) && step_whole {
+            let a = to_i64(start) as i128;
+            let b = to_i64(end) as i128;
+            let st = if matches!(step, Value::Null) {
+                1i128
+            } else {
+                (to_i64(step).unsigned_abs() as i128).max(1)
+            };
+            let count = (a - b).abs() / st;
+            if count as usize > MAX_RANGE {
+                return Ok(Value::Array(arr)); // memory-bomb guard
+            }
+            let mut x = a;
+            if a <= b {
+                while x <= b {
+                    arr.push(Value::Int(x as i64));
+                    x += st;
+                }
+            } else {
+                while x >= b {
+                    arr.push(Value::Int(x as i64));
+                    x -= st;
+                }
+            }
+            return Ok(Value::Array(arr));
+        }
+        // float range
         let st = if matches!(step, Value::Null) { 1.0 } else { to_f64(step).abs().max(1e-9) };
-        // integer range when both ends are int-ish and step is whole
-        let ints = matches!(start, Value::Int(_)) && matches!(end, Value::Int(_)) && st.fract() == 0.0;
         let (a, b) = (to_f64(start), to_f64(end));
-        // PHP throws ValueError for infinite/NaN bounds (and this also stops the
-        // NaN-count case from slipping past the size guard into an infinite loop).
         if !a.is_finite() || !b.is_finite() || !st.is_finite() {
             return Err(self.throw_error("ValueError", "range(): Arguments must be finite"));
         }
-        // bail out of pathological huge ranges (memory bomb guard)
         let count = ((a - b).abs() / st) as usize;
         if count > MAX_RANGE {
             return Ok(Value::Array(arr));
         }
+        let mut x = a;
         if a <= b {
-            let mut x = a;
             while x <= b + 1e-9 {
-                arr.push(if ints { Value::Int(x as i64) } else { Value::Float(x) });
+                arr.push(Value::Float(x));
                 x += st;
             }
         } else {
-            let mut x = a;
             while x >= b - 1e-9 {
-                arr.push(if ints { Value::Int(x as i64) } else { Value::Float(x) });
+                arr.push(Value::Float(x));
                 x -= st;
             }
         }
