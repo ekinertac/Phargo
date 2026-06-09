@@ -4119,8 +4119,36 @@ impl Engine {
             "is_callable" => Value::Bool(match arg(0) {
                 Value::Str(s) => !s.is_empty(),
                 Value::Array(a) => a.entries.len() == 2,
+                Value::Closure(_) => true,
+                Value::Object(o) => self.lookup_method(&o.borrow().class, "__invoke").is_some(),
                 _ => false,
             }),
+            "similar_text" => {
+                fn sim(a: &[char], b: &[char]) -> usize {
+                    // longest common substring, then recurse on the flanks (PHP algo)
+                    let (mut max, mut pa, mut pb) = (0usize, 0usize, 0usize);
+                    for i in 0..a.len() {
+                        for j in 0..b.len() {
+                            let mut k = 0;
+                            while i + k < a.len() && j + k < b.len() && a[i + k] == b[j + k] {
+                                k += 1;
+                            }
+                            if k > max {
+                                max = k;
+                                pa = i;
+                                pb = j;
+                            }
+                        }
+                    }
+                    if max == 0 {
+                        return 0;
+                    }
+                    max + sim(&a[..pa], &b[..pb]) + sim(&a[pa + max..], &b[pb + max..])
+                }
+                let a: Vec<char> = arg(0).to_php_string().chars().collect();
+                let b: Vec<char> = arg(1).to_php_string().chars().collect();
+                Value::Int(sim(&a, &b) as i64)
+            }
             "count" | "sizeof" => match arg(0) {
                 Value::Array(a) => Value::Int(a.entries.len() as i64),
                 // Countable: count($obj) calls $obj->count()
@@ -6803,6 +6831,15 @@ impl Engine {
                         None => Err(EngineError(format!("undefined method {cls}::{method}()"))),
                     },
                     _ => Err(EngineError("invalid callable array".into())),
+                }
+            }
+            // invokable object: `$obj(...)` → $obj->__invoke(...)
+            Value::Object(o) => {
+                let class = o.borrow().class.clone();
+                if self.lookup_method(&class, "__invoke").is_some() {
+                    self.call_method(callable, "__invoke", args)
+                } else {
+                    Err(EngineError(format!("class {class} is not invokable")))
                 }
             }
             _ => Err(EngineError("value is not callable".into())),
