@@ -2929,6 +2929,25 @@ impl Engine {
     }
 
     /// Parse a `( arg, arg, … )` argument list, evaluating each argument.
+    /// If the cursor is at a first-class-callable `(...)`, consume it and return
+    /// true. Positioned at the opening `(`.
+    fn try_first_class_callable(&mut self) -> bool {
+        debug_assert_eq!(self.peek(), Some('('));
+        let save = self.pos;
+        self.pos += 1;
+        self.skip_ws();
+        if self.starts_with("...") {
+            self.pos += 3;
+            self.skip_ws();
+            if self.peek() == Some(')') {
+                self.pos += 1;
+                return true;
+            }
+        }
+        self.pos = save;
+        false
+    }
+
     fn parse_args(&mut self) -> R<Vec<Value>> {
         self.expect_char('(')?;
         let mut args = Vec::new();
@@ -6931,7 +6950,10 @@ impl Engine {
                             self.static_access(&id)
                         } else if self.peek() == Some('(') {
                             let lid = id.to_ascii_lowercase();
-                            if lid == "preg_match" || lid == "preg_match_all" {
+                            if self.try_first_class_callable() {
+                                // `foo(...)` → a callable referencing the function
+                                Ok(Value::Str(id))
+                            } else if lid == "preg_match" || lid == "preg_match_all" {
                                 self.preg_match_call(lid == "preg_match_all")
                             } else if is_byref_builtin(&id) {
                                 self.byref_call(&id)
