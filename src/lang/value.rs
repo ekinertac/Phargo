@@ -1,0 +1,408 @@
+//! The v2 runtime value model — byte-correct by construction.
+//!
+//! Unlike the legacy engine (whose `Value::Str` is a Rust `String`, which mangles
+//! high bytes), here a PHP string is a `Vec<u8>`. Scalars, arrays (ordered maps),
+//! and the coercion rules (PHP's type juggling) live here; the evaluator and
+//! builtins are built on top.
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+pub enum Value {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(Vec<u8>),
+    Array(Arr),
+}
+
+/// Array key: PHP normalizes integer-like string keys to ints.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Key {
+    Int(i64),
+    Str(Vec<u8>),
+}
+
+/// An insertion-ordered map (PHP arrays), with a hash index for O(1) lookup.
+#[derive(Debug, Clone, Default)]
+pub struct Arr {
+    pub entries: Vec<(Key, Value)>,
+    index: HashMap<Key, usize>,
+    next_int: i64,
+}
+
+impl Arr {
+    pub fn new() -> Self {
+        Arr::default()
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Normalize a value used as a key (int-like strings → ints; bools/floats → ints; null → "").
+    pub fn norm_key(v: &Value) -> Key {
+        match v {
+            Value::Int(n) => Key::Int(*n),
+            Value::Bool(b) => Key::Int(*b as i64),
+            Value::Float(f) => Key::Int(*f as i64),
+            Value::Null => Key::Str(Vec::new()),
+            Value::Str(s) => {
+                if let Some(n) = canonical_int_key(s) {
+                    Key::Int(n)
+                } else {
+                    Key::Str(s.clone())
+                }
+            }
+            Value::Array(_) => Key::Int(0),
+        }
+    }
+
+    pub fn get(&self, k: &Key) -> Option<&Value> {
+        self.index.get(k).map(|&i| &self.entries[i].1)
+    }
+    pub fn get_mut(&mut self, k: &Key) -> Option<&mut Value> {
+        if let Some(&i) = self.index.get(k) {
+            Some(&mut self.entries[i].1)
+        } else {
+            None
+        }
+    }
+
+    pub fn insert(&mut self, k: Key, v: Value) {
+        if let Key::Int(n) = &k {
+            if *n >= self.next_int {
+                self.next_int = n + 1;
+            }
+        }
+        if let Some(&i) = self.index.get(&k) {
+            self.entries[i].1 = v;
+        } else {
+            self.index.insert(k.clone(), self.entries.len());
+            self.entries.push((k, v));
+        }
+    }
+
+    /// `$a[] = v` — append with the next integer key.
+    pub fn push(&mut self, v: Value) {
+        let k = Key::Int(self.next_int);
+        self.insert(k, v);
+    }
+
+    pub fn remove(&mut self, k: &Key) -> Option<Value> {
+        if let Some(i) = self.index.get(k).copied() {
+            let (_, v) = self.entries.remove(i);
+            self.reindex();
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    fn reindex(&mut self) {
+        self.index.clear();
+        for (i, (k, _)) in self.entries.iter().enumerate() {
+            self.index.insert(k.clone(), i);
+        }
+    }
+}
+
+/// PHP only treats a string as an integer key if it's the *canonical* decimal
+/// form of an int (no leading zeros, optional leading `-`, fits in i64).
+fn canonical_int_key(s: &[u8]) -> Option<i64> {
+    if s.is_empty() {
+        return None;
+    }
+    let (neg, digits) = if s[0] == b'-' { (true, &s[1..]) } else { (false, s) };
+    if digits.is_empty() || !digits.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if digits.len() > 1 && digits[0] == b'0' {
+        return None; // leading zero
+    }
+    if neg && digits == b"0" {
+        return None; // "-0" isn't canonical
+    }
+    let txt = std::str::from_utf8(s).ok()?;
+    txt.parse::<i64>().ok()
+}
+
+// ---- coercions (PHP type juggling) -------------------------------------
+
+pub fn to_bool(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Int(n) => *n != 0,
+        Value::Float(f) => *f != 0.0,
+        Value::Str(s) => !(s.is_empty() || s == b"0"),
+        Value::Array(a) => !a.is_empty(),
+    }
+}
+
+pub fn to_i64(v: &Value) -> i64 {
+    match v {
+        Value::Null => 0,
+        Value::Bool(b) => *b as i64,
+        Value::Int(n) => *n,
+        Value::Float(f) => *f as i64,
+        Value::Str(s) => leading_number(s).as_i64(),
+        Value::Array(a) => !a.is_empty() as i64,
+    }
+}
+
+pub fn to_f64(v: &Value) -> f64 {
+    match v {
+        Value::Null => 0.0,
+        Value::Bool(b) => *b as i64 as f64,
+        Value::Int(n) => *n as f64,
+        Value::Float(f) => *f,
+        Value::Str(s) => leading_number(s).as_f64(),
+        Value::Array(a) => !a.is_empty() as i64 as f64,
+    }
+}
+
+pub fn to_bytes(v: &Value) -> Vec<u8> {
+    match v {
+        Value::Null => Vec::new(),
+        Value::Bool(true) => b"1".to_vec(),
+        Value::Bool(false) => Vec::new(),
+        Value::Int(n) => n.to_string().into_bytes(),
+        Value::Float(f) => format_float(*f).into_bytes(),
+        Value::Str(s) => s.clone(),
+        Value::Array(_) => b"Array".to_vec(),
+    }
+}
+
+pub fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "NULL",
+        Value::Bool(_) => "boolean",
+        Value::Int(_) => "integer",
+        Value::Float(_) => "double",
+        Value::Str(_) => "string",
+        Value::Array(_) => "array",
+    }
+}
+
+/// A numeric value that's either an int or float, used by arithmetic.
+#[derive(Clone, Copy)]
+pub enum Num {
+    Int(i64),
+    Float(f64),
+}
+impl Num {
+    pub fn as_i64(self) -> i64 {
+        match self {
+            Num::Int(n) => n,
+            Num::Float(f) => f as i64,
+        }
+    }
+    pub fn as_f64(self) -> f64 {
+        match self {
+            Num::Int(n) => n as f64,
+            Num::Float(f) => f,
+        }
+    }
+    pub fn to_value(self) -> Value {
+        match self {
+            Num::Int(n) => Value::Int(n),
+            Num::Float(f) => Value::Float(f),
+        }
+    }
+}
+
+/// PHP's "leading-numeric string" rule: parse an optional numeric prefix.
+pub fn leading_number(s: &[u8]) -> Num {
+    let txt = String::from_utf8_lossy(s);
+    let t = txt.trim_start();
+    let bytes = t.as_bytes();
+    let mut i = 0;
+    let n = bytes.len();
+    if i < n && (bytes[i] == b'+' || bytes[i] == b'-') {
+        i += 1;
+    }
+    let mut is_float = false;
+    while i < n && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i < n && bytes[i] == b'.' {
+        is_float = true;
+        i += 1;
+        while i < n && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    if i < n && (bytes[i] == b'e' || bytes[i] == b'E') {
+        let mut j = i + 1;
+        if j < n && (bytes[j] == b'+' || bytes[j] == b'-') {
+            j += 1;
+        }
+        if j < n && bytes[j].is_ascii_digit() {
+            is_float = true;
+            i = j;
+            while i < n && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+    }
+    let prefix = &t[..i];
+    if prefix.is_empty() || prefix == "+" || prefix == "-" {
+        return Num::Int(0);
+    }
+    if is_float {
+        Num::Float(prefix.parse().unwrap_or(0.0))
+    } else {
+        match prefix.parse::<i64>() {
+            Ok(n) => Num::Int(n),
+            Err(_) => Num::Float(prefix.parse().unwrap_or(0.0)),
+        }
+    }
+}
+
+/// Is the whole string a valid PHP numeric string?
+pub fn is_numeric_str(s: &[u8]) -> bool {
+    let t = match std::str::from_utf8(s) {
+        Ok(t) => t.trim(),
+        Err(_) => return false,
+    };
+    if t.is_empty() {
+        return false;
+    }
+    t.parse::<i64>().is_ok() || t.parse::<f64>().is_ok()
+}
+
+/// The numeric view of a value for arithmetic (strings coerced).
+pub fn to_num(v: &Value) -> Num {
+    match v {
+        Value::Int(n) => Num::Int(*n),
+        Value::Float(f) => Num::Float(*f),
+        Value::Bool(b) => Num::Int(*b as i64),
+        Value::Null => Num::Int(0),
+        Value::Str(s) => leading_number(s),
+        Value::Array(_) => Num::Int(0),
+    }
+}
+
+/// PHP's `number_format`-free float→string (matches `echo`/string cast).
+pub fn format_float(x: f64) -> String {
+    if x.is_nan() {
+        return "NAN".into();
+    }
+    if x.is_infinite() {
+        return if x < 0.0 { "-INF".into() } else { "INF".into() };
+    }
+    if x == x.trunc() && x.abs() < 1e15 {
+        return format!("{}", x as i64);
+    }
+    // PHP default precision is 14 significant digits.
+    let mut s = format!("{:.*}", 14, x);
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    // fall back to %G-ish for very large/small
+    let g = format!("{:e}", x);
+    if s.len() > g.len() + 4 {
+        return reformat_exp(x);
+    }
+    s
+}
+
+fn reformat_exp(x: f64) -> String {
+    let s = format!("{:E}", x);
+    s.replace('E', "E+").replace("E+-", "E-")
+}
+
+// ---- comparison & equality --------------------------------------------
+
+pub fn loose_eq(a: &Value, b: &Value) -> bool {
+    use Value::*;
+    match (a, b) {
+        (Null, Null) => true,
+        (Bool(_), _) | (_, Bool(_)) => to_bool(a) == to_bool(b),
+        (Null, _) => !to_bool(b) && matches!(b, Null | Bool(false)) || is_nullish(b),
+        (_, Null) => loose_eq(b, a),
+        (Int(_) | Float(_), Int(_) | Float(_)) => to_f64(a) == to_f64(b),
+        (Str(x), Str(y)) => {
+            if is_numeric_str(x) && is_numeric_str(y) {
+                to_f64(a) == to_f64(b)
+            } else {
+                x == y
+            }
+        }
+        (Int(_) | Float(_), Str(s)) | (Str(s), Int(_) | Float(_)) => {
+            // PHP 8: number vs non-numeric string compares as strings
+            if is_numeric_str(s) {
+                to_f64(a) == to_f64(b)
+            } else {
+                to_bytes(a) == to_bytes(b)
+            }
+        }
+        (Array(x), Array(y)) => array_loose_eq(x, y),
+        _ => false,
+    }
+}
+
+fn is_nullish(v: &Value) -> bool {
+    matches!(v, Value::Null)
+}
+
+fn array_loose_eq(x: &Arr, y: &Arr) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    for (k, v) in &x.entries {
+        match y.get(k) {
+            Some(w) if loose_eq(v, w) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+pub fn strict_eq(a: &Value, b: &Value) -> bool {
+    use Value::*;
+    match (a, b) {
+        (Null, Null) => true,
+        (Bool(x), Bool(y)) => x == y,
+        (Int(x), Int(y)) => x == y,
+        (Float(x), Float(y)) => x == y,
+        (Str(x), Str(y)) => x == y,
+        (Array(x), Array(y)) => {
+            x.len() == y.len()
+                && x.entries.iter().zip(&y.entries).all(|((ka, va), (kb, vb))| {
+                    ka == kb && strict_eq(va, vb)
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Three-way comparison (`<=>`), PHP semantics.
+pub fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    use Value::*;
+    match (a, b) {
+        (Str(x), Str(y)) => {
+            if is_numeric_str(x) && is_numeric_str(y) {
+                to_f64(a).partial_cmp(&to_f64(b)).unwrap_or(Ordering::Equal)
+            } else {
+                x.cmp(y)
+            }
+        }
+        (Array(x), Array(y)) => x.len().cmp(&y.len()),
+        (Bool(_), _) | (_, Bool(_)) | (Null, _) | (_, Null) => {
+            (to_bool(a) as u8).cmp(&(to_bool(b) as u8))
+        }
+        _ => to_f64(a).partial_cmp(&to_f64(b)).unwrap_or(Ordering::Equal),
+    }
+}

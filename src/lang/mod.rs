@@ -14,6 +14,8 @@
 //!     source offsets, so nothing is ever re-parsed.
 
 pub mod ast;
+pub mod eval;
 pub mod lexer;
 pub mod parser;
 pub mod token;
+pub mod value;
