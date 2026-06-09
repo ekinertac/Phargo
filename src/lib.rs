@@ -31,6 +31,10 @@ mod regex; // from-scratch backtracking regex VM (preg_*)
 mod serialize; // serialize / unserialize
 mod xml; // from-scratch XML parser (SimpleXML backing)
 
+// ---- v2 engine front end (lexer/parser/AST), built parallel to the legacy
+// single-pass engine; not wired into `run()` until it reaches test parity.
+pub mod lang;
+
 pub(crate) use bcmath::*;
 pub(crate) use datetime::*;
 pub(crate) use dump::*;
