@@ -35,8 +35,52 @@ pub struct Eval {
     static_props: HashMap<(String, String), Value>,
     /// Class of the currently executing method, for `self`/`parent`/`static`.
     current_class: Option<String>,
+    /// In-flight thrown exception (set by `throw`, cleared by a matching `catch`).
+    thrown: Option<Value>,
     steps: u64,
 }
+
+/// A minimal exception/error hierarchy, parsed before every program so that
+/// `new Exception(...)`, `getMessage()`, `instanceof`, and `catch` work through
+/// the ordinary class machinery.
+const PRELUDE: &[u8] = br##"<?php
+class Exception {
+    protected $message = "";
+    protected $code = 0;
+    protected $previous = null;
+    public function __construct($message = "", $code = 0, $previous = null) {
+        $this->message = $message; $this->code = $code; $this->previous = $previous;
+    }
+    public function getMessage() { return $this->message; }
+    public function getCode() { return $this->code; }
+    public function getPrevious() { return $this->previous; }
+    public function getTrace() { return []; }
+    public function getTraceAsString() { return "#0 {main}"; }
+    public function getFile() { return ""; }
+    public function getLine() { return 0; }
+    public function __toString() { return $this->message; }
+}
+class ErrorException extends Exception {}
+class Error extends Exception {}
+class TypeError extends Error {}
+class ValueError extends Error {}
+class ArgumentCountError extends TypeError {}
+class ArithmeticError extends Error {}
+class DivisionByZeroError extends ArithmeticError {}
+class UnhandledMatchError extends Error {}
+class RuntimeException extends Exception {}
+class LogicException extends Exception {}
+class InvalidArgumentException extends LogicException {}
+class OutOfRangeException extends LogicException {}
+class OutOfBoundsException extends RuntimeException {}
+class LengthException extends LogicException {}
+class DomainException extends LogicException {}
+class RangeException extends RuntimeException {}
+class UnexpectedValueException extends RuntimeException {}
+class UnderflowException extends RuntimeException {}
+class OverflowException extends RuntimeException {}
+class JsonException extends Exception {}
+"##;
 
 const STEP_LIMIT: u64 = 50_000_000;
 
@@ -50,13 +94,24 @@ impl Eval {
             consts: HashMap::new(),
             static_props: HashMap::new(),
             current_class: None,
+            thrown: None,
             steps: 0,
+        }
+    }
+
+    /// Register the exception/error hierarchy (parsed from PRELUDE).
+    fn load_prelude(&mut self) {
+        if let Ok(toks) = super::lexer::Lexer::tokenize(PRELUDE) {
+            if let Ok(stmts) = super::parser::Parser::parse(toks) {
+                self.hoist(&stmts);
+            }
         }
     }
 
     /// Run a parsed program and return everything it printed.
     pub fn run(program: &[Stmt]) -> R<Vec<u8>> {
         let mut e = Eval::new();
+        e.load_prelude();
         e.hoist(program);
         e.exec_block(program)?;
         Ok(e.out)
@@ -265,10 +320,24 @@ impl Eval {
             Stmt::Class(c) => {
                 self.classes.insert(c.name.to_ascii_lowercase(), Rc::new(c.clone()));
             }
+            Stmt::Throw(e) => {
+                let v = self.eval(e)?;
+                self.thrown = Some(v);
+                return Err(RunError("__phargo_throw__".into()));
+            }
+            Stmt::Try { body, catches, finally } => {
+                let outcome = self.exec_block(body);
+                let mut result = self.handle_try_outcome(outcome, catches)?;
+                if let Some(fin) = finally {
+                    match self.exec_block(fin)? {
+                        Flow::Normal => {}
+                        other => result = other, // finally's flow wins
+                    }
+                }
+                return Ok(result);
+            }
             // not yet implemented in this increment — parsed but skipped
-            Stmt::Try { .. }
-            | Stmt::Throw(_)
-            | Stmt::StaticVar(_)
+            Stmt::StaticVar(_)
             | Stmt::Namespace { .. }
             | Stmt::Use(_)
             | Stmt::Declare => {}
@@ -501,6 +570,43 @@ impl Eval {
                     .get(&(cname.to_ascii_lowercase(), name.clone()))
                     .cloned()
                     .unwrap_or(Value::Null)
+            }
+            Expr::Throw(inner) => {
+                let v = self.eval(inner)?;
+                self.thrown = Some(v);
+                return Err(RunError("__phargo_throw__".into()));
+            }
+            Expr::Closure(c) => {
+                let mut captures = Vec::new();
+                for u in &c.uses {
+                    let v = self.vars().get(&u.name).cloned().unwrap_or(Value::Null);
+                    captures.push((u.name.clone(), v));
+                }
+                let bound_this = if c.is_static {
+                    None
+                } else {
+                    self.vars().get("this").cloned()
+                };
+                Value::Closure(Rc::new(ClosureVal {
+                    kind: ClosureKind::Full(Rc::new((**c).clone())),
+                    captures,
+                    bound_this,
+                }))
+            }
+            Expr::ArrowFn(a) => {
+                // arrow fns auto-capture the entire enclosing scope by value
+                let captures: Vec<(String, Value)> =
+                    self.vars().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                let bound_this = if a.is_static {
+                    None
+                } else {
+                    self.vars().get("this").cloned()
+                };
+                Value::Closure(Rc::new(ClosureVal {
+                    kind: ClosureKind::Arrow(Rc::new((**a).clone())),
+                    captures,
+                    bound_this,
+                }))
             }
             Expr::InstanceOf(e, class) => {
                 let v = self.eval(e)?;
@@ -805,32 +911,90 @@ impl Eval {
 
     // ---- calls ----------------------------------------------------------
     fn eval_call(&mut self, callee: &Expr, args: &[Arg]) -> R<Value> {
-        let name = match callee {
-            Expr::ConstFetch(n) => n.last().to_ascii_lowercase(),
-            _ => return Ok(Value::Null),
-        };
-        // evaluate arguments (with spread)
-        let mut argv: Vec<Value> = Vec::new();
-        for a in args {
-            if a.name.as_deref() == Some("...") {
-                continue; // first-class callable sentinel — not supported yet
+        // direct named call: foo(...)
+        if let Expr::ConstFetch(n) = callee {
+            // first-class callable: foo(...)
+            if args.len() == 1 && args[0].name.as_deref() == Some("...") {
+                return Ok(Value::Str(n.last().as_bytes().to_vec()));
             }
-            if a.spread {
-                if let Value::Array(arr) = self.eval(&a.value)? {
-                    for (_, v) in arr.entries {
-                        argv.push(v);
-                    }
+            let name = n.last().to_ascii_lowercase();
+            let argv = self.eval_args(args)?;
+            if let Some(f) = self.funcs.get(&name).cloned() {
+                return self.call_user(&f, argv);
+            }
+            return self.builtin(&name, argv);
+        }
+        // dynamic callee: $f(...), expr(...) — evaluate to a callable value
+        let cv = self.eval(callee)?;
+        let argv = self.eval_args(args)?;
+        self.call_value(cv, argv)
+    }
+
+    /// Invoke any callable value: closure, function-name string, `[obj, "m"]`,
+    /// or an object with `__invoke`.
+    fn call_value(&mut self, cv: Value, args: Vec<Value>) -> R<Value> {
+        match cv {
+            Value::Closure(c) => self.call_closure(&c, args),
+            Value::Str(s) => {
+                let name = String::from_utf8_lossy(&s).to_ascii_lowercase();
+                if let Some(f) = self.funcs.get(&name).cloned() {
+                    self.call_user(&f, args)
+                } else {
+                    self.builtin(&name, args)
                 }
-            } else {
-                argv.push(self.eval(&a.value)?);
+            }
+            Value::Object(rc) => {
+                let class = rc.borrow().class.clone();
+                if self.find_method(&class, "__invoke").is_some() {
+                    self.call_method(Value::Object(rc), "__invoke", args)
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            Value::Array(a) if a.len() == 2 => {
+                let recv = a.get(&Key::Int(0)).cloned().unwrap_or(Value::Null);
+                let m = a.get(&Key::Int(1)).cloned().unwrap_or(Value::Null);
+                let mname = String::from_utf8_lossy(&to_bytes(&m)).into_owned();
+                match recv {
+                    Value::Object(_) => self.call_method(recv, &mname, args),
+                    Value::Str(s) => {
+                        let cn = String::from_utf8_lossy(&s).into_owned();
+                        self.call_static(&cn, &mname, args, None)
+                    }
+                    _ => Ok(Value::Null),
+                }
+            }
+            _ => Ok(Value::Null),
+        }
+    }
+
+    fn call_closure(&mut self, c: &ClosureVal, args: Vec<Value>) -> R<Value> {
+        let mut scope = HashMap::new();
+        for (k, v) in &c.captures {
+            scope.insert(k.clone(), v.clone());
+        }
+        if let Some(t) = &c.bound_this {
+            scope.insert("this".to_string(), t.clone());
+        }
+        match &c.kind {
+            ClosureKind::Full(f) => {
+                self.bind_params(&mut scope, &f.params, &args)?;
+                self.scopes.push(scope);
+                let r = self.exec_block(&f.body);
+                self.scopes.pop();
+                match r? {
+                    Flow::Return(v) => Ok(v),
+                    _ => Ok(Value::Null),
+                }
+            }
+            ClosureKind::Arrow(f) => {
+                self.bind_params(&mut scope, &f.params, &args)?;
+                self.scopes.push(scope);
+                let r = self.eval(&f.body);
+                self.scopes.pop();
+                r
             }
         }
-        // user function?
-        if let Some(f) = self.funcs.get(&name).cloned() {
-            return self.call_user(&f, argv);
-        }
-        // builtin
-        self.builtin(&name, argv)
     }
 
     fn call_user(&mut self, f: &FuncDecl, args: Vec<Value>) -> R<Value> {
@@ -1143,6 +1307,42 @@ impl Eval {
         Ok(())
     }
 
+    /// Given the result of a `try` body, dispatch to a matching `catch`.
+    fn handle_try_outcome(&mut self, outcome: R<Flow>, catches: &[Catch]) -> R<Flow> {
+        let err = match outcome {
+            Ok(flow) => return Ok(flow),
+            Err(e) => e,
+        };
+        let exc = match self.thrown.take() {
+            Some(v) => v,
+            None => return Err(err), // not an exception — propagate (e.g. step limit)
+        };
+        let cls = match &exc {
+            Value::Object(rc) => rc.borrow().class.clone(),
+            _ => String::new(),
+        };
+        for c in catches {
+            if c.types.iter().any(|t| self.is_subclass(&cls, t.last())) {
+                if let Some(var) = &c.var {
+                    self.vars().insert(var.clone(), exc.clone());
+                }
+                return self.exec_block(&c.body);
+            }
+        }
+        // no catch matched — re-throw
+        self.thrown = Some(exc);
+        Err(err)
+    }
+
+    /// Instantiate `class(msg)` and arm it as the pending throw.
+    fn throw_error(&mut self, class: &str, msg: &str) -> RunError {
+        let v = self
+            .instantiate(class, vec![Value::Str(msg.as_bytes().to_vec())])
+            .unwrap_or(Value::Null);
+        self.thrown = Some(v);
+        RunError("__phargo_throw__".into())
+    }
+
     fn class_const(&mut self, class: &str, name: &str) -> R<Value> {
         // enum case?
         if let Some(c) = self.find_class(class) {
@@ -1245,7 +1445,7 @@ impl Eval {
             "intdiv" => {
                 let d = to_i64(&a(1));
                 if d == 0 {
-                    return Err(RunError("DivisionByZeroError".into()));
+                    return Err(self.throw_error("DivisionByZeroError", "Division by zero"));
                 }
                 Value::Int(to_i64(&a(0)) / d)
             }
@@ -1430,6 +1630,76 @@ impl Eval {
                 }
                 Value::Bool(found)
             }
+            "call_user_func" => {
+                let f = a(0);
+                let rest = if args.len() > 1 { args[1..].to_vec() } else { vec![] };
+                return self.call_value(f, rest);
+            }
+            "call_user_func_array" => {
+                let f = a(0);
+                let mut argv = Vec::new();
+                if let Value::Array(arr) = a(1) {
+                    for (_, v) in arr.entries {
+                        argv.push(v);
+                    }
+                }
+                return self.call_value(f, argv);
+            }
+            "array_map" => {
+                let cb = a(0);
+                let mut out = Arr::new();
+                if let Value::Array(arr) = a(1) {
+                    for (k, v) in arr.entries {
+                        let r = if matches!(cb, Value::Null) {
+                            v
+                        } else {
+                            self.call_value(cb.clone(), vec![v])?
+                        };
+                        out.insert(k, r);
+                    }
+                }
+                Value::Array(out)
+            }
+            "array_filter" => {
+                let cb = a(1);
+                let mut out = Arr::new();
+                if let Value::Array(arr) = a(0) {
+                    for (k, v) in arr.entries {
+                        let keep = if matches!(cb, Value::Null) {
+                            to_bool(&v)
+                        } else {
+                            to_bool(&self.call_value(cb.clone(), vec![v.clone()])?)
+                        };
+                        if keep {
+                            out.insert(k, v);
+                        }
+                    }
+                }
+                Value::Array(out)
+            }
+            "array_reduce" => {
+                let cb = a(1);
+                let mut acc = a(2);
+                if let Value::Array(arr) = a(0) {
+                    for (_, v) in arr.entries {
+                        acc = self.call_value(cb.clone(), vec![acc, v])?;
+                    }
+                }
+                acc
+            }
+            "is_callable" => Value::Bool(match a(0) {
+                Value::Closure(_) => true,
+                Value::Str(s) => {
+                    let n = String::from_utf8_lossy(&s).to_ascii_lowercase();
+                    self.funcs.contains_key(&n) || is_known_builtin(&n)
+                }
+                Value::Object(rc) => {
+                    let c = rc.borrow().class.clone();
+                    self.find_method(&c, "__invoke").is_some()
+                }
+                Value::Array(arr) => arr.len() == 2,
+                _ => false,
+            }),
             "range" => self.range(&a(0), &a(1), &a(2)),
             "sprintf" => Value::Str(self.sprintf(&args)),
             "printf" => {
@@ -1724,6 +1994,7 @@ fn var_dump(v: &Value, indent: usize, out: &mut String) {
             }
             out.push_str(&format!("{pad}}}\n"));
         }
+        Value::Closure(_) => out.push_str(&format!("{pad}object(Closure)#1 (0) {{\n{pad}}}\n")),
     }
 }
 

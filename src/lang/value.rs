@@ -6,6 +6,7 @@
 //! builtins are built on top.
 #![allow(dead_code)]
 
+use super::ast;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -19,6 +20,21 @@ pub enum Value {
     Str(Vec<u8>),
     Array(Arr),
     Object(Rc<RefCell<Obj>>),
+    Closure(Rc<ClosureVal>),
+}
+
+/// A runtime closure: the function body plus its captured environment.
+#[derive(Debug)]
+pub struct ClosureVal {
+    pub kind: ClosureKind,
+    pub captures: Vec<(String, Value)>,
+    pub bound_this: Option<Value>,
+}
+
+#[derive(Debug)]
+pub enum ClosureKind {
+    Full(Rc<ast::Closure>),
+    Arrow(Rc<ast::ArrowFn>),
 }
 
 /// A PHP object instance: a class name plus insertion-ordered properties.
@@ -86,7 +102,7 @@ impl Arr {
                     Key::Str(s.clone())
                 }
             }
-            Value::Array(_) | Value::Object(_) => Key::Int(0),
+            Value::Array(_) | Value::Object(_) | Value::Closure(_) => Key::Int(0),
         }
     }
 
@@ -169,7 +185,7 @@ pub fn to_bool(v: &Value) -> bool {
         Value::Float(f) => *f != 0.0,
         Value::Str(s) => !(s.is_empty() || s == b"0"),
         Value::Array(a) => !a.is_empty(),
-        Value::Object(_) => true,
+        Value::Object(_) | Value::Closure(_) => true,
     }
 }
 
@@ -181,7 +197,7 @@ pub fn to_i64(v: &Value) -> i64 {
         Value::Float(f) => *f as i64,
         Value::Str(s) => leading_number(s).as_i64(),
         Value::Array(a) => !a.is_empty() as i64,
-        Value::Object(_) => 1,
+        Value::Object(_) | Value::Closure(_) => 1,
     }
 }
 
@@ -193,7 +209,7 @@ pub fn to_f64(v: &Value) -> f64 {
         Value::Float(f) => *f,
         Value::Str(s) => leading_number(s).as_f64(),
         Value::Array(a) => !a.is_empty() as i64 as f64,
-        Value::Object(_) => 1.0,
+        Value::Object(_) | Value::Closure(_) => 1.0,
     }
 }
 
@@ -207,7 +223,7 @@ pub fn to_bytes(v: &Value) -> Vec<u8> {
         Value::Str(s) => s.clone(),
         Value::Array(_) => b"Array".to_vec(),
         // __toString is handled by the evaluator's stringify(); this is the fallback.
-        Value::Object(_) => Vec::new(),
+        Value::Object(_) | Value::Closure(_) => Vec::new(),
     }
 }
 
@@ -219,7 +235,7 @@ pub fn type_name(v: &Value) -> &'static str {
         Value::Float(_) => "double",
         Value::Str(_) => "string",
         Value::Array(_) => "array",
-        Value::Object(_) => "object",
+        Value::Object(_) | Value::Closure(_) => "object",
     }
 }
 
@@ -319,7 +335,7 @@ pub fn to_num(v: &Value) -> Num {
         Value::Null => Num::Int(0),
         Value::Str(s) => leading_number(s),
         Value::Array(_) => Num::Int(0),
-        Value::Object(_) => Num::Int(1),
+        Value::Object(_) | Value::Closure(_) => Num::Int(1),
     }
 }
 
