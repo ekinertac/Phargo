@@ -9,7 +9,8 @@
 use super::ast::*;
 use super::value::*;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 #[derive(Debug)]
@@ -41,6 +42,10 @@ pub struct Eval {
     call_depth: usize,
     /// Current expression-evaluation recursion depth (deep AST spines).
     eval_depth: usize,
+    /// The file currently executing (for `__FILE__`/`__DIR__` + relative include).
+    cur_file: Option<PathBuf>,
+    /// Canonical paths already pulled in via `include_once`/`require_once`.
+    included: HashSet<String>,
     steps: u64,
 }
 
@@ -109,6 +114,8 @@ impl Eval {
             thrown: None,
             call_depth: 0,
             eval_depth: 0,
+            cur_file: None,
+            included: HashSet::new(),
             steps: 0,
         }
     }
@@ -135,6 +142,17 @@ impl Eval {
     /// Run a parsed program and return everything it printed.
     pub fn run(program: &[Stmt]) -> R<Vec<u8>> {
         let mut e = Eval::new();
+        e.load_prelude();
+        e.hoist(program);
+        e.exec_block(program)?;
+        Ok(e.out)
+    }
+
+    /// Like [`run`], but records the script's path so `__FILE__`/`__DIR__` and
+    /// relative `include`/`require` resolve against it.
+    pub fn run_with_path(program: &[Stmt], path: Option<PathBuf>) -> R<Vec<u8>> {
+        let mut e = Eval::new();
+        e.cur_file = path;
         e.load_prelude();
         e.hoist(program);
         e.exec_block(program)?;
@@ -436,7 +454,23 @@ impl Eval {
             }
             Expr::Var(name) => self.vars().get(name).cloned().unwrap_or(Value::Null),
             Expr::ConstFetch(name) => self.const_fetch(name),
-            Expr::MagicConst(_) => Value::Str(Vec::new()),
+            Expr::MagicConst(name) => match name.to_ascii_uppercase().as_str() {
+                "__FILE__" => Value::Str(
+                    self.cur_file
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().as_bytes().to_vec())
+                        .unwrap_or_default(),
+                ),
+                "__DIR__" => Value::Str(
+                    self.cur_file
+                        .as_ref()
+                        .and_then(|p| p.parent())
+                        .map(|d| d.to_string_lossy().as_bytes().to_vec())
+                        .unwrap_or_default(),
+                ),
+                "__CLASS__" => Value::Str(self.current_class.clone().unwrap_or_default().into_bytes()),
+                _ => Value::Str(Vec::new()),
+            },
             Expr::Unary(op, e) => {
                 let v = self.eval(e)?;
                 match op {
@@ -1042,6 +1076,21 @@ impl Eval {
             }
             let name = n.last().to_ascii_lowercase();
             let argv = self.eval_args(args)?;
+            // include/require/eval need the lex->parse->exec machinery
+            match name.as_str() {
+                "include" | "include_once" | "require" | "require_once" => {
+                    let path = String::from_utf8_lossy(&to_bytes(argv.get(0).unwrap_or(&Value::Null)))
+                        .into_owned();
+                    let require = name.starts_with("require");
+                    let once = name.ends_with("_once");
+                    return self.do_include(&path, require, once);
+                }
+                "eval" => {
+                    let code = to_bytes(argv.get(0).unwrap_or(&Value::Null));
+                    return self.do_eval(&code);
+                }
+                _ => {}
+            }
             if let Some(f) = self.funcs.get(&name).cloned() {
                 return self.call_user(&f, argv);
             }
@@ -1051,6 +1100,70 @@ impl Eval {
         let cv = self.eval(callee)?;
         let argv = self.eval_args(args)?;
         self.call_value(cv, argv)
+    }
+
+    /// `include`/`require`: load a file, lex+parse it, and execute its statements
+    /// in the current scope (sharing globals; functions/classes register globally).
+    fn do_include(&mut self, path: &str, require: bool, once: bool) -> R<Value> {
+        let resolved = self.resolve_include(path);
+        let key = resolved.to_string_lossy().to_ascii_lowercase();
+        if once && self.included.contains(&key) {
+            return Ok(Value::Bool(true));
+        }
+        let bytes = match std::fs::read(&resolved) {
+            Ok(b) => b,
+            Err(_) => {
+                if require {
+                    return Err(self.throw_error(
+                        "Error",
+                        &format!("require(): Failed opening required '{path}'"),
+                    ));
+                }
+                return Ok(Value::Bool(false)); // include() warns and returns false
+            }
+        };
+        self.included.insert(key);
+        self.run_source(&bytes, Some(resolved))
+    }
+
+    /// `eval("code")`: lex+parse the string and execute it in the current scope.
+    fn do_eval(&mut self, code: &[u8]) -> R<Value> {
+        // PHP's eval string has no leading `<?php`; wrap it so the lexer enters code mode.
+        let mut full = b"<?php ".to_vec();
+        full.extend_from_slice(code);
+        let cur = self.cur_file.clone();
+        self.run_source(&full, cur)
+    }
+
+    fn run_source(&mut self, bytes: &[u8], path: Option<PathBuf>) -> R<Value> {
+        let toks = super::lexer::Lexer::tokenize(bytes)
+            .map_err(|e| RunError(format!("Parse error: {}", e.msg)))?;
+        let ast = super::parser::Parser::parse(toks)
+            .map_err(|e| RunError(format!("Parse error: {}", e.msg)))?;
+        let prev_file = std::mem::replace(&mut self.cur_file, path);
+        self.hoist(&ast);
+        let r = self.exec_block(&ast);
+        self.cur_file = prev_file;
+        match r? {
+            Flow::Return(v) => Ok(v),
+            _ => Ok(Value::Int(1)), // include/eval default return value
+        }
+    }
+
+    /// Resolve an include path: absolute as-is, else relative to the current
+    /// file's directory, else relative to the working directory.
+    fn resolve_include(&self, path: &str) -> PathBuf {
+        let p = PathBuf::from(path);
+        if p.is_absolute() && p.exists() {
+            return p;
+        }
+        if let Some(dir) = self.cur_file.as_ref().and_then(|f| f.parent()) {
+            let cand = dir.join(path);
+            if cand.exists() {
+                return cand;
+            }
+        }
+        p
     }
 
     /// Invoke any callable value: closure, function-name string, `[obj, "m"]`,

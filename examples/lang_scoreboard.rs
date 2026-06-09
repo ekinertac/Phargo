@@ -26,6 +26,7 @@ struct Phpt {
     file: String,
     expect: Option<String>,
     expectf: Option<String>,
+    path: PathBuf,
 }
 
 fn run() {
@@ -51,7 +52,8 @@ fn run() {
     for (i, path) in corpus.iter().enumerate() {
         let _ = fs::write(&breadcrumb, path.to_string_lossy().as_bytes());
         let text = fs::read_to_string(path).unwrap_or_default();
-        let t = parse_phpt(&text);
+        let mut t = parse_phpt(&text);
+        t.path = path.clone();
         if t.expect.is_none() && t.expectf.is_none() {
             na += 1;
             continue;
@@ -72,7 +74,8 @@ fn run() {
     let (mut cpass, mut ctotal) = (0usize, 0usize);
     for path in &curated {
         let text = fs::read_to_string(path).unwrap_or_default();
-        let t = parse_phpt(&text);
+        let mut t = parse_phpt(&text);
+        t.path = path.clone();
         if t.expect.is_none() && t.expectf.is_none() {
             continue;
         }
@@ -105,7 +108,7 @@ fn evaluate(t: &Phpt) -> Result<bool, String> {
     let out = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let toks = Lexer::tokenize(t.file.as_bytes()).map_err(|e| format!("LEX: {}", e.msg))?;
         let ast = Parser::parse(toks).map_err(|e| format!("PARSE: {}", e.msg))?;
-        Eval::run(&ast).map_err(|e| e.0)
+        Eval::run_with_path(&ast, Some(t.path.clone())).map_err(|e| e.0)
     }));
     let out = match out {
         Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
@@ -162,7 +165,12 @@ fn parse_phpt(text: &str) -> Phpt {
         sections.push((c, buf));
     }
     let get = |key: &str| sections.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
-    Phpt { file: get("FILE").unwrap_or_default(), expect: get("EXPECT"), expectf: get("EXPECTF") }
+    Phpt {
+        file: get("FILE").unwrap_or_default(),
+        expect: get("EXPECT"),
+        expectf: get("EXPECTF"),
+        path: PathBuf::new(),
+    }
 }
 
 fn section_header(line: &str) -> Option<String> {
