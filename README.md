@@ -4,7 +4,7 @@
 
 # Phargo
 
-**PHP + Cargo.** A from-scratch, **memory-safe PHP engine written in Rust** — built the same way the Bun team rewrote Bun in Rust: drive an AI with the original project's **own test suite as the oracle**, and watch the pass-rate climb *in public*.
+A from-scratch, **memory-safe PHP engine written in Rust** — built the same way the Bun team rewrote Bun in Rust: drive an AI with the original project's **own test suite as the oracle**, and watch the pass-rate climb *in public*.
 
 ## North star: run WordPress in the browser
 
