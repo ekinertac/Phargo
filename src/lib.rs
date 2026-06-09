@@ -730,6 +730,65 @@ class SplObjectStorage implements Countable, Iterator, ArrayAccess {
     public function getInfo() { return $this->__v[$this->__k[$this->__p]] ?? null; }
     public function next(): void { $this->__p = $this->__p + 1; }
 }
+abstract class SplHeap implements Countable, Iterator {
+    protected $__h = [];
+    abstract protected function compare($a, $b): int;
+    protected function __top_index() {
+        $best = 0;
+        for ($i = 1; $i < count($this->__h); $i++) {
+            if ($this->compare($this->__h[$i], $this->__h[$best]) > 0) { $best = $i; }
+        }
+        return $best;
+    }
+    public function insert($v) { $this->__h[] = $v; return true; }
+    public function top() { return $this->__h[$this->__top_index()]; }
+    public function extract() {
+        if (count($this->__h) === 0) { return null; }
+        $i = $this->__top_index();
+        $v = $this->__h[$i];
+        array_splice($this->__h, $i, 1);
+        return $v;
+    }
+    public function count(): int { return count($this->__h); }
+    public function isEmpty() { return count($this->__h) === 0; }
+    public function rewind(): void {}
+    public function valid(): bool { return count($this->__h) > 0; }
+    public function current(): mixed { return $this->top(); }
+    public function key(): mixed { return count($this->__h) - 1; }
+    public function next(): void { $this->extract(); }
+}
+class SplMinHeap extends SplHeap {
+    protected function compare($a, $b): int { return ($a < $b) ? 1 : (($a > $b) ? -1 : 0); }
+}
+class SplMaxHeap extends SplHeap {
+    protected function compare($a, $b): int { return ($a > $b) ? 1 : (($a < $b) ? -1 : 0); }
+}
+class SplPriorityQueue implements Countable, Iterator {
+    private $__d = [];
+    private function __top_index() {
+        $best = 0;
+        for ($i = 1; $i < count($this->__d); $i++) {
+            if ($this->__d[$i][0] > $this->__d[$best][0]) { $best = $i; }
+        }
+        return $best;
+    }
+    public function insert($value, $priority) { $this->__d[] = [$priority, $value]; return true; }
+    public function top() { return $this->__d[$this->__top_index()][1]; }
+    public function extract() {
+        if (count($this->__d) === 0) { return null; }
+        $i = $this->__top_index();
+        $v = $this->__d[$i][1];
+        array_splice($this->__d, $i, 1);
+        return $v;
+    }
+    public function count(): int { return count($this->__d); }
+    public function isEmpty() { return count($this->__d) === 0; }
+    public function rewind(): void {}
+    public function valid(): bool { return count($this->__d) > 0; }
+    public function current(): mixed { return $this->top(); }
+    public function key(): mixed { return count($this->__d) - 1; }
+    public function next(): void { $this->extract(); }
+}
 interface DateTimeInterface {}
 class DateTime implements DateTimeInterface {
     public $__ts;
