@@ -985,18 +985,10 @@ impl Eval {
         if let Some(v) = self.consts.get(n) {
             return v.clone();
         }
-        match n {
-            "PHP_EOL" => Value::Str(b"\n".to_vec()),
-            "PHP_INT_MAX" => Value::Int(i64::MAX),
-            "PHP_INT_MIN" => Value::Int(i64::MIN),
-            "PHP_INT_SIZE" => Value::Int(8),
-            "PHP_FLOAT_EPSILON" => Value::Float(f64::EPSILON),
-            "NULL" | "null" => Value::Null,
-            "TRUE" | "true" => Value::Bool(true),
-            "FALSE" | "false" => Value::Bool(false),
+        php_const(n).unwrap_or_else(|| {
             // unknown bareword → its own name as a string (PHP 7 behavior-ish)
-            _ => Value::Str(n.as_bytes().to_vec()),
-        }
+            Value::Str(n.as_bytes().to_vec())
+        })
     }
 
     // ---- assignment targets --------------------------------------------
@@ -2152,6 +2144,190 @@ impl Eval {
                     sub
                 })
             }
+            // ---- filesystem ----
+            "file_get_contents" => {
+                let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                match std::fs::read(&path) {
+                    Ok(b) => Value::Str(b),
+                    Err(_) => Value::Bool(false),
+                }
+            }
+            "file_put_contents" => {
+                let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let bytes = match &a(1) {
+                    Value::Array(arr) => {
+                        let mut v = Vec::new();
+                        for (_, e) in &arr.entries {
+                            v.extend_from_slice(&to_bytes(e));
+                        }
+                        v
+                    }
+                    v => to_bytes(v),
+                };
+                // FILE_APPEND = 8
+                let append = to_i64(&a(2)) & 8 != 0;
+                let res = if append {
+                    use std::io::Write;
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .and_then(|mut f| f.write_all(&bytes))
+                } else {
+                    std::fs::write(&path, &bytes)
+                };
+                match res {
+                    Ok(_) => Value::Int(bytes.len() as i64),
+                    Err(_) => Value::Bool(false),
+                }
+            }
+            "file" => {
+                let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                match std::fs::read(&path) {
+                    Ok(b) => {
+                        let ignore_nl = to_i64(&a(1)) & 2 != 0;
+                        let mut arr = Arr::new();
+                        let mut start = 0;
+                        for i in 0..b.len() {
+                            if b[i] == b'\n' {
+                                let end = if ignore_nl { i } else { i + 1 };
+                                arr.push(Value::Str(b[start..end].to_vec()));
+                                start = i + 1;
+                            }
+                        }
+                        if start < b.len() {
+                            arr.push(Value::Str(b[start..].to_vec()));
+                        }
+                        Value::Array(arr)
+                    }
+                    Err(_) => Value::Bool(false),
+                }
+            }
+            "readfile" => {
+                let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                match std::fs::read(&path) {
+                    Ok(b) => {
+                        let n = b.len();
+                        self.out.extend_from_slice(&b);
+                        Value::Int(n as i64)
+                    }
+                    Err(_) => Value::Bool(false),
+                }
+            }
+            "unlink" => {
+                let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                Value::Bool(std::fs::remove_file(&path).is_ok())
+            }
+            "mkdir" => {
+                let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let recursive = to_bool(&a(2));
+                let r = if recursive {
+                    std::fs::create_dir_all(&path)
+                } else {
+                    std::fs::create_dir(&path)
+                };
+                Value::Bool(r.is_ok())
+            }
+            "rmdir" => {
+                let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                Value::Bool(std::fs::remove_dir(&path).is_ok())
+            }
+            "rename" => Value::Bool(
+                std::fs::rename(
+                    String::from_utf8_lossy(&to_bytes(&a(0))).as_ref(),
+                    String::from_utf8_lossy(&to_bytes(&a(1))).as_ref(),
+                )
+                .is_ok(),
+            ),
+            "copy" => Value::Bool(
+                std::fs::copy(
+                    String::from_utf8_lossy(&to_bytes(&a(0))).as_ref(),
+                    String::from_utf8_lossy(&to_bytes(&a(1))).as_ref(),
+                )
+                .is_ok(),
+            ),
+            "file_exists" => {
+                Value::Bool(std::path::Path::new(&String::from_utf8_lossy(&to_bytes(&a(0))).into_owned()).exists())
+            }
+            "is_file" => Value::Bool(
+                std::path::Path::new(&String::from_utf8_lossy(&to_bytes(&a(0))).into_owned()).is_file(),
+            ),
+            "is_dir" => Value::Bool(
+                std::path::Path::new(&String::from_utf8_lossy(&to_bytes(&a(0))).into_owned()).is_dir(),
+            ),
+            "is_readable" | "is_writable" | "is_writeable" => {
+                Value::Bool(std::path::Path::new(&String::from_utf8_lossy(&to_bytes(&a(0))).into_owned()).exists())
+            }
+            "filesize" => {
+                let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                match std::fs::metadata(&path) {
+                    Ok(m) => Value::Int(m.len() as i64),
+                    Err(_) => Value::Bool(false),
+                }
+            }
+            "scandir" => {
+                let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                match std::fs::read_dir(&path) {
+                    Ok(rd) => {
+                        let mut names: Vec<Vec<u8>> = vec![b".".to_vec(), b"..".to_vec()];
+                        for e in rd.flatten() {
+                            names.push(e.file_name().to_string_lossy().as_bytes().to_vec());
+                        }
+                        names.sort();
+                        let mut arr = Arr::new();
+                        for n in names {
+                            arr.push(Value::Str(n));
+                        }
+                        Value::Array(arr)
+                    }
+                    Err(_) => Value::Bool(false),
+                }
+            }
+            "realpath" => {
+                let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                match std::fs::canonicalize(&path) {
+                    Ok(p) => {
+                        let s = p.to_string_lossy();
+                        // strip Windows \\?\ prefix
+                        let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+                        Value::Str(s.as_bytes().to_vec())
+                    }
+                    Err(_) => Value::Bool(false),
+                }
+            }
+            "getcwd" => match std::env::current_dir() {
+                Ok(p) => Value::Str(p.to_string_lossy().as_bytes().to_vec()),
+                Err(_) => Value::Bool(false),
+            },
+            "sys_get_temp_dir" => {
+                Value::Str(std::env::temp_dir().to_string_lossy().as_bytes().to_vec())
+            }
+            "touch" => {
+                let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                Value::Bool(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .open(&path)
+                        .is_ok(),
+                )
+            }
+            "pathinfo" => {
+                let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let p = std::path::Path::new(&path);
+                let dir = p.parent().map(|d| d.to_string_lossy().into_owned()).filter(|s| !s.is_empty()).unwrap_or_else(|| ".".into());
+                let base = p.file_name().map(|b| b.to_string_lossy().into_owned()).unwrap_or_default();
+                let ext = p.extension().map(|e| e.to_string_lossy().into_owned());
+                let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let mut arr = Arr::new();
+                arr.insert(Key::Str(b"dirname".to_vec()), Value::Str(dir.into_bytes()));
+                arr.insert(Key::Str(b"basename".to_vec()), Value::Str(base.into_bytes()));
+                if let Some(e) = ext {
+                    arr.insert(Key::Str(b"extension".to_vec()), Value::Str(e.into_bytes()));
+                }
+                arr.insert(Key::Str(b"filename".to_vec()), Value::Str(stem.into_bytes()));
+                Value::Array(arr)
+            }
             // ---- environment / config stubs (setup calls; sane defaults) ----
             "getenv" => {
                 if args.is_empty() {
@@ -2559,6 +2735,124 @@ fn value_size(v: &Value, limit: usize) -> usize {
         }
     }
     count
+}
+
+/// The predefined PHP constants commonly used in the corpus.
+fn php_const(n: &str) -> Option<Value> {
+    use Value::*;
+    let sep = if cfg!(windows) { "\\" } else { "/" };
+    Some(match n {
+        "PHP_EOL" => Str(b"\n".to_vec()),
+        "PHP_INT_MAX" => Int(i64::MAX),
+        "PHP_INT_MIN" => Int(i64::MIN),
+        "PHP_INT_SIZE" => Int(8),
+        "PHP_FLOAT_EPSILON" => Float(f64::EPSILON),
+        "PHP_FLOAT_MAX" => Float(f64::MAX),
+        "PHP_FLOAT_MIN" => Float(f64::MIN_POSITIVE),
+        "PHP_FLOAT_DIG" => Int(15),
+        "PHP_VERSION" => Str(b"8.3.0".to_vec()),
+        "PHP_MAJOR_VERSION" => Int(8),
+        "PHP_MINOR_VERSION" => Int(3),
+        "PHP_RELEASE_VERSION" => Int(0),
+        "PHP_VERSION_ID" => Int(80300),
+        "PHP_OS" => Str(if cfg!(windows) { b"WINNT".to_vec() } else { b"Linux".to_vec() }),
+        "PHP_OS_FAMILY" => Str(if cfg!(windows) { b"Windows".to_vec() } else { b"Linux".to_vec() }),
+        "DIRECTORY_SEPARATOR" => Str(sep.as_bytes().to_vec()),
+        "PATH_SEPARATOR" => Str(if cfg!(windows) { b";".to_vec() } else { b":".to_vec() }),
+        "NULL" | "null" => Null,
+        "TRUE" | "true" => Bool(true),
+        "FALSE" | "false" => Bool(false),
+        // math
+        "M_PI" => Float(std::f64::consts::PI),
+        "M_E" => Float(std::f64::consts::E),
+        "M_SQRT2" => Float(std::f64::consts::SQRT_2),
+        "M_SQRT1_2" => Float(std::f64::consts::FRAC_1_SQRT_2),
+        "M_SQRT3" => Float(1.7320508075688772),
+        "M_LN2" => Float(std::f64::consts::LN_2),
+        "M_LN10" => Float(std::f64::consts::LN_10),
+        "M_LOG2E" => Float(std::f64::consts::LOG2_E),
+        "M_LOG10E" => Float(std::f64::consts::LOG10_E),
+        "M_PI_2" => Float(std::f64::consts::FRAC_PI_2),
+        "M_PI_4" => Float(std::f64::consts::FRAC_PI_4),
+        "M_2_PI" => Float(std::f64::consts::FRAC_2_PI),
+        "M_1_PI" => Float(std::f64::consts::FRAC_1_PI),
+        "M_EULER" => Float(0.5772156649015329),
+        "INF" => Float(f64::INFINITY),
+        "NAN" => Float(f64::NAN),
+        // error levels
+        "E_ERROR" => Int(1),
+        "E_WARNING" => Int(2),
+        "E_PARSE" => Int(4),
+        "E_NOTICE" => Int(8),
+        "E_CORE_ERROR" => Int(16),
+        "E_CORE_WARNING" => Int(32),
+        "E_COMPILE_ERROR" => Int(64),
+        "E_COMPILE_WARNING" => Int(128),
+        "E_USER_ERROR" => Int(256),
+        "E_USER_WARNING" => Int(512),
+        "E_USER_NOTICE" => Int(1024),
+        "E_STRICT" => Int(2048),
+        "E_RECOVERABLE_ERROR" => Int(4096),
+        "E_DEPRECATED" => Int(8192),
+        "E_USER_DEPRECATED" => Int(16384),
+        "E_ALL" => Int(32767),
+        // sort flags
+        "SORT_REGULAR" => Int(0),
+        "SORT_NUMERIC" => Int(1),
+        "SORT_STRING" => Int(2),
+        "SORT_DESC" => Int(3),
+        "SORT_ASC" => Int(4),
+        "SORT_LOCALE_STRING" => Int(5),
+        "SORT_NATURAL" => Int(6),
+        "SORT_FLAG_CASE" => Int(8),
+        // count / str_pad / array_filter
+        "COUNT_NORMAL" => Int(0),
+        "COUNT_RECURSIVE" => Int(1),
+        "STR_PAD_RIGHT" => Int(1),
+        "STR_PAD_LEFT" => Int(0),
+        "STR_PAD_BOTH" => Int(2),
+        "ARRAY_FILTER_USE_KEY" => Int(2),
+        "ARRAY_FILTER_USE_BOTH" => Int(1),
+        // file flags
+        "FILE_USE_INCLUDE_PATH" => Int(1),
+        "FILE_IGNORE_NEW_LINES" => Int(2),
+        "FILE_SKIP_EMPTY_LINES" => Int(4),
+        "FILE_APPEND" => Int(8),
+        "FILE_NO_DEFAULT_CONTEXT" => Int(16),
+        "FILE_TEXT" => Int(0),
+        "FILE_BINARY" => Int(0),
+        "SEEK_SET" => Int(0),
+        "SEEK_CUR" => Int(1),
+        "SEEK_END" => Int(2),
+        "LOCK_SH" => Int(1),
+        "LOCK_EX" => Int(2),
+        "LOCK_UN" => Int(3),
+        // htmlspecialchars / ent
+        "ENT_QUOTES" => Int(3),
+        "ENT_COMPAT" => Int(2),
+        "ENT_NOQUOTES" => Int(0),
+        "ENT_HTML401" => Int(0),
+        "ENT_HTML5" => Int(48),
+        // json
+        "JSON_PRETTY_PRINT" => Int(128),
+        "JSON_UNESCAPED_SLASHES" => Int(64),
+        "JSON_UNESCAPED_UNICODE" => Int(256),
+        "JSON_THROW_ON_ERROR" => Int(4194304),
+        "JSON_ERROR_NONE" => Int(0),
+        // preg
+        "PREG_PATTERN_ORDER" => Int(1),
+        "PREG_SET_ORDER" => Int(2),
+        "PREG_OFFSET_CAPTURE" => Int(256),
+        "PREG_SPLIT_NO_EMPTY" => Int(1),
+        "PREG_SPLIT_DELIM_CAPTURE" => Int(2),
+        // misc
+        "PHP_ROUND_HALF_UP" => Int(1),
+        "PHP_ROUND_HALF_DOWN" => Int(2),
+        "PHP_ROUND_HALF_EVEN" => Int(3),
+        "PHP_ROUND_HALF_ODD" => Int(4),
+        "ENT_SUBSTITUTE" => Int(8),
+        _ => return None,
+    })
 }
 
 fn string_char(s: &[u8], k: &Key) -> Value {
