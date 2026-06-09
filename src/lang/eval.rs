@@ -520,16 +520,7 @@ impl Eval {
                     self.eval(els)?
                 }
             }
-            Expr::Index(base, idx) => {
-                let b = self.eval(base)?;
-                match idx {
-                    Some(i) => {
-                        let iv = self.eval(i)?;
-                        self.index_get(&b, &iv)
-                    }
-                    None => Value::Null,
-                }
-            }
+            Expr::Index(base, idx) => self.read_index(base, idx)?,
             Expr::Call(callee, args) => self.eval_call(callee, args)?,
             Expr::Isset(items) => {
                 let mut all = true;
@@ -808,6 +799,70 @@ impl Eval {
             },
             CastType::Object => v, // objects not modeled yet
             CastType::Unset => Value::Null,
+        }
+    }
+
+    /// Read `$var[i]`, `$var[i][j]`, ... by navigating the stored container by
+    /// reference and cloning only the final element. (Naively evaluating `base`
+    /// clones the whole container on every access — O(n^2) in array-heavy loops.)
+    fn read_index(&mut self, base: &Expr, idx: &Option<Box<Expr>>) -> R<Value> {
+        let first = match idx {
+            Some(i) => Arr::norm_key(&self.eval(i)?),
+            None => return Ok(Value::Null), // `$a[]` isn't a readable expression
+        };
+        // Unwind a chain of `Index` nodes down to the root, evaluating each key.
+        let mut keys = vec![first];
+        let mut node = base;
+        loop {
+            match node {
+                Expr::Index(b, Some(i)) => {
+                    keys.push(Arr::norm_key(&self.eval(i)?));
+                    node = b;
+                }
+                Expr::Var(_) => break,
+                // root isn't a plain variable (e.g. a call result) — fall back to
+                // evaluating it once, then indexing.
+                other => {
+                    keys.reverse();
+                    let mut v = self.eval(other)?;
+                    for k in &keys {
+                        v = self.index_get_key(&v, k);
+                    }
+                    return Ok(v);
+                }
+            }
+        }
+        keys.reverse();
+        let name = match node {
+            Expr::Var(n) => n.clone(),
+            _ => unreachable!(),
+        };
+        // Navigate by reference (keys already evaluated — no &mut self needed here).
+        let scope = self.scopes.last().unwrap();
+        let mut v = match scope.get(&name) {
+            Some(v) => v,
+            None => return Ok(Value::Null),
+        };
+        for k in &keys {
+            match v {
+                Value::Array(a) => {
+                    v = match a.get(k) {
+                        Some(x) => x,
+                        None => return Ok(Value::Null),
+                    };
+                }
+                Value::Str(s) => return Ok(string_char(s, k)),
+                _ => return Ok(Value::Null),
+            }
+        }
+        Ok(v.clone())
+    }
+
+    fn index_get_key(&self, base: &Value, k: &Key) -> Value {
+        match base {
+            Value::Array(a) => a.get(k).cloned().unwrap_or(Value::Null),
+            Value::Str(s) => string_char(s, k),
+            _ => Value::Null,
         }
     }
 
@@ -2137,6 +2192,19 @@ fn print_r(v: &Value, indent: usize, out: &mut String) {
 }
 
 // ---- helpers -----------------------------------------------------------
+
+fn string_char(s: &[u8], k: &Key) -> Value {
+    let i = match k {
+        Key::Int(n) => *n,
+        Key::Str(b) => leading_number(b).as_i64(),
+    };
+    let i = if i < 0 { s.len() as i64 + i } else { i };
+    if i >= 0 && (i as usize) < s.len() {
+        Value::Str(vec![s[i as usize]])
+    } else {
+        Value::Str(Vec::new())
+    }
+}
 
 fn inc(v: &Value, by: i64) -> Value {
     match v {
