@@ -1312,6 +1312,16 @@ impl Eval {
                     let code = to_bytes(argv.get(0).unwrap_or(&Value::Null));
                     return self.do_eval(&code);
                 }
+                "preg_match" | "preg_match_all" => {
+                    let all = name == "preg_match_all";
+                    let pat = to_bytes(argv.get(0).unwrap_or(&Value::Null));
+                    let subj = to_bytes(argv.get(1).unwrap_or(&Value::Null));
+                    let (count, matches) = self.preg_run(&pat, &subj, all);
+                    if args.len() > 2 {
+                        self.assign_to(&args[2].value, matches)?;
+                    }
+                    return Ok(Value::Int(count));
+                }
                 _ => {}
             }
             if let Some(f) = self.funcs.get(&name).cloned() {
@@ -1387,6 +1397,57 @@ impl Eval {
             }
         }
         p
+    }
+
+    /// Run a `preg_match`/`preg_match_all`, returning (count, matches-array),
+    /// reusing the legacy regex engine (char-based, Value-independent).
+    fn preg_run(&self, pat: &[u8], subj: &[u8], all: bool) -> (i64, Value) {
+        let pattern = String::from_utf8_lossy(pat).into_owned();
+        let rx = match crate::rx_compile(&pattern) {
+            Some(r) => r,
+            None => return (0, Value::Bool(false)),
+        };
+        let text: Vec<char> = String::from_utf8_lossy(subj).chars().collect();
+        let mut steps = 0usize;
+        let grp = |slots: &[usize], g: usize| Value::Str(crate::rx_group_str(&text, slots, g).into_bytes());
+        if !all {
+            match rx.exec(&text, 0, &mut steps) {
+                Some(slots) => {
+                    let mut m = Arr::new();
+                    for g in 0..=rx.ngroups {
+                        if let Some((nm, _)) = rx.names.iter().find(|(_, idx)| *idx == g) {
+                            m.insert(Key::Str(nm.as_bytes().to_vec()), grp(&slots, g));
+                        }
+                        m.insert(Key::Int(g as i64), grp(&slots, g));
+                    }
+                    (1, Value::Array(m))
+                }
+                None => (0, Value::Array(Arr::new())),
+            }
+        } else {
+            let mut sets: Vec<Vec<usize>> = Vec::new();
+            let mut start = 0;
+            while let Some(slots) = rx.exec(&text, start, &mut steps) {
+                let (ms, me) = (slots[0], slots[1]);
+                sets.push(slots);
+                start = if me > ms { me } else { me + 1 };
+                if start > text.len() {
+                    break;
+                }
+            }
+            let mut result = Arr::new();
+            for g in 0..=rx.ngroups {
+                let mut col = Arr::new();
+                for slots in &sets {
+                    col.push(grp(slots, g));
+                }
+                if let Some((nm, _)) = rx.names.iter().find(|(_, idx)| *idx == g) {
+                    result.insert(Key::Str(nm.as_bytes().to_vec()), Value::Array(col.clone()));
+                }
+                result.insert(Key::Int(g as i64), Value::Array(col));
+            }
+            (sets.len() as i64, Value::Array(result))
+        }
     }
 
     /// Invoke any callable value: closure, function-name string, `[obj, "m"]`,
@@ -2527,6 +2588,135 @@ impl Eval {
                 } else {
                     Value::Str(format!("0.00000000 {}", crate::now_unix()).into_bytes())
                 }
+            }
+            "preg_quote" => {
+                let s = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let delim = if args.len() > 1 {
+                    String::from_utf8_lossy(&to_bytes(&a(1))).chars().next()
+                } else {
+                    None
+                };
+                Value::Str(crate::rx_quote(&s, delim).into_bytes())
+            }
+            "preg_replace" => {
+                let subject = String::from_utf8_lossy(&to_bytes(&a(2))).into_owned();
+                let limit = if args.len() > 3 { to_i64(&a(3)) } else { -1 };
+                let pats: Vec<Vec<u8>> = match a(0) {
+                    Value::Array(arr) => arr.entries.into_iter().map(|(_, v)| to_bytes(&v)).collect(),
+                    v => vec![to_bytes(&v)],
+                };
+                let rep_is_arr = matches!(a(1), Value::Array(_));
+                let reps: Vec<Vec<u8>> = match a(1) {
+                    Value::Array(arr) => arr.entries.into_iter().map(|(_, v)| to_bytes(&v)).collect(),
+                    v => vec![to_bytes(&v)],
+                };
+                let mut result = subject;
+                let mut count = 0i64;
+                for (i, p) in pats.iter().enumerate() {
+                    let pattern = String::from_utf8_lossy(p).into_owned();
+                    let repl = if rep_is_arr {
+                        reps.get(i).map(|r| String::from_utf8_lossy(r).into_owned()).unwrap_or_default()
+                    } else {
+                        String::from_utf8_lossy(&reps[0]).into_owned()
+                    };
+                    if let Some(rx) = crate::rx_compile(&pattern) {
+                        result = crate::rx_replace_str(&rx, &repl, &result, limit, &mut count);
+                    }
+                }
+                Value::Str(result.into_bytes())
+            }
+            "preg_replace_callback" => {
+                let pattern = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let cb = a(1);
+                let subject: Vec<char> =
+                    String::from_utf8_lossy(&to_bytes(&a(2))).chars().collect();
+                let rx = match crate::rx_compile(&pattern) {
+                    Some(r) => r,
+                    None => return Ok(Value::Null),
+                };
+                let mut out = String::new();
+                let mut pos = 0;
+                let mut steps = 0usize;
+                while pos <= subject.len() {
+                    match rx.exec(&subject, pos, &mut steps) {
+                        Some(slots) => {
+                            let (ms, me) = (slots[0], slots[1]);
+                            out.extend(&subject[pos..ms]);
+                            // build the match array for the callback
+                            let mut m = Arr::new();
+                            for g in 0..=rx.ngroups {
+                                m.push(Value::Str(crate::rx_group_str(&subject, &slots, g).into_bytes()));
+                            }
+                            let r = self.call_value(cb.clone(), vec![Value::Array(m)])?;
+                            out.push_str(&String::from_utf8_lossy(&to_bytes(&r)));
+                            pos = if me > ms {
+                                me
+                            } else {
+                                if ms < subject.len() {
+                                    out.push(subject[ms]);
+                                }
+                                ms + 1
+                            };
+                        }
+                        None => {
+                            out.extend(&subject[pos..]);
+                            break;
+                        }
+                    }
+                }
+                Value::Str(out.into_bytes())
+            }
+            "preg_split" => {
+                let pattern = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let subject: Vec<char> =
+                    String::from_utf8_lossy(&to_bytes(&a(1))).chars().collect();
+                let no_empty = to_i64(&a(3)) & 1 != 0;
+                let mut arr = Arr::new();
+                match crate::rx_compile(&pattern) {
+                    Some(rx) => {
+                        let mut pos = 0;
+                        let mut last = 0;
+                        let mut steps = 0usize;
+                        while pos <= subject.len() {
+                            match rx.exec(&subject, pos, &mut steps) {
+                                Some(slots) => {
+                                    let (ms, me) = (slots[0], slots[1]);
+                                    if me == ms && ms == last {
+                                        pos = ms + 1;
+                                        continue;
+                                    }
+                                    let piece: String = subject[last..ms].iter().collect();
+                                    if !(no_empty && piece.is_empty()) {
+                                        arr.push(Value::Str(piece.into_bytes()));
+                                    }
+                                    last = me;
+                                    pos = if me > ms { me } else { me + 1 };
+                                }
+                                None => break,
+                            }
+                        }
+                        let piece: String = subject[last..].iter().collect();
+                        if !(no_empty && piece.is_empty()) {
+                            arr.push(Value::Str(piece.into_bytes()));
+                        }
+                    }
+                    None => arr.push(Value::Str(subject.iter().collect::<String>().into_bytes())),
+                }
+                Value::Array(arr)
+            }
+            "preg_grep" => {
+                let pattern = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let mut out = Arr::new();
+                if let (Some(rx), Value::Array(arr)) = (crate::rx_compile(&pattern), a(1)) {
+                    for (k, v) in arr.entries {
+                        let text: Vec<char> = String::from_utf8_lossy(&to_bytes(&v)).chars().collect();
+                        let mut steps = 0usize;
+                        if rx.exec(&text, 0, &mut steps).is_some() {
+                            out.insert(k, v);
+                        }
+                    }
+                }
+                Value::Array(out)
             }
             "serialize" => {
                 let mut out = Vec::new();
