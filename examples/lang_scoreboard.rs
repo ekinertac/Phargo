@@ -29,8 +29,22 @@ struct Phpt {
     path: PathBuf,
 }
 
+thread_local! {
+    static PANIC_MSG: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
 fn run() {
-    panic::set_hook(Box::new(|_| {}));
+    panic::set_hook(Box::new(|info| {
+        let loc = info
+            .location()
+            .map(|l| {
+                let f = l.file();
+                let f = f.rsplit(['/', '\\']).next().unwrap_or(f);
+                format!("{}:{}", f, l.line())
+            })
+            .unwrap_or_default();
+        PANIC_MSG.with(|m| *m.borrow_mut() = format!("PANIC {loc}"));
+    }));
     let root = env!("CARGO_MANIFEST_DIR");
     let corpus_dir = Path::new(root).join("vendor").join("php-src");
     let curated_dir = Path::new(root).join("tests").join("phpt");
@@ -63,7 +77,8 @@ fn run() {
             Ok(false) => fail += 1,
             Err(msg) => {
                 fail += 1;
-                *errors.entry(normalize(&msg)).or_insert(0) += 1;
+                let key = if msg.starts_with("PANIC") { msg.clone() } else { normalize(&msg) };
+                *errors.entry(key).or_insert(0) += 1;
             }
         }
         if i % 4000 == 0 && i > 0 {
@@ -113,7 +128,10 @@ fn evaluate(t: &Phpt) -> Result<bool, String> {
     let out = match out {
         Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
         Ok(Err(msg)) => return Err(msg),
-        Err(_) => return Err("PANIC".to_string()),
+        Err(_) => return Err(PANIC_MSG.with(|m| {
+            let s = m.borrow().clone();
+            if s.is_empty() { "PANIC".to_string() } else { s }
+        })),
     };
     if let Some(e) = &t.expect {
         return Ok(out.trim_end() == e.trim_end());

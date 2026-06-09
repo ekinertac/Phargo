@@ -2285,8 +2285,10 @@ impl Eval {
                 let needle = to_bytes(&a(1));
                 if needle.is_empty() {
                     Value::Int(hay.len() as i64)
+                } else if needle.len() > hay.len() {
+                    Value::Bool(false)
                 } else {
-                    match (0..=hay.len().saturating_sub(needle.len()))
+                    match (0..=hay.len() - needle.len())
                         .rev()
                         .find(|&i| hay[i..i + needle.len()] == needle[..])
                     {
