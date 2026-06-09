@@ -540,6 +540,7 @@ pub fn run_with_path(source: &str, path: Option<PathBuf>) -> R<String> {
         included: HashSet::new(),
         enum_cases: HashMap::new(),
         bc_scale: 0,
+        exited: false,
     };
     // Bound the main run by the length captured now: `include`/`eval` append to
     // `src` during execution, and the top-level loop must not run into them.
@@ -584,6 +585,9 @@ struct Engine {
     included: HashSet<String>,
     /// Default scale for bcmath functions (set by `bcscale`).
     bc_scale: usize,
+    /// Set by `exit`/`die`: halts the whole script. Propagated up as `Flow::Return`
+    /// by the statement loops, and stops trailing raw-HTML output.
+    exited: bool,
 }
 
 /// A minimal exception/SPL class hierarchy, parsed before every script so that
@@ -1582,6 +1586,9 @@ impl Engine {
     /// `return` (which an included file may use).
     fn program_ranged(&mut self, end: usize) -> R<Flow> {
         while self.pos < end {
+            if self.exited {
+                break;
+            }
             if self.starts_with("<?php") {
                 self.pos += 5;
                 let f = self.php_body_ranged(end)?;
@@ -1621,6 +1628,9 @@ impl Engine {
                 return Ok(Flow::Normal);
             }
             let f = self.statement()?;
+            if self.exited {
+                return Ok(Flow::Return);
+            }
             if matches!(f, Flow::Return) {
                 return Ok(f);
             }
@@ -1680,11 +1690,16 @@ impl Engine {
 
     fn block_or_statement(&mut self) -> R<Flow> {
         self.skip_ws();
-        if self.peek() == Some('{') {
-            self.block()
+        let f = if self.peek() == Some('{') {
+            self.block()?
         } else {
-            self.statement()
+            self.statement()?
+        };
+        // `exit`/`die` in a braceless body: unwind via Return so enclosing loops stop.
+        if self.exited {
+            return Ok(Flow::Return);
         }
+        Ok(f)
     }
 
     fn block(&mut self) -> R<Flow> {
@@ -1699,6 +1714,10 @@ impl Engine {
                 None => return Err(EngineError("unterminated `{` block".into())),
                 _ => {
                     let f = self.statement()?;
+                    if self.exited {
+                        self.skip_to_block_end()?;
+                        return Ok(Flow::Return);
+                    }
                     if f != Flow::Normal {
                         self.skip_to_block_end()?;
                         return Ok(f);
@@ -2232,6 +2251,10 @@ impl Engine {
     /// Map a body statement's Flow inside a switch: Some(flow) exits the switch
     /// (consuming the rest of the block), None continues.
     fn switch_flow(&mut self, f: Flow) -> R<Option<Flow>> {
+        if self.exited {
+            self.skip_to_block_end()?;
+            return Ok(Some(Flow::Return));
+        }
         match f {
             Flow::Normal => Ok(None),
             Flow::Break(n) => {
@@ -3196,6 +3219,18 @@ impl Engine {
         }
         let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);
         let v = match name.to_ascii_lowercase().as_str() {
+            // `exit`/`die`: a string argument is printed; an integer is the exit
+            // status (no output). Either way the script halts (see `self.exited`).
+            "exit" | "die" => {
+                if let Some(a) = args.first() {
+                    if !matches!(a, Value::Int(_)) {
+                        let s = self.stringify(a)?;
+                        self.out.push_str(&s);
+                    }
+                }
+                self.exited = true;
+                Value::Null
+            }
             "var_dump" => {
                 let mut s = String::new();
                 for a in &args {
@@ -7572,6 +7607,12 @@ impl Engine {
                                 let r = self.call_function(&id, args)?;
                                 self.chain_access(r)
                             }
+                        } else if matches!(id.to_ascii_lowercase().as_str(), "exit" | "die") {
+                            // bare `exit` / `die` with no parens — halt the script
+                            if self.live {
+                                self.exited = true;
+                            }
+                            Ok(Value::Null)
                         } else {
                             self.pos = after;
                             if let Some(v) = self.magic_constant(&id) {
