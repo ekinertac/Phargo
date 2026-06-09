@@ -4,27 +4,27 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 1867 / 21862  (8.54% of the entire PHP test suite)**
+**`.phpt` pass rate: 1899 / 21862  (8.69% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 8.57%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 8.71%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 1867 | 19929 | 66 | 21862 |
+| 1899 | 19897 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 87/87 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 88/88 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 630 | 5329 | 11.8% |
-| `ext/standard` | 456 | 3877 | 11.8% |
-| `ext/opcache` | 308 | 916 | 33.6% |
+| `Zend` | 633 | 5329 | 11.9% |
+| `ext/standard` | 458 | 3877 | 11.8% |
+| `ext/opcache` | 311 | 916 | 34.0% |
 | `core` | 153 | 868 | 17.6% |
 | `ext/dom` | 7 | 868 | 0.8% |
 | `ext/spl` | 62 | 796 | 7.8% |
-| `ext/date` | 32 | 689 | 4.6% |
+| `ext/date` | 52 | 689 | 7.5% |
 | `ext/soap` | 0 | 593 | 0.0% |
 | `ext/phar` | 13 | 574 | 2.3% |
 | `ext/reflection` | 28 | 519 | 5.4% |
@@ -36,10 +36,10 @@ _Curated smoke tests (dev guards, **not** in the number above): 87/87 passing._
 | `ext/session` | 3 | 268 | 1.1% |
 | `ext/openssl` | 1 | 257 | 0.4% |
 | `ext/curl` | 0 | 175 | 0.0% |
-| `ext/bcmath` | 27 | 168 | 16.1% |
-| `ext/pcre` | 37 | 168 | 22.0% |
+| `ext/bcmath` | 29 | 168 | 17.3% |
+| `ext/pcre` | 38 | 168 | 22.6% |
 | `ext/pdo_mysql` | 0 | 167 | 0.0% |
-| `ext/zend_test` | 3 | 159 | 1.9% |
+| `ext/zend_test` | 4 | 159 | 2.5% |
 | `ext/zlib` | 6 | 157 | 3.8% |
 | `ext/simplexml` | 0 | 156 | 0.0% |
 | `sapi/fpm` | 0 | 141 | 0.0% |
