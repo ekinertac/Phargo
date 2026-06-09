@@ -4005,6 +4005,158 @@ impl Engine {
                 }
                 _ => Value::Array(PArray::default()),
             },
+            "array_diff_key" | "array_intersect_key" | "array_diff_assoc" => {
+                let lname = name.to_ascii_lowercase();
+                match arg(0) {
+                    Value::Array(a) => {
+                        let others: Vec<PArray> = args[1..]
+                            .iter()
+                            .filter_map(|v| match v {
+                                Value::Array(x) => Some(x.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        let mut r = PArray::default();
+                        for (k, v) in &a.entries {
+                            let keep = match lname.as_str() {
+                                "array_diff_key" => !others.iter().any(|o| o.get(k).is_some()),
+                                "array_intersect_key" => {
+                                    others.iter().all(|o| o.get(k).is_some())
+                                }
+                                _ => !others.iter().any(|o| {
+                                    o.get(k).map(|ov| loose_eq(ov, v)).unwrap_or(false)
+                                }),
+                            };
+                            if keep {
+                                r.set(k.clone(), v.clone());
+                            }
+                        }
+                        Value::Array(r)
+                    }
+                    _ => Value::Null,
+                }
+            }
+            "array_replace" => {
+                let mut r = match arg(0) {
+                    Value::Array(a) => a,
+                    _ => PArray::default(),
+                };
+                for v in &args[1..] {
+                    if let Value::Array(o) = v {
+                        for (k, val) in &o.entries {
+                            r.set(k.clone(), val.clone());
+                        }
+                    }
+                }
+                Value::Array(r)
+            }
+            "array_count_values" => match arg(0) {
+                Value::Array(a) => {
+                    let mut r = PArray::default();
+                    for (_, v) in &a.entries {
+                        let key = key_from_value(v);
+                        let cur = r.get(&key).map(|x| to_long(x)).unwrap_or(0);
+                        r.set(key, Value::Int(cur + 1));
+                    }
+                    Value::Array(r)
+                }
+                _ => Value::Null,
+            },
+            "array_find" => {
+                if let Value::Array(a) = arg(0) {
+                    let cb = arg(1);
+                    for (k, v) in a.entries {
+                        if to_bool(&self.call_callable(&cb, vec![v.clone(), akey_to_value(&k)])?) {
+                            return Ok(v);
+                        }
+                    }
+                }
+                Value::Null
+            }
+            "array_any" | "array_all" => {
+                let all = name.eq_ignore_ascii_case("array_all");
+                let mut result = all;
+                if let Value::Array(a) = arg(0) {
+                    let cb = arg(1);
+                    for (k, v) in a.entries {
+                        let t = to_bool(&self.call_callable(&cb, vec![v, akey_to_value(&k)])?);
+                        if all && !t {
+                            result = false;
+                            break;
+                        }
+                        if !all && t {
+                            result = true;
+                            break;
+                        }
+                    }
+                }
+                Value::Bool(result)
+            }
+            "array_walk_recursive" => {
+                let cb = arg(1);
+                let extra = arg(2);
+                fn walk(
+                    eng: &mut Engine,
+                    a: PArray,
+                    cb: &Value,
+                    extra: &Value,
+                ) -> R<()> {
+                    for (k, v) in a.entries {
+                        if let Value::Array(sub) = v {
+                            walk(eng, sub, cb, extra)?;
+                        } else {
+                            let mut callargs = vec![v, akey_to_value(&k)];
+                            if !matches!(extra, Value::Null) {
+                                callargs.push(extra.clone());
+                            }
+                            eng.call_callable(cb, callargs)?;
+                        }
+                    }
+                    Ok(())
+                }
+                if let Value::Array(a) = arg(0) {
+                    walk(self, a, &cb, &extra)?;
+                }
+                Value::Bool(true)
+            }
+            "str_getcsv" => {
+                let line = arg(0).to_php_string();
+                let delim = arg(1)
+                    .to_php_string()
+                    .chars()
+                    .next()
+                    .unwrap_or(',');
+                let line = line.trim_end_matches(['\n', '\r']);
+                let mut fields = PArray::default();
+                let mut cur = String::new();
+                let mut in_q = false;
+                let chars: Vec<char> = line.chars().collect();
+                let mut i = 0;
+                while i < chars.len() {
+                    let c = chars[i];
+                    if in_q {
+                        if c == '"' {
+                            if chars.get(i + 1) == Some(&'"') {
+                                cur.push('"');
+                                i += 1;
+                            } else {
+                                in_q = false;
+                            }
+                        } else {
+                            cur.push(c);
+                        }
+                    } else if c == '"' {
+                        in_q = true;
+                    } else if c == delim {
+                        fields.push(Value::Str(std::mem::take(&mut cur)));
+                    } else {
+                        cur.push(c);
+                    }
+                    i += 1;
+                }
+                fields.push(Value::Str(cur));
+                Value::Array(fields)
+            }
             "array_reverse" => match arg(0) {
                 Value::Array(a) => {
                     let mut r = PArray::default();
@@ -6017,6 +6169,49 @@ impl Engine {
                     v
                 }
             }
+            "array_splice" => {
+                let vals: Vec<Value> = arr.entries.iter().map(|(_, v)| v.clone()).collect();
+                let n = vals.len() as i64;
+                let mut offset = rest.first().map(to_long).unwrap_or(0);
+                if offset < 0 {
+                    offset = (n + offset).max(0);
+                }
+                let offset = offset.min(n) as usize;
+                let length = match rest.get(1) {
+                    Some(v) if !matches!(v, Value::Null) => {
+                        let l = to_long(v);
+                        if l < 0 {
+                            ((n + l) - offset as i64).max(0) as usize
+                        } else {
+                            l as usize
+                        }
+                    }
+                    _ => vals.len() - offset,
+                };
+                let end = (offset + length).min(vals.len());
+                let removed: Vec<Value> = vals[offset..end].to_vec();
+                let replacement: Vec<Value> = match rest.get(2) {
+                    Some(Value::Array(a)) => a.entries.iter().map(|(_, v)| v.clone()).collect(),
+                    Some(v) if !matches!(v, Value::Null) => vec![v.clone()],
+                    _ => Vec::new(),
+                };
+                let mut na = PArray::default();
+                for v in &vals[..offset] {
+                    na.push(v.clone());
+                }
+                for v in replacement {
+                    na.push(v);
+                }
+                for v in &vals[end..] {
+                    na.push(v.clone());
+                }
+                arr = na;
+                let mut r = PArray::default();
+                for v in removed {
+                    r.push(v);
+                }
+                Value::Array(r)
+            }
             "array_unshift" => {
                 let old = std::mem::take(&mut arr.entries);
                 let mut na = PArray::default();
@@ -8002,6 +8197,7 @@ fn is_byref_builtin(name: &str) -> bool {
             | "array_pop"
             | "array_shift"
             | "array_unshift"
+            | "array_splice"
     )
 }
 
