@@ -4042,6 +4042,10 @@ fn var_dump_seen(v: &Value, indent: usize, out: &mut String, seen: &mut Vec<usiz
 }
 
 fn var_export(v: &Value, indent: usize, out: &mut String) {
+    var_export_seen(v, indent, out, &mut Vec::new());
+}
+
+fn var_export_seen(v: &Value, indent: usize, out: &mut String, seen: &mut Vec<usize>) {
     if indent > 256 {
         out.push_str("NULL");
         return;
@@ -4082,22 +4086,29 @@ fn var_export(v: &Value, indent: usize, out: &mut String) {
                     out.push_str(&pad);
                     out.push_str("  ");
                 }
-                var_export(val, indent + 1, out);
+                var_export_seen(val, indent + 1, out, seen);
                 out.push_str(",\n");
             }
             out.push_str(&pad);
             out.push(')');
         }
         Value::Object(rc) => {
+            let id = Rc::as_ptr(rc) as *const () as usize;
+            if seen.contains(&id) {
+                out.push_str("NULL"); // cycle — PHP errors; we just stop
+                return;
+            }
+            seen.push(id);
             let o = rc.borrow();
             out.push_str(&format!("\\{}::__set_state(array(\n", o.class));
             let pad = "  ".repeat(indent);
             for (name, val) in &o.props {
                 out.push_str(&format!("{pad}   '{name}' => "));
-                var_export(val, indent + 1, out);
+                var_export_seen(val, indent + 1, out, seen);
                 out.push_str(",\n");
             }
             out.push_str(&format!("{pad})"));
+            seen.pop();
         }
         Value::Closure(_) => out.push_str("NULL"),
     }
