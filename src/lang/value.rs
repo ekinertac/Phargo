@@ -376,12 +376,21 @@ fn reformat_exp(x: f64) -> String {
 // ---- comparison & equality --------------------------------------------
 
 pub fn loose_eq(a: &Value, b: &Value) -> bool {
+    loose_eq_d(a, b, 0)
+}
+
+/// `depth` guards against cyclic object graphs (`$a->x = $a; $a == $b`) recursing
+/// without bound — PHP throws "Nesting level too deep" there; we just stop.
+fn loose_eq_d(a: &Value, b: &Value, depth: usize) -> bool {
     use Value::*;
+    if depth > 256 {
+        return false;
+    }
     match (a, b) {
         (Null, Null) => true,
         (Bool(_), _) | (_, Bool(_)) => to_bool(a) == to_bool(b),
         (Null, _) => !to_bool(b) && matches!(b, Null | Bool(false)) || is_nullish(b),
-        (_, Null) => loose_eq(b, a),
+        (_, Null) => loose_eq_d(b, a, depth),
         (Int(_) | Float(_), Int(_) | Float(_)) => to_f64(a) == to_f64(b),
         (Str(x), Str(y)) => {
             if is_numeric_str(x) && is_numeric_str(y) {
@@ -398,7 +407,7 @@ pub fn loose_eq(a: &Value, b: &Value) -> bool {
                 to_bytes(a) == to_bytes(b)
             }
         }
-        (Array(x), Array(y)) => array_loose_eq(x, y),
+        (Array(x), Array(y)) => array_loose_eq(x, y, depth),
         (Object(x), Object(y)) => {
             // same instance, or same class with loosely-equal properties
             if Rc::ptr_eq(x, y) {
@@ -408,7 +417,7 @@ pub fn loose_eq(a: &Value, b: &Value) -> bool {
             x.class == y.class
                 && x.props.len() == y.props.len()
                 && x.props.iter().all(|(k, v)| {
-                    y.get(k).map(|w| loose_eq(v, w)).unwrap_or(false)
+                    y.get(k).map(|w| loose_eq_d(v, w, depth + 1)).unwrap_or(false)
                 })
         }
         _ => false,
@@ -419,13 +428,13 @@ fn is_nullish(v: &Value) -> bool {
     matches!(v, Value::Null)
 }
 
-fn array_loose_eq(x: &Arr, y: &Arr) -> bool {
-    if x.len() != y.len() {
-        return false;
+fn array_loose_eq(x: &Arr, y: &Arr, depth: usize) -> bool {
+    if depth > 256 || x.len() != y.len() {
+        return depth <= 256 && x.len() == y.len();
     }
     for (k, v) in &x.entries {
         match y.get(k) {
-            Some(w) if loose_eq(v, w) => {}
+            Some(w) if loose_eq_d(v, w, depth + 1) => {}
             _ => return false,
         }
     }

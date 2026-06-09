@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     std::thread::Builder::new()
-        .stack_size(256 * 1024 * 1024)
+        .stack_size(1024 * 1024 * 1024)
         .spawn(run)
         .unwrap()
         .join()
