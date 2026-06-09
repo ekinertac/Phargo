@@ -1865,6 +1865,16 @@ impl Eval {
                 }
                 Value::Null
             }
+            "var_export" => {
+                let mut s = String::new();
+                var_export(&a(0), 0, &mut s);
+                if to_bool(&a(1)) {
+                    Value::Str(s.into_bytes())
+                } else {
+                    self.out.extend_from_slice(s.as_bytes());
+                    Value::Null
+                }
+            }
             "print_r" => {
                 let mut s = String::new();
                 print_r(&a(0), 0, &mut s);
@@ -2518,6 +2528,57 @@ impl Eval {
                     Value::Str(format!("0.00000000 {}", crate::now_unix()).into_bytes())
                 }
             }
+            "serialize" => {
+                let mut out = Vec::new();
+                php_serialize(&a(0), &mut out, 0);
+                Value::Str(out)
+            }
+            "unserialize" => {
+                let bytes = to_bytes(&a(0));
+                let mut pos = 0;
+                php_unserialize(&bytes, &mut pos, 0).unwrap_or(Value::Bool(false))
+            }
+            "filter_var" => {
+                let v = a(0);
+                let filter = if args.len() > 1 { to_i64(&a(1)) } else { 516 };
+                match filter {
+                    257 => match String::from_utf8_lossy(&to_bytes(&v)).trim().parse::<i64>() {
+                        Ok(n) => Value::Int(n),
+                        Err(_) => Value::Bool(false),
+                    },
+                    259 => match String::from_utf8_lossy(&to_bytes(&v)).trim().parse::<f64>() {
+                        Ok(n) => Value::Float(n),
+                        Err(_) => Value::Bool(false),
+                    },
+                    258 => {
+                        let s = String::from_utf8_lossy(&to_bytes(&v)).trim().to_ascii_lowercase();
+                        match s.as_str() {
+                            "1" | "true" | "on" | "yes" => Value::Bool(true),
+                            "0" | "false" | "off" | "no" | "" => Value::Bool(false),
+                            _ => Value::Null,
+                        }
+                    }
+                    274 => {
+                        // FILTER_VALIDATE_EMAIL — rough check
+                        let s = String::from_utf8_lossy(&to_bytes(&v)).into_owned();
+                        if s.contains('@') && s.contains('.') && !s.contains(' ') {
+                            Value::Str(s.into_bytes())
+                        } else {
+                            Value::Bool(false)
+                        }
+                    }
+                    273 => {
+                        // FILTER_VALIDATE_URL
+                        let s = String::from_utf8_lossy(&to_bytes(&v)).into_owned();
+                        if s.contains("://") {
+                            Value::Str(s.into_bytes())
+                        } else {
+                            Value::Bool(false)
+                        }
+                    }
+                    _ => Value::Str(to_bytes(&v)),
+                }
+            }
             "ctype_digit" => {
                 let s = to_bytes(&a(0));
                 Value::Bool(!s.is_empty() && s.iter().all(|b| b.is_ascii_digit()))
@@ -3169,6 +3230,68 @@ fn var_dump_seen(v: &Value, indent: usize, out: &mut String, seen: &mut Vec<usiz
     }
 }
 
+fn var_export(v: &Value, indent: usize, out: &mut String) {
+    if indent > 256 {
+        out.push_str("NULL");
+        return;
+    }
+    match v {
+        Value::Null => out.push_str("NULL"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Int(n) => out.push_str(&n.to_string()),
+        Value::Float(f) => {
+            let s = format_float(*f);
+            out.push_str(&s);
+            if !s.contains('.') && !s.contains('E') && !s.contains('N') && !s.contains('I') {
+                out.push_str(".0");
+            }
+        }
+        Value::Str(s) => {
+            out.push('\'');
+            for &b in s.iter() {
+                if b == b'\'' || b == b'\\' {
+                    out.push('\\');
+                }
+                out.push(b as char);
+            }
+            out.push('\'');
+        }
+        Value::Array(a) => {
+            let pad = "  ".repeat(indent);
+            out.push_str("array (\n");
+            for (k, val) in &a.entries {
+                out.push_str(&pad);
+                out.push_str("  ");
+                match k {
+                    Key::Int(n) => out.push_str(&format!("{n} => ")),
+                    Key::Str(s) => out.push_str(&format!("'{}' => ", String::from_utf8_lossy(s))),
+                }
+                if matches!(val, Value::Array(_)) {
+                    out.push('\n');
+                    out.push_str(&pad);
+                    out.push_str("  ");
+                }
+                var_export(val, indent + 1, out);
+                out.push_str(",\n");
+            }
+            out.push_str(&pad);
+            out.push(')');
+        }
+        Value::Object(rc) => {
+            let o = rc.borrow();
+            out.push_str(&format!("\\{}::__set_state(array(\n", o.class));
+            let pad = "  ".repeat(indent);
+            for (name, val) in &o.props {
+                out.push_str(&format!("{pad}   '{name}' => "));
+                var_export(val, indent + 1, out);
+                out.push_str(",\n");
+            }
+            out.push_str(&format!("{pad})"));
+        }
+        Value::Closure(_) => out.push_str("NULL"),
+    }
+}
+
 fn print_r(v: &Value, indent: usize, out: &mut String) {
     if indent > 256 {
         out.push_str("*MAX DEPTH*");
@@ -3331,8 +3454,184 @@ fn php_const(n: &str) -> Option<Value> {
         "PHP_ROUND_HALF_EVEN" => Int(3),
         "PHP_ROUND_HALF_ODD" => Int(4),
         "ENT_SUBSTITUTE" => Int(8),
+        // filter
+        "FILTER_DEFAULT" | "FILTER_UNSAFE_RAW" => Int(516),
+        "FILTER_VALIDATE_INT" => Int(257),
+        "FILTER_VALIDATE_BOOLEAN" | "FILTER_VALIDATE_BOOL" => Int(258),
+        "FILTER_VALIDATE_FLOAT" => Int(259),
+        "FILTER_VALIDATE_REGEXP" => Int(272),
+        "FILTER_VALIDATE_URL" => Int(273),
+        "FILTER_VALIDATE_EMAIL" => Int(274),
+        "FILTER_VALIDATE_IP" => Int(275),
+        "FILTER_SANITIZE_STRING" => Int(513),
+        "FILTER_SANITIZE_NUMBER_INT" => Int(519),
+        "FILTER_SANITIZE_EMAIL" => Int(517),
+        "FILTER_SANITIZE_URL" => Int(518),
+        "FILTER_FLAG_ALLOW_THOUSAND" => Int(8192),
+        "FILTER_NULL_ON_FAILURE" => Int(134217728),
+        "FILTER_REQUIRE_SCALAR" => Int(33554432),
+        "FILTER_REQUIRE_ARRAY" => Int(16777216),
+        "FILTER_FORCE_ARRAY" => Int(67108864),
         _ => return None,
     })
+}
+
+// ---- serialize / unserialize (byte-based, for the v2 Value) -------------
+fn php_serialize(v: &Value, out: &mut Vec<u8>, depth: usize) {
+    if depth > 256 {
+        out.extend_from_slice(b"N;");
+        return;
+    }
+    match v {
+        Value::Null => out.extend_from_slice(b"N;"),
+        Value::Bool(b) => out.extend_from_slice(if *b { b"b:1;" } else { b"b:0;" }),
+        Value::Int(n) => out.extend_from_slice(format!("i:{n};").as_bytes()),
+        Value::Float(f) => out.extend_from_slice(format!("d:{};", ser_float(*f)).as_bytes()),
+        Value::Str(s) => {
+            out.extend_from_slice(format!("s:{}:\"", s.len()).as_bytes());
+            out.extend_from_slice(s);
+            out.extend_from_slice(b"\";");
+        }
+        Value::Array(a) => {
+            out.extend_from_slice(format!("a:{}:{{", a.len()).as_bytes());
+            for (k, val) in &a.entries {
+                match k {
+                    Key::Int(n) => out.extend_from_slice(format!("i:{n};").as_bytes()),
+                    Key::Str(s) => {
+                        out.extend_from_slice(format!("s:{}:\"", s.len()).as_bytes());
+                        out.extend_from_slice(s);
+                        out.extend_from_slice(b"\";");
+                    }
+                }
+                php_serialize(val, out, depth + 1);
+            }
+            out.push(b'}');
+        }
+        Value::Object(rc) => {
+            let o = rc.borrow();
+            out.extend_from_slice(
+                format!("O:{}:\"{}\":{}:{{", o.class.len(), o.class, o.props.len()).as_bytes(),
+            );
+            for (name, val) in &o.props {
+                out.extend_from_slice(format!("s:{}:\"{}\";", name.len(), name).as_bytes());
+                php_serialize(val, out, depth + 1);
+            }
+            out.push(b'}');
+        }
+        Value::Closure(_) => out.extend_from_slice(b"N;"),
+    }
+}
+
+fn ser_float(f: f64) -> String {
+    if f.is_nan() {
+        "NAN".into()
+    } else if f.is_infinite() {
+        if f < 0.0 { "-INF".into() } else { "INF".into() }
+    } else {
+        format!("{f}") // Rust's default is shortest round-trip
+    }
+}
+
+fn unser_read_until(b: &[u8], pos: &mut usize, end: u8) -> Vec<u8> {
+    let start = *pos;
+    while *pos < b.len() && b[*pos] != end {
+        *pos += 1;
+    }
+    let r = b[start..*pos].to_vec();
+    if *pos < b.len() {
+        *pos += 1; // consume end
+    }
+    r
+}
+
+fn php_unserialize(b: &[u8], pos: &mut usize, depth: usize) -> Option<Value> {
+    if depth > 256 || *pos >= b.len() {
+        return None;
+    }
+    let t = b[*pos];
+    match t {
+        b'N' => {
+            *pos += 2; // N;
+            Some(Value::Null)
+        }
+        b'b' => {
+            *pos += 2; // b:
+            let v = b.get(*pos)? == &b'1';
+            *pos += 2; // X;
+            Some(Value::Bool(v))
+        }
+        b'i' => {
+            *pos += 2; // i:
+            let s = unser_read_until(b, pos, b';');
+            std::str::from_utf8(&s).ok()?.trim().parse::<i64>().ok().map(Value::Int)
+        }
+        b'd' => {
+            *pos += 2; // d:
+            let s = unser_read_until(b, pos, b';');
+            let t = std::str::from_utf8(&s).ok()?.trim();
+            let v = match t {
+                "INF" => f64::INFINITY,
+                "-INF" => f64::NEG_INFINITY,
+                "NAN" => f64::NAN,
+                _ => t.parse().ok()?,
+            };
+            Some(Value::Float(v))
+        }
+        b's' => {
+            *pos += 2; // s:
+            let len: usize = std::str::from_utf8(&unser_read_until(b, pos, b':')).ok()?.parse().ok()?;
+            if b.get(*pos)? != &b'"' {
+                return None;
+            }
+            *pos += 1; // "
+            if *pos + len > b.len() {
+                return None;
+            }
+            let bytes = b[*pos..*pos + len].to_vec();
+            *pos += len;
+            *pos += 2; // ";
+            Some(Value::Str(bytes))
+        }
+        b'a' => {
+            *pos += 2; // a:
+            let n: usize = std::str::from_utf8(&unser_read_until(b, pos, b':')).ok()?.parse().ok()?;
+            if b.get(*pos)? != &b'{' {
+                return None;
+            }
+            *pos += 1; // {
+            let mut arr = Arr::new();
+            for _ in 0..n {
+                let k = php_unserialize(b, pos, depth + 1)?;
+                let v = php_unserialize(b, pos, depth + 1)?;
+                arr.insert(Arr::norm_key(&k), v);
+            }
+            *pos += 1; // }
+            Some(Value::Array(arr))
+        }
+        b'O' => {
+            *pos += 2; // O:
+            let clen: usize = std::str::from_utf8(&unser_read_until(b, pos, b':')).ok()?.parse().ok()?;
+            *pos += 1; // "
+            let class = String::from_utf8_lossy(&b[*pos..*pos + clen]).into_owned();
+            *pos += clen;
+            *pos += 2; // ":
+            let n: usize = std::str::from_utf8(&unser_read_until(b, pos, b':')).ok()?.parse().ok()?;
+            if b.get(*pos)? != &b'{' {
+                return None;
+            }
+            *pos += 1; // {
+            let obj = Rc::new(RefCell::new(Obj { class, props: Vec::new() }));
+            for _ in 0..n {
+                let k = php_unserialize(b, pos, depth + 1)?;
+                let v = php_unserialize(b, pos, depth + 1)?;
+                let name = String::from_utf8_lossy(&to_bytes(&k)).into_owned();
+                obj.borrow_mut().set(&name, v);
+            }
+            *pos += 1; // }
+            Some(Value::Object(obj))
+        }
+        _ => None,
+    }
 }
 
 fn string_char(s: &[u8], k: &Key) -> Value {
