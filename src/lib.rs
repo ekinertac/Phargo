@@ -50,6 +50,8 @@ struct Param {
     /// Constructor property promotion: a leading `public`/`private`/`protected`
     /// (and/or `readonly`) modifier means the arg is also stored on `$this`.
     promoted: bool,
+    /// Variadic (`...$rest`): collects all remaining arguments into an array.
+    variadic: bool,
 }
 
 /// An anonymous function / arrow function. `captures` snapshots the outer
@@ -735,6 +737,50 @@ class DateTimeImmutable implements DateTimeInterface {
     public function format($fmt) { return date($fmt, $this->__ts); }
     public function getTimestamp() { return $this->__ts; }
 }
+class ReflectionClass {
+    public $name;
+    public function __construct($arg) { $this->name = is_object($arg) ? get_class($arg) : $arg; }
+    public function getName() { return $this->name; }
+    public function getShortName() { $p = strrpos($this->name, "\\"); return $p === false ? $this->name : substr($this->name, $p + 1); }
+    public function getParentClass() { $p = get_parent_class($this->name); return $p === false ? false : new ReflectionClass($p); }
+    public function hasMethod($m) { return method_exists($this->name, $m); }
+    public function hasProperty($p) { return property_exists($this->name, $p); }
+    public function getMethod($m) { return new ReflectionMethod($this->name, $m); }
+    public function getProperty($p) { return new ReflectionProperty($this->name, $p); }
+    public function getMethods() { $r = []; foreach (get_class_methods($this->name) as $m) { $r[] = new ReflectionMethod($this->name, $m); } return $r; }
+    public function getInterfaceNames() { return array_values(class_implements($this->name)); }
+    public function implementsInterface($i) { $n = strtolower($i); foreach (class_implements($this->name) as $x) { if (strtolower($x) === $n) { return true; } } return false; }
+    public function isSubclassOf($c) { return is_subclass_of($this->name, $c); }
+    public function isInstance($obj) { return is_a($obj, $this->name); }
+    public function newInstance(...$args) { $n = $this->name; return new $n(...$args); }
+    public function newInstanceArgs($args = []) { $n = $this->name; return new $n(...$args); }
+    public function newInstanceWithoutConstructor() { $n = $this->name; return new $n(); }
+}
+class ReflectionObject extends ReflectionClass {}
+class ReflectionMethod {
+    public $class; public $name;
+    public function __construct($c, $m = null) { if ($m === null) { $parts = explode("::", $c); $c = $parts[0]; $m = $parts[1]; } $this->class = is_object($c) ? get_class($c) : $c; $this->name = $m; }
+    public function getName() { return $this->name; }
+    public function getDeclaringClass() { return new ReflectionClass($this->class); }
+    public function invoke($obj, ...$args) { $n = $this->name; return $obj->$n(...$args); }
+    public function invokeArgs($obj, $args = []) { $n = $this->name; return $obj->$n(...$args); }
+}
+class ReflectionProperty {
+    public $class; public $name;
+    public function __construct($c, $n) { $this->class = is_object($c) ? get_class($c) : $c; $this->name = $n; }
+    public function getName() { return $this->name; }
+    public function getValue($obj = null) { $n = $this->name; return $obj->$n; }
+    public function setValue($obj, $v) { $n = $this->name; $obj->$n = $v; }
+    public function setAccessible($a) {}
+}
+class ReflectionFunction {
+    public $name;
+    public function __construct($n) { $this->name = $n; }
+    public function getName() { return $this->name; }
+    public function invoke(...$args) { return call_user_func_array($this->name, $args); }
+    public function invokeArgs($args = []) { return call_user_func_array($this->name, $args); }
+}
+class ReflectionException extends Exception {}
 ?>
 "##;
 
@@ -2160,7 +2206,15 @@ impl Engine {
                 let s2 = self.pos;
                 self.pos += 2;
                 self.skip_ws();
-                if let Some(prop) = self.try_identifier() {
+                // member name: bare identifier, `$var`, or `{expr}`
+                let prop_opt = if matches!(self.peek(), Some(c) if c.is_ascii_alphabetic() || c == '_') {
+                    self.try_identifier()
+                } else if matches!(self.peek(), Some('$') | Some('{')) {
+                    Some(self.parse_member_name()?)
+                } else {
+                    None
+                };
+                if let Some(prop) = prop_opt {
                     // optional index chain on the property
                     let mut pindices: Vec<Option<Value>> = Vec::new();
                     loop {
@@ -2786,7 +2840,31 @@ impl Engine {
             return Ok(args);
         }
         loop {
-            args.push(self.expression()?);
+            self.skip_ws();
+            // named-argument syntax `name: value` — drop the label, keep the value
+            if matches!(self.peek(), Some(c) if c.is_ascii_alphabetic() || c == '_') {
+                let save = self.pos;
+                let _ = self.try_identifier();
+                self.skip_ws();
+                if self.peek() == Some(':') && self.peek_at(1) != Some(':') {
+                    self.pos += 1;
+                    self.skip_ws();
+                } else {
+                    self.pos = save;
+                }
+            }
+            // argument unpacking: `...$arr`
+            if self.starts_with("...") {
+                self.pos += 3;
+                let spread = self.expression()?;
+                if let Value::Array(a) = spread {
+                    for (_, v) in a.entries {
+                        args.push(v);
+                    }
+                }
+            } else {
+                args.push(self.expression()?);
+            }
             self.skip_ws();
             match self.peek() {
                 Some(',') => {
@@ -3194,8 +3272,17 @@ impl Engine {
             }
             "array_fill" => {
                 let start = to_long(&arg(0));
-                let count = to_long(&arg(1)).clamp(0, 10_000_000);
+                let count = to_long(&arg(1)).max(0);
                 let val = arg(2);
+                // Cap total elements (count * per-element weight) to avoid OOM when
+                // filling a large array with a large array value.
+                let weight = match &val {
+                    Value::Array(a) => a.entries.len().max(1) as i64,
+                    _ => 1,
+                };
+                if count.saturating_mul(weight) > 20_000_000 {
+                    return Err(EngineError("array_fill(): requested array is too large".into()));
+                }
                 let mut r = PArray::default();
                 for i in 0..count {
                     r.set(AKey::Int(start + i), val.clone());
@@ -4269,6 +4356,143 @@ impl Engine {
                 Value::Array(r)
             }
             "extension_loaded" => Value::Bool(false),
+            // ---- class introspection -----------------------------------------
+            "get_class" => match arg(0) {
+                Value::Object(o) => Value::Str(o.borrow().class.clone()),
+                Value::Null => match &self.current_class {
+                    Some(c) => Value::Str(c.clone()),
+                    None => Value::Bool(false),
+                },
+                _ => Value::Bool(false),
+            },
+            "get_called_class" => match &self.current_class {
+                Some(c) => Value::Str(c.clone()),
+                None => Value::Bool(false),
+            },
+            "get_parent_class" => {
+                let cls = self.class_name_arg(&arg(0));
+                match cls.and_then(|c| {
+                    self.classes
+                        .get(&c.to_ascii_lowercase())
+                        .and_then(|d| d.parent.clone())
+                }) {
+                    Some(p) => Value::Str(p),
+                    None => Value::Bool(false),
+                }
+            }
+            "get_object_vars" => match arg(0) {
+                Value::Object(o) => {
+                    let mut r = PArray::default();
+                    for (n, v) in &o.borrow().props {
+                        if !n.starts_with("__") {
+                            r.set(AKey::Str(n.clone()), v.clone());
+                        }
+                    }
+                    Value::Array(r)
+                }
+                _ => Value::Bool(false),
+            },
+            "get_class_methods" => match self.class_name_arg(&arg(0)) {
+                Some(c) => {
+                    let mut r = PArray::default();
+                    let mut seen: Vec<String> = Vec::new();
+                    for cn in self.class_chain(&c) {
+                        if let Some(cd) = self.classes.get(&cn) {
+                            for m in cd.methods.keys() {
+                                if !seen.contains(m) {
+                                    seen.push(m.clone());
+                                    r.push(Value::Str(m.clone()));
+                                }
+                            }
+                        }
+                    }
+                    Value::Array(r)
+                }
+                None => Value::Bool(false),
+            },
+            "method_exists" => {
+                let cls = self.class_name_arg(&arg(0));
+                match cls {
+                    Some(c) => Value::Bool(
+                        self.lookup_method(&c, &arg(1).to_php_string()).is_some(),
+                    ),
+                    None => Value::Bool(false),
+                }
+            }
+            "property_exists" => {
+                let cls = self.class_name_arg(&arg(0));
+                let prop = arg(1).to_php_string();
+                let on_obj = matches!(&arg(0), Value::Object(o) if o.borrow().get(&prop).is_some());
+                let on_class = cls
+                    .map(|c| {
+                        self.class_chain(&c).iter().any(|cn| {
+                            self.classes
+                                .get(cn)
+                                .map(|d| d.props.iter().any(|(n, _)| n == &prop))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+                Value::Bool(on_obj || on_class)
+            }
+            "is_a" | "is_subclass_of" => {
+                let allow_string = name.eq_ignore_ascii_case("is_subclass_of")
+                    || args.get(2).map(to_bool).unwrap_or(false);
+                let cls = match &arg(0) {
+                    Value::Object(o) => Some(o.borrow().class.clone()),
+                    Value::Str(s) if allow_string => Some(s.clone()),
+                    _ => None,
+                };
+                let target = arg(1).to_php_string();
+                match cls {
+                    Some(c) => {
+                        let is = self.is_instance(&c, &target);
+                        if name.eq_ignore_ascii_case("is_subclass_of") {
+                            Value::Bool(is && !c.eq_ignore_ascii_case(&target))
+                        } else {
+                            Value::Bool(is)
+                        }
+                    }
+                    None => Value::Bool(false),
+                }
+            }
+            "class_parents" => match self.class_name_arg(&arg(0)) {
+                Some(c) => {
+                    let mut r = PArray::default();
+                    let mut cur = Some(c);
+                    let mut guard = 0;
+                    while let Some(cn) = cur {
+                        guard += 1;
+                        if guard > 1000 {
+                            break;
+                        }
+                        let parent = self
+                            .classes
+                            .get(&cn.to_ascii_lowercase())
+                            .and_then(|d| d.parent.clone());
+                        match parent {
+                            Some(p) => {
+                                r.set(AKey::Str(p.clone()), Value::Str(p.clone()));
+                                cur = Some(p);
+                            }
+                            None => break,
+                        }
+                    }
+                    Value::Array(r)
+                }
+                None => Value::Bool(false),
+            },
+            "class_implements" => match self.class_name_arg(&arg(0)) {
+                Some(c) => {
+                    let mut r = PArray::default();
+                    for i in self.all_interfaces(&c) {
+                        r.set(AKey::Str(i.clone()), Value::Str(i));
+                    }
+                    Value::Array(r)
+                }
+                None => Value::Bool(false),
+            },
+            "class_uses" => Value::Array(PArray::default()), // trait provenance not tracked post-merge
             // ---- date / time -------------------------------------------------
             "time" => Value::Int(now_unix()),
             "date" | "gmdate" => {
@@ -4870,8 +5094,10 @@ impl Engine {
                 self.pos += 1; // by-reference — treated as by-value for now
                 self.skip_ws();
             }
+            let mut variadic = false;
             if self.starts_with("...") {
-                self.pos += 3; // variadic — treated as a single param for now
+                self.pos += 3;
+                variadic = true;
                 self.skip_ws();
             }
             if self.peek() != Some('$') {
@@ -4893,6 +5119,7 @@ impl Engine {
                 name: pname,
                 default,
                 promoted,
+                variadic,
             });
             self.skip_ws();
             match self.peek() {
@@ -5247,6 +5474,14 @@ impl Engine {
         let saved_pos = self.pos;
         let mut bound: Vec<(String, Value)> = Vec::with_capacity(func.params.len());
         for (i, p) in func.params.iter().enumerate() {
+            if p.variadic {
+                let mut rest = PArray::default();
+                for a in args.iter().skip(i) {
+                    rest.push(a.clone());
+                }
+                bound.push((p.name.clone(), Value::Array(rest)));
+                break;
+            }
             let v = if let Some(a) = args.get(i) {
                 a.clone()
             } else if let Some(dstart) = p.default {
@@ -5315,6 +5550,51 @@ impl Engine {
             cur = cd.parent.as_ref().map(|p| p.to_ascii_lowercase());
         }
         None
+    }
+
+    /// The class → parent → grandparent chain (lowercased names), cycle-guarded.
+    fn class_chain(&self, class: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = Some(class.to_ascii_lowercase());
+        while let Some(cn) = cur {
+            if out.contains(&cn) || out.len() > 1000 {
+                break;
+            }
+            out.push(cn.clone());
+            cur = self
+                .classes
+                .get(&cn)
+                .and_then(|d| d.parent.as_ref().map(|p| p.to_ascii_lowercase()));
+        }
+        out
+    }
+
+    /// All interface names a class (and its parents) implement, transitively.
+    fn all_interfaces(&self, class: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut queue: Vec<String> = self.class_chain(class);
+        while let Some(cn) = queue.pop() {
+            if let Some(cd) = self.classes.get(&cn) {
+                for i in &cd.interfaces {
+                    let il = i.to_ascii_lowercase();
+                    if !out.contains(&il) {
+                        out.push(il.clone());
+                        queue.push(il); // interface may extend other interfaces
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolve a value (object or class-name string) to a class name.
+    fn class_name_arg(&self, v: &Value) -> Option<String> {
+        match v {
+            Value::Object(o) => Some(o.borrow().class.clone()),
+            Value::Str(s) => Some(s.clone()),
+            Value::Null => self.current_class.clone(),
+            _ => None,
+        }
     }
 
     /// `new Class(args)` → allocate, set property defaults, run `__construct`.
@@ -5751,10 +6031,7 @@ impl Engine {
                     val = Value::Null;
                     continue;
                 }
-                self.skip_ws();
-                let member = self
-                    .try_identifier()
-                    .ok_or_else(|| EngineError("expected name after `->`".into()))?;
+                let member = self.parse_member_name()?;
                 self.skip_ws();
                 if self.peek() == Some('(') {
                     let args = self.parse_args()?;
@@ -5813,6 +6090,14 @@ impl Engine {
         let saved_pos = self.pos;
         let mut bound: Vec<(String, Value)> = Vec::with_capacity(c.params.len());
         for (i, p) in c.params.iter().enumerate() {
+            if p.variadic {
+                let mut rest = PArray::default();
+                for a in args.iter().skip(i) {
+                    rest.push(a.clone());
+                }
+                bound.push((p.name.clone(), Value::Array(rest)));
+                break;
+            }
             let v = if let Some(a) = args.get(i) {
                 a.clone()
             } else if let Some(d) = p.default {
@@ -6403,19 +6688,47 @@ impl Engine {
                     "match" => self.match_expression(),
                     "new" => {
                         self.skip_ws();
-                        if self.peek() == Some('\\') {
-                            self.pos += 1;
-                        }
-                        let cname = self
-                            .try_identifier()
-                            .ok_or_else(|| EngineError("expected class name after `new`".into()))?;
+                        // dynamic instantiation: `new $var(...)` (var holds a class
+                        // name string or an object whose class is used)
+                        let cname = if self.peek() == Some('$') {
+                            let vn = self.parse_variable_name()?;
+                            match self.vars.get(&vn) {
+                                Some(Value::Object(o)) => o.borrow().class.clone(),
+                                Some(v) => v.to_php_string(),
+                                None => String::new(),
+                            }
+                        } else {
+                            if self.peek() == Some('\\') {
+                                self.pos += 1;
+                            }
+                            let id = self
+                                .try_identifier()
+                                .ok_or_else(|| EngineError("expected class name after `new`".into()))?;
+                            // `new self()` / `new static()` / `new parent()`
+                            match id.to_ascii_lowercase().as_str() {
+                                "self" | "static" => {
+                                    self.current_class.clone().unwrap_or(id)
+                                }
+                                "parent" => self
+                                    .current_class
+                                    .as_ref()
+                                    .and_then(|c| {
+                                        self.classes
+                                            .get(&c.to_ascii_lowercase())
+                                            .and_then(|d| d.parent.clone())
+                                    })
+                                    .unwrap_or(id),
+                                _ => id,
+                            }
+                        };
                         self.skip_ws();
                         let args = if self.peek() == Some('(') {
                             self.parse_args()?
                         } else {
                             Vec::new()
                         };
-                        self.instantiate(&cname, args)
+                        let obj = self.instantiate(&cname, args)?;
+                        self.chain_access(obj)
                     }
                     "array" => {
                         self.skip_ws();
@@ -6496,12 +6809,9 @@ impl Engine {
                 let k = self.expression()?;
                 self.expect_char(']')?;
                 accs.push(Acc::Index(k));
-            } else if self.starts_with("->") {
-                self.pos += 2;
-                self.skip_ws();
-                let member = self
-                    .try_identifier()
-                    .ok_or_else(|| EngineError("expected name after `->`".into()))?;
+            } else if self.starts_with("->") || self.starts_with("?->") {
+                self.pos += if self.starts_with("?->") { 3 } else { 2 };
+                let member = self.parse_member_name()?;
                 let a2 = self.pos;
                 self.skip_ws();
                 if self.peek() == Some('(') {
@@ -6803,6 +7113,25 @@ impl Engine {
             }
         }
         Ok(Value::Array(arr))
+    }
+
+    /// Parse a member name after `->`/`?->`: a bare identifier, `$var` (variable
+    /// member name), or `{expr}` (computed member name).
+    fn parse_member_name(&mut self) -> R<String> {
+        self.skip_ws();
+        if self.peek() == Some('$') {
+            let vn = self.parse_variable_name()?;
+            Ok(self.vars.get(&vn).map(|v| v.to_php_string()).unwrap_or_default())
+        } else if self.peek() == Some('{') {
+            self.pos += 1;
+            let v = self.expression()?;
+            self.skip_ws();
+            self.expect_char('}')?;
+            Ok(v.to_php_string())
+        } else {
+            self.try_identifier()
+                .ok_or_else(|| EngineError("expected name after `->`".into()))
+        }
     }
 
     fn parse_variable_name(&mut self) -> R<String> {

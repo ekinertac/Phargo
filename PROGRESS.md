@@ -4,37 +4,37 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 1664 / 21862  (7.61% of the entire PHP test suite)**
+**`.phpt` pass rate: 1757 / 21862  (8.04% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 7.63%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 8.06%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 1664 | 20132 | 66 | 21862 |
+| 1757 | 20039 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 81/81 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 82/82 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 564 | 5329 | 10.6% |
-| `ext/standard` | 409 | 3877 | 10.5% |
-| `ext/opcache` | 302 | 916 | 33.0% |
-| `core` | 145 | 868 | 16.7% |
+| `Zend` | 614 | 5329 | 11.5% |
+| `ext/standard` | 418 | 3877 | 10.8% |
+| `ext/opcache` | 305 | 916 | 33.3% |
+| `core` | 152 | 868 | 17.5% |
 | `ext/dom` | 7 | 868 | 0.8% |
-| `ext/spl` | 54 | 796 | 6.8% |
+| `ext/spl` | 56 | 796 | 7.0% |
 | `ext/date` | 27 | 689 | 3.9% |
 | `ext/soap` | 0 | 593 | 0.0% |
 | `ext/phar` | 13 | 574 | 2.3% |
-| `ext/reflection` | 0 | 519 | 0.0% |
-| `ext/intl` | 0 | 496 | 0.0% |
+| `ext/reflection` | 20 | 519 | 3.9% |
+| `ext/intl` | 1 | 496 | 0.2% |
 | `ext/mysqli` | 0 | 452 | 0.0% |
 | `ext/mbstring` | 33 | 420 | 7.9% |
 | `ext/uri` | 0 | 328 | 0.0% |
 | `ext/gd` | 0 | 318 | 0.0% |
 | `ext/session` | 2 | 268 | 0.7% |
-| `ext/openssl` | 0 | 257 | 0.0% |
+| `ext/openssl` | 1 | 257 | 0.4% |
 | `ext/curl` | 0 | 175 | 0.0% |
 | `ext/bcmath` | 0 | 168 | 0.0% |
 | `ext/pcre` | 37 | 168 | 22.0% |
