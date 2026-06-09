@@ -1860,27 +1860,22 @@ impl Eval {
             }
             return Ok(Value::Array(arr));
         }
-        // float range
+        // float range — iterate by INDEX, never by accumulating `x` (near i64
+        // magnitudes the ulp exceeds the step, so `x += st` would be a no-op and
+        // loop forever). Compute the element count, cap it BEFORE looping.
         let st = if matches!(step, Value::Null) { 1.0 } else { to_f64(step).abs().max(1e-9) };
         let (a, b) = (to_f64(start), to_f64(end));
         if !a.is_finite() || !b.is_finite() || !st.is_finite() {
             return Err(self.throw_error("ValueError", "range(): Arguments must be finite"));
         }
-        let count = ((a - b).abs() / st) as usize;
-        if count > MAX_RANGE {
-            return Ok(Value::Array(arr));
+        let count_f = ((b - a).abs() / st).floor();
+        if !count_f.is_finite() || count_f > MAX_RANGE as f64 {
+            return Ok(Value::Array(arr)); // memory-bomb guard
         }
-        let mut x = a;
-        if a <= b {
-            while x <= b + 1e-9 {
-                arr.push(Value::Float(x));
-                x += st;
-            }
-        } else {
-            while x >= b - 1e-9 {
-                arr.push(Value::Float(x));
-                x -= st;
-            }
+        let n = count_f as usize;
+        for i in 0..=n {
+            let x = if a <= b { a + i as f64 * st } else { a - i as f64 * st };
+            arr.push(Value::Float(x));
         }
         Ok(Value::Array(arr))
     }
