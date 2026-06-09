@@ -17,11 +17,14 @@ type R<T> = Result<T, ParseError>;
 pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    depth: usize,
 }
+
+const MAX_DEPTH: usize = 2500;
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, pos: 0 }
+        Parser { toks, pos: 0, depth: 0 }
     }
 
     pub fn parse(toks: Vec<Token>) -> R<Vec<Stmt>> {
@@ -172,6 +175,17 @@ impl Parser {
     }
 
     fn statement(&mut self) -> R<Stmt> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            self.depth -= 1;
+            return Err(self.err("nesting too deep"));
+        }
+        let r = self.statement_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn statement_inner(&mut self) -> R<Stmt> {
         // keyword-led statements
         if let Kind::Ident(s) = self.kind() {
             let kw = s.to_ascii_lowercase();
@@ -947,6 +961,17 @@ impl Parser {
     }
 
     fn expr_bp(&mut self, min_bp: u8) -> R<Expr> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            self.depth -= 1;
+            return Err(self.err("expression nesting too deep"));
+        }
+        let r = self.expr_bp_inner(min_bp);
+        self.depth -= 1;
+        r
+    }
+
+    fn expr_bp_inner(&mut self, min_bp: u8) -> R<Expr> {
         let mut lhs = self.prefix()?;
         loop {
             // ternary  a ? b : c   and   a ?: c

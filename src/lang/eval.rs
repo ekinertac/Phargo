@@ -37,8 +37,14 @@ pub struct Eval {
     current_class: Option<String>,
     /// In-flight thrown exception (set by `throw`, cleared by a matching `catch`).
     thrown: Option<Value>,
+    /// Current function/method call nesting — guards against stack overflow.
+    call_depth: usize,
+    /// Current expression-evaluation recursion depth (deep AST spines).
+    eval_depth: usize,
     steps: u64,
 }
+
+const MAX_CALL_DEPTH: usize = 2000;
 
 /// A minimal exception/error hierarchy, parsed before every program so that
 /// `new Exception(...)`, `getMessage()`, `instanceof`, and `catch` work through
@@ -82,7 +88,11 @@ class OverflowException extends RuntimeException {}
 class JsonException extends Exception {}
 "##;
 
-const STEP_LIMIT: u64 = 50_000_000;
+const STEP_LIMIT: u64 = 20_000_000;
+/// Cap on single string allocations (concat, str_repeat) — stops memory bombs
+/// from pathological corpus tests (huge `.=` / `str_repeat` / `range`).
+const MAX_STR: usize = 64 * 1024 * 1024;
+const MAX_RANGE: usize = 8_000_000;
 
 impl Eval {
     pub fn new() -> Self {
@@ -95,8 +105,20 @@ impl Eval {
             static_props: HashMap::new(),
             current_class: None,
             thrown: None,
+            call_depth: 0,
+            eval_depth: 0,
             steps: 0,
         }
+    }
+
+    /// Enter a call frame; errors if nesting would risk a native stack overflow.
+    fn enter_call(&mut self) -> R<()> {
+        self.call_depth += 1;
+        if self.call_depth > MAX_CALL_DEPTH {
+            self.call_depth -= 1;
+            return Err(RunError("maximum function nesting level reached".into()));
+        }
+        Ok(())
     }
 
     /// Register the exception/error hierarchy (parsed from PRELUDE).
@@ -352,6 +374,19 @@ impl Eval {
     // ---- expressions ----------------------------------------------------
     fn eval(&mut self, e: &Expr) -> R<Value> {
         self.tick()?;
+        // Guard native-stack depth: deep left-associative spines (e.g. a long
+        // `1+1+...+1`) build a deep AST even though the parser built it iteratively.
+        self.eval_depth += 1;
+        if self.eval_depth > 6000 {
+            self.eval_depth -= 1;
+            return Err(RunError("expression too deeply nested".into()));
+        }
+        let r = self.eval_inner(e);
+        self.eval_depth -= 1;
+        r
+    }
+
+    fn eval_inner(&mut self, e: &Expr) -> R<Value> {
         Ok(match e {
             Expr::Null => Value::Null,
             Expr::Bool(b) => Value::Bool(*b),
@@ -425,6 +460,27 @@ impl Eval {
                 v
             }
             Expr::AssignOp(op, lhs, rhs) => {
+                // `$v .= expr` in place: append to the existing string instead of
+                // cloning it each time (avoids O(n^2) growth on `.=` loops).
+                if *op == BinOp::Concat {
+                    if let Expr::Var(name) = &**lhs {
+                        let rv = self.eval(rhs)?;
+                        let rb = self.stringify(&rv)?;
+                        let slot = self.vars().entry(name.clone()).or_insert(Value::Str(Vec::new()));
+                        if let Value::Str(s) = slot {
+                            if s.len() + rb.len() <= MAX_STR {
+                                s.extend_from_slice(&rb);
+                            }
+                            return Ok(Value::Str(s.clone()));
+                        } else {
+                            let mut s = to_bytes(slot);
+                            s.extend_from_slice(&rb);
+                            let nv = Value::Str(s);
+                            *slot = nv.clone();
+                            return Ok(nv);
+                        }
+                    }
+                }
                 let cur = self.eval(lhs)?;
                 let rv = self.eval(rhs)?;
                 let nv = self.apply_bin(*op, &cur, &rv);
@@ -644,7 +700,10 @@ impl Eval {
                 let lv = self.eval(l)?;
                 let rv = self.eval(r)?;
                 let mut s = self.stringify(&lv)?;
-                s.extend_from_slice(&self.stringify(&rv)?);
+                let rb = self.stringify(&rv)?;
+                if s.len() + rb.len() <= MAX_STR {
+                    s.extend_from_slice(&rb);
+                }
                 return Ok(Value::Str(s));
             }
             _ => {}
@@ -702,7 +761,10 @@ impl Eval {
             }
             Concat => {
                 let mut s = to_bytes(l);
-                s.extend_from_slice(&to_bytes(r));
+                let rb = to_bytes(r);
+                if s.len() + rb.len() <= MAX_STR {
+                    s.extend_from_slice(&rb);
+                }
                 Value::Str(s)
             }
             Eq => Value::Bool(loose_eq(l, r)),
@@ -969,6 +1031,7 @@ impl Eval {
     }
 
     fn call_closure(&mut self, c: &ClosureVal, args: Vec<Value>) -> R<Value> {
+        self.enter_call()?;
         let mut scope = HashMap::new();
         for (k, v) in &c.captures {
             scope.insert(k.clone(), v.clone());
@@ -976,16 +1039,16 @@ impl Eval {
         if let Some(t) = &c.bound_this {
             scope.insert("this".to_string(), t.clone());
         }
-        match &c.kind {
+        let r = match &c.kind {
             ClosureKind::Full(f) => {
                 self.bind_params(&mut scope, &f.params, &args)?;
                 self.scopes.push(scope);
                 let r = self.exec_block(&f.body);
                 self.scopes.pop();
-                match r? {
-                    Flow::Return(v) => Ok(v),
-                    _ => Ok(Value::Null),
-                }
+                r.map(|flow| match flow {
+                    Flow::Return(v) => v,
+                    _ => Value::Null,
+                })
             }
             ClosureKind::Arrow(f) => {
                 self.bind_params(&mut scope, &f.params, &args)?;
@@ -994,10 +1057,13 @@ impl Eval {
                 self.scopes.pop();
                 r
             }
-        }
+        };
+        self.call_depth -= 1;
+        r
     }
 
     fn call_user(&mut self, f: &FuncDecl, args: Vec<Value>) -> R<Value> {
+        self.enter_call()?;
         let mut scope = HashMap::new();
         for (i, p) in f.params.iter().enumerate() {
             if p.variadic {
@@ -1020,6 +1086,7 @@ impl Eval {
         self.scopes.push(scope);
         let r = self.exec_block(&f.body);
         self.scopes.pop();
+        self.call_depth -= 1;
         match r? {
             Flow::Return(v) => Ok(v),
             _ => Ok(Value::Null),
@@ -1215,6 +1282,7 @@ impl Eval {
             Some(b) => b.clone(),
             None => return Ok(Value::Null),
         };
+        self.enter_call()?;
         let mut scope = HashMap::new();
         if !m.is_static {
             scope.insert("this".to_string(), recv.clone());
@@ -1240,6 +1308,7 @@ impl Eval {
         let r = self.exec_block(&body);
         self.scopes.pop();
         self.current_class = prev_class;
+        self.call_depth -= 1;
         match r? {
             Flow::Return(v) => Ok(v),
             _ => Ok(Value::Null),
@@ -1261,6 +1330,7 @@ impl Eval {
             Some(b) => b.clone(),
             None => return Ok(Value::Null),
         };
+        self.enter_call()?;
         let mut scope = HashMap::new();
         // a non-static method reached via parent::/self:: keeps $this
         if !m.is_static {
@@ -1274,6 +1344,7 @@ impl Eval {
         let r = self.exec_block(&body);
         self.scopes.pop();
         self.current_class = prev_class;
+        self.call_depth -= 1;
         match r? {
             Flow::Return(v) => Ok(v),
             _ => Ok(Value::Null),
@@ -1471,6 +1542,9 @@ impl Eval {
             "str_repeat" => {
                 let s = to_bytes(&a(0));
                 let n = to_i64(&a(1)).max(0) as usize;
+                if s.len().saturating_mul(n) > MAX_STR {
+                    return Err(self.throw_error("ValueError", "str_repeat result too large"));
+                }
                 Value::Str(s.repeat(n))
             }
             "strrev" => {
@@ -1760,6 +1834,10 @@ impl Eval {
         // integer range when both ends are int-ish and step is whole
         let ints = matches!(start, Value::Int(_)) && matches!(end, Value::Int(_)) && st.fract() == 0.0;
         let (a, b) = (to_f64(start), to_f64(end));
+        // bail out of pathological huge ranges (memory bomb guard)
+        if ((a - b).abs() / st) as usize > MAX_RANGE {
+            return Value::Array(arr);
+        }
         if a <= b {
             let mut x = a;
             while x <= b + 1e-9 {
