@@ -2463,6 +2463,12 @@ fn var_dump(v: &Value, indent: usize, out: &mut String) {
 /// `seen` holds the Rc addresses of objects on the current path, so circular
 /// object graphs print `*RECURSION*` instead of recursing into a memory bomb.
 fn var_dump_seen(v: &Value, indent: usize, out: &mut String, seen: &mut Vec<usize>) {
+    // Depth cap: deeply nested structures otherwise produce quadratic-sized output
+    // (indentation grows per level), a memory bomb on e.g. a 50k-deep object chain.
+    if indent > 256 {
+        out.push_str(&format!("{}*MAX DEPTH*\n", "  ".repeat(indent)));
+        return;
+    }
     let pad = "  ".repeat(indent);
     match v {
         Value::Null => out.push_str(&format!("{pad}NULL\n")),
@@ -2508,6 +2514,10 @@ fn var_dump_seen(v: &Value, indent: usize, out: &mut String, seen: &mut Vec<usiz
 }
 
 fn print_r(v: &Value, indent: usize, out: &mut String) {
+    if indent > 256 {
+        out.push_str("*MAX DEPTH*");
+        return;
+    }
     match v {
         Value::Array(a) => {
             let pad = "    ".repeat(indent);
