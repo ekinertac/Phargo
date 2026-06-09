@@ -186,6 +186,14 @@ impl Parser {
     }
 
     fn statement_inner(&mut self) -> R<Stmt> {
+        // `#[Attr]` before a declaration (class/function/enum/...) — skip it.
+        if matches!(self.kind(), Kind::AttrStart) {
+            self.skip_attributes();
+            if matches!(self.kind(), Kind::Semi | Kind::Eof) {
+                self.eat(&Kind::Semi);
+                return Ok(Stmt::Nop);
+            }
+        }
         // keyword-led statements
         if let Kind::Ident(s) = self.kind() {
             let kw = s.to_ascii_lowercase();
@@ -689,6 +697,27 @@ impl Parser {
         }
     }
 
+    /// Consume a balanced `{ … }` block (used to skip property-hook bodies).
+    fn skip_braced_block(&mut self) {
+        if !matches!(self.kind(), Kind::LBrace) {
+            return;
+        }
+        let mut depth = 0;
+        loop {
+            match self.bump() {
+                Kind::LBrace => depth += 1,
+                Kind::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Kind::Eof => break,
+                _ => {}
+            }
+        }
+    }
+
     fn skip_attributes(&mut self) {
         while matches!(self.kind(), Kind::AttrStart) {
             self.bump();
@@ -771,7 +800,7 @@ impl Parser {
 
     fn parse_class_body(&mut self, decl: &mut ClassDecl) -> R<()> {
         self.expect(&Kind::LBrace)?;
-        while !matches!(self.kind(), Kind::RBrace | Kind::Eof) {
+        'members: while !matches!(self.kind(), Kind::RBrace | Kind::Eof) {
             self.skip_attributes();
             // `use TraitName;`
             if self.at_kw("use") {
@@ -912,6 +941,12 @@ impl Parser {
                     readonly,
                     type_hint: type_hint.clone(),
                 });
+                // PHP 8.4 property hooks: `$x { get => …; set { … } }` — parse-skip
+                // the hook block (the property itself is recorded; hooks are no-ops).
+                if matches!(self.kind(), Kind::LBrace) {
+                    self.skip_braced_block();
+                    continue 'members;
+                }
                 if !self.eat(&Kind::Comma) {
                     break;
                 }
@@ -1535,14 +1570,6 @@ impl Parser {
                     };
                     self.expect(&Kind::RBracket)?;
                     e = Expr::Index(Box::new(e), idx);
-                }
-                Kind::LBrace => {
-                    // legacy `$s{0}` offset access — treat like [ ]
-                    // (only when it makes sense; safe because statements handle `{` separately)
-                    self.bump();
-                    let idx = self.expr()?;
-                    self.expect(&Kind::RBrace)?;
-                    e = Expr::Index(Box::new(e), Some(Box::new(idx)));
                 }
                 Kind::LParen => {
                     let args = self.parse_args()?;
