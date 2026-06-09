@@ -137,6 +137,79 @@ pub(crate) fn php_date(fmt: &str, ts: i64) -> String {
     out
 }
 
+/// Format a Unix timestamp with a (deprecated) `strftime()` `%`-code format, UTC.
+pub(crate) fn php_strftime(fmt: &str, ts: i64) -> String {
+    let days = ts.div_euclid(86400);
+    let secs = ts.rem_euclid(86400);
+    let (y, m, d) = civil_from_days(days);
+    let (hour, minute, second) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let wday = (days.rem_euclid(7) + 4) % 7; // 1970-01-01 = Thursday
+    let yday = days - days_from_civil(y, 1, 1); // 0-based
+    let h12 = {
+        let h = hour % 12;
+        if h == 0 {
+            12
+        } else {
+            h
+        }
+    };
+    let mut out = String::new();
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '%' || i + 1 >= chars.len() {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let code = chars[i + 1];
+        match code {
+            'a' => out.push_str(&DAYS[wday as usize][..3]),
+            'A' => out.push_str(DAYS[wday as usize]),
+            'b' | 'h' => out.push_str(&MONTHS[(m - 1) as usize][..3]),
+            'B' => out.push_str(MONTHS[(m - 1) as usize]),
+            'd' => out.push_str(&format!("{d:02}")),
+            'e' => out.push_str(&format!("{d:2}")),
+            'j' => out.push_str(&format!("{:03}", yday + 1)),
+            'm' => out.push_str(&format!("{m:02}")),
+            'u' => out.push_str(&(if wday == 0 { 7 } else { wday }).to_string()),
+            'w' => out.push_str(&wday.to_string()),
+            'y' => out.push_str(&format!("{:02}", y.rem_euclid(100))),
+            'Y' => out.push_str(&y.to_string()),
+            'C' => out.push_str(&format!("{:02}", y.div_euclid(100))),
+            'H' => out.push_str(&format!("{hour:02}")),
+            'k' => out.push_str(&format!("{hour:2}")),
+            'I' => out.push_str(&format!("{h12:02}")),
+            'l' => out.push_str(&format!("{h12:2}")),
+            'M' => out.push_str(&format!("{minute:02}")),
+            'S' => out.push_str(&format!("{second:02}")),
+            'p' => out.push_str(if hour < 12 { "AM" } else { "PM" }),
+            'P' => out.push_str(if hour < 12 { "am" } else { "pm" }),
+            'D' => out.push_str(&format!("{m:02}/{d:02}/{:02}", y.rem_euclid(100))),
+            'F' => out.push_str(&format!("{y}-{m:02}-{d:02}")),
+            'T' | 'X' => out.push_str(&format!("{hour:02}:{minute:02}:{second:02}")),
+            'R' => out.push_str(&format!("{hour:02}:{minute:02}")),
+            'r' => out.push_str(&format!(
+                "{h12:02}:{minute:02}:{second:02} {}",
+                if hour < 12 { "AM" } else { "PM" }
+            )),
+            'x' => out.push_str(&format!("{m:02}/{d:02}/{:02}", y.rem_euclid(100))),
+            'z' => out.push_str("+0000"),
+            'Z' => out.push_str("UTC"),
+            's' => out.push_str(&ts.to_string()),
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            '%' => out.push('%'),
+            other => {
+                out.push('%');
+                out.push(other);
+            }
+        }
+        i += 2;
+    }
+    out
+}
+
 /// Compose a UTC timestamp from civil components (used by mktime/gmmktime).
 pub(crate) fn make_ts(h: i64, mi: i64, s: i64, mon: i64, day: i64, year: i64) -> i64 {
     days_from_civil(year, mon, day) * 86400 + h * 3600 + mi * 60 + s

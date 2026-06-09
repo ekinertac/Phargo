@@ -5156,6 +5156,11 @@ impl Engine {
                 let ts = if args.len() > 1 { to_long(&arg(1)) } else { now_unix() };
                 Value::Str(php_date(&fmt, ts))
             }
+            "strftime" | "gmstrftime" => {
+                let fmt = arg(0).to_php_string();
+                let ts = if args.len() > 1 { to_long(&arg(1)) } else { now_unix() };
+                Value::Str(php_strftime(&fmt, ts))
+            }
             "mktime" | "gmmktime" => {
                 let now = now_unix();
                 let days = now.div_euclid(86400);
