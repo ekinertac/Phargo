@@ -6782,6 +6782,55 @@ impl Engine {
     }
 
     /// Handle `preg_match` / `preg_match_all`, whose `$matches` (3rd arg) is by-ref.
+    /// `settype($var, "type")` — coerce a variable in place. Handles a simple
+    /// `$var` target (the overwhelmingly common case); other targets return false.
+    fn settype_call(&mut self) -> R<Value> {
+        self.expect_char('(')?;
+        self.skip_ws();
+        if self.peek() != Some('$') {
+            let _ = self.expression()?;
+            self.skip_ws();
+            if self.peek() == Some(',') {
+                self.pos += 1;
+                self.skip_ws();
+                let _ = self.expression()?;
+            }
+            self.skip_ws();
+            self.expect_char(')')?;
+            return Ok(Value::Bool(false));
+        }
+        let varname = self.parse_variable_name()?;
+        self.skip_ws();
+        let mut ty = String::new();
+        if self.peek() == Some(',') {
+            self.pos += 1;
+            self.skip_ws();
+            ty = self.expression()?.to_php_string();
+        }
+        self.skip_ws();
+        self.expect_char(')')?;
+        if !self.live {
+            return Ok(Value::Null);
+        }
+        let cur = self.vars.get(&varname).cloned().unwrap_or(Value::Null);
+        let cast_ty = match ty.to_ascii_lowercase().as_str() {
+            "null" => "unset",
+            "integer" => "int",
+            "boolean" => "bool",
+            "double" => "float",
+            other => {
+                // settype keeps the canonical names; apply_cast knows the rest
+                let owned = other.to_string();
+                let newv = self.apply_cast(&owned, cur);
+                self.vars.insert(varname, newv);
+                return Ok(Value::Bool(true));
+            }
+        };
+        let newv = self.apply_cast(cast_ty, cur);
+        self.vars.insert(varname, newv);
+        Ok(Value::Bool(true))
+    }
+
     fn preg_match_call(&mut self, all: bool) -> R<Value> {
         self.expect_char('(')?;
         self.skip_ws();
@@ -7673,6 +7722,8 @@ impl Engine {
                                 Ok(Value::Str(id))
                             } else if lid == "preg_match" || lid == "preg_match_all" {
                                 self.preg_match_call(lid == "preg_match_all")
+                            } else if lid == "settype" {
+                                self.settype_call()
                             } else if is_byref_builtin(&id) {
                                 self.byref_call(&id)
                             } else {
