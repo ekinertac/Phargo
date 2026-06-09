@@ -2422,8 +2422,13 @@ impl Eval {
             }
             "array_fill" => {
                 let start = to_i64(&a(0));
-                let count = to_i64(&a(1)).max(0).min(MAX_ARRAY_NODES as i64) as usize;
+                let count = to_i64(&a(1)).max(0) as usize;
                 let val = a(2);
+                // cap by TOTAL nodes (count × element size), not just count
+                let elem = value_size(&val, MAX_ARRAY_NODES).max(1);
+                if count.saturating_mul(elem) > MAX_ARRAY_NODES {
+                    return Err(self.throw_error("Error", "Possible integer overflow in memory allocation"));
+                }
                 let mut out = Arr::new();
                 for i in 0..count {
                     out.insert(Key::Int(start + i as i64), val.clone());
@@ -2465,7 +2470,7 @@ impl Eval {
                     Value::Array(arr) => arr.entries.into_iter().map(|(_, v)| v).collect(),
                     _ => Vec::new(),
                 };
-                let n = size.unsigned_abs() as usize;
+                let n = (size.unsigned_abs() as usize).min(MAX_ARRAY_NODES);
                 if items.len() < n {
                     let pad = n - items.len();
                     if size < 0 {
