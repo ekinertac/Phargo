@@ -1,4 +1,4 @@
-//! Phargo — a from-scratch, memory-safe PHP engine written in Rust (PHP + Cargo).
+//! Phargo — a from-scratch, memory-safe PHP engine written in Rust.
 //!
 //! **v3b.** On top of v3 (control flow), this adds:
 //!   * assignment as an *expression* (`$a = $b = 3`) incl. compound
@@ -6273,10 +6273,39 @@ impl Engine {
             Some(def) => {
                 self.call_user_function(def, args, Some(Value::Object(oref)), Some(class))
             }
-            None => Err(EngineError(format!(
-                "call to undefined method {class}::{method}()"
-            ))),
+            None => {
+                // __call magic method
+                if let Some(def) = self.lookup_method(&class, "__call") {
+                    let mut arr = PArray::default();
+                    for a in args {
+                        arr.push(a);
+                    }
+                    return self.call_user_function(
+                        def,
+                        vec![Value::Str(method.to_string()), Value::Array(arr)],
+                        Some(Value::Object(oref)),
+                        Some(class),
+                    );
+                }
+                Err(EngineError(format!(
+                    "call to undefined method {class}::{method}()"
+                )))
+            }
         }
+    }
+
+    /// Read a property, honoring the `__get` magic method for missing properties.
+    fn get_property(&mut self, recv: &Value, name: &str) -> R<Value> {
+        if let Value::Object(o) = recv {
+            if let Some(v) = o.borrow().get(name) {
+                return Ok(v);
+            }
+            let class = o.borrow().class.clone();
+            if self.lookup_method(&class, "__get").is_some() {
+                return self.call_method(recv, "__get", vec![Value::Str(name.to_string())]);
+            }
+        }
+        Ok(Value::Null)
     }
 
     /// Built-ins that take their first argument by reference (sort family,
@@ -6690,10 +6719,7 @@ impl Engine {
                     }
                     val = self.call_method(&val, &member, args)?;
                 } else {
-                    val = match &val {
-                        Value::Object(o) => o.borrow().get(&member).unwrap_or(Value::Null),
-                        _ => Value::Null,
-                    };
+                    val = self.get_property(&val, &member)?;
                 }
             } else {
                 self.pos = save;
@@ -7208,6 +7234,21 @@ impl Engine {
         }
         match self.vars.get(name).cloned().unwrap_or(Value::Null) {
             Value::Object(o) => {
+                // __set magic: only for a property that isn't already declared/set
+                if aop == "=" {
+                    let (has, class) = {
+                        let b = o.borrow();
+                        (b.get(prop).is_some(), b.class.clone())
+                    };
+                    if !has && self.lookup_method(&class, "__set").is_some() {
+                        let recv = Value::Object(o.clone());
+                        return self.call_method(
+                            &recv,
+                            "__set",
+                            vec![Value::Str(prop.to_string()), rhs],
+                        );
+                    }
+                }
                 let newval = if aop == "=" {
                     rhs
                 } else {
@@ -7536,7 +7577,7 @@ impl Engine {
                     Value::Object(_) => self.call_method(&cur, "offsetGet", vec![k.clone()])?,
                     _ => Value::Null,
                 },
-                Acc::Prop(p) => read_property(&cur, p),
+                Acc::Prop(p) => self.get_property(&cur, p)?,
                 Acc::Method(m, args) => self.call_method(&cur, m, args.clone())?,
                 Acc::Call(args) => self.call_callable(&cur, args.clone())?,
             };
@@ -8101,7 +8142,7 @@ impl Engine {
                         pe += 1;
                     }
                     let prop: String = chars[ps..pe].iter().collect();
-                    v = read_property(&v, &prop);
+                    v = self.get_property(&v, &prop)?;
                     j = pe;
                 } else if chars.get(j) == Some(&'[') {
                     let ks = j + 1;
@@ -8253,13 +8294,6 @@ fn set_path(slot: &mut Value, indices: &[Option<Value>], val: Value) {
             arr.set(key.clone(), Value::Array(PArray::default()));
         }
         set_path(arr.get_mut(&key).unwrap(), rest, val);
-    }
-}
-
-fn read_property(v: &Value, name: &str) -> Value {
-    match v {
-        Value::Object(o) => o.borrow().get(name).unwrap_or(Value::Null),
-        _ => Value::Null,
     }
 }
 
