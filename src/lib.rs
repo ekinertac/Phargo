@@ -3137,6 +3137,11 @@ impl Engine {
         }
         loop {
             self.skip_ws();
+            // trailing comma before `)` (PHP 7.3+): `foo($a, $b,)`
+            if self.peek() == Some(')') {
+                self.pos += 1;
+                break;
+            }
             // named-argument syntax `name: value` — drop the label, keep the value
             if matches!(self.peek(), Some(c) if c.is_ascii_alphabetic() || c == '_') {
                 let save = self.pos;
@@ -5767,6 +5772,10 @@ impl Engine {
         }
         loop {
             self.skip_ws();
+            // trailing comma before `)` (PHP 8.0+): `function f($a, $b,)`
+            if self.peek() == Some(')') {
+                break;
+            }
             // attributes `#[...]` before a parameter
             self.skip_attributes();
             // constructor property promotion: leading visibility / readonly
