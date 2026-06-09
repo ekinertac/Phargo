@@ -12,7 +12,7 @@ _This counts only the upstream **php-src** test suite — tests we did **not** w
 |---:|---:|---:|---:|
 | 1950 | 19846 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 92/92 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 92/93 passing._
 
 ## By area
 
