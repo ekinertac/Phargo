@@ -46,6 +46,8 @@ pub struct Eval {
     cur_file: Option<PathBuf>,
     /// Canonical paths already pulled in via `include_once`/`require_once`.
     included: HashSet<String>,
+    /// Output-buffering watermarks into `out` (one per active `ob_start`).
+    ob_stack: Vec<usize>,
     steps: u64,
 }
 
@@ -55,6 +57,15 @@ const MAX_CALL_DEPTH: usize = 2000;
 /// `new Exception(...)`, `getMessage()`, `instanceof`, and `catch` work through
 /// the ordinary class machinery.
 const PRELUDE: &[u8] = br##"<?php
+class stdClass {}
+interface Throwable {}
+interface Stringable {}
+interface Traversable {}
+interface Iterator extends Traversable {}
+interface IteratorAggregate extends Traversable {}
+interface ArrayAccess {}
+interface Countable {}
+interface JsonSerializable {}
 class Exception {
     protected $message = "";
     protected $code = 0;
@@ -116,6 +127,7 @@ impl Eval {
             eval_depth: 0,
             cur_file: None,
             included: HashSet::new(),
+            ob_stack: Vec::new(),
             steps: 0,
         }
     }
@@ -141,11 +153,7 @@ impl Eval {
 
     /// Run a parsed program and return everything it printed.
     pub fn run(program: &[Stmt]) -> R<Vec<u8>> {
-        let mut e = Eval::new();
-        e.load_prelude();
-        e.hoist(program);
-        e.exec_block(program)?;
-        Ok(e.out)
+        Self::run_with_path(program, None)
     }
 
     /// Like [`run`], but records the script's path so `__FILE__`/`__DIR__` and
@@ -155,8 +163,43 @@ impl Eval {
         e.cur_file = path;
         e.load_prelude();
         e.hoist(program);
-        e.exec_block(program)?;
-        Ok(e.out)
+        match e.exec_block(program) {
+            Ok(_) => Ok(e.out),
+            Err(err) => {
+                // An uncaught exception becomes a PHP fatal-error message in the
+                // output (matching PHP). Other engine errors (step limit, unknown
+                // function, parse) propagate with their message so the scoreboard
+                // histogram stays useful.
+                if let Some(exc) = e.thrown.take() {
+                    let (cls, msg) = e.exception_info(&exc);
+                    let file = e
+                        .cur_file
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let s = format!(
+                        "\nFatal error: Uncaught {cls}: {msg} in {file}:0\nStack trace:\n#0 {{main}}\n  thrown in {file} on line 0\n"
+                    );
+                    e.out.extend_from_slice(s.as_bytes());
+                    Ok(e.out)
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    fn exception_info(&self, v: &Value) -> (String, String) {
+        if let Value::Object(rc) = v {
+            let o = rc.borrow();
+            let msg = o
+                .get("message")
+                .map(|m| String::from_utf8_lossy(&to_bytes(m)).into_owned())
+                .unwrap_or_default();
+            (o.class.clone(), msg)
+        } else {
+            ("Exception".into(), String::new())
+        }
     }
 
     /// Hoist top-level function declarations so call-before-definition works.
@@ -833,7 +876,26 @@ impl Eval {
                     Value::Array(a)
                 }
             },
-            CastType::Object => v, // objects not modeled yet
+            CastType::Object => match v {
+                Value::Object(_) | Value::Closure(_) => v,
+                Value::Array(a) => {
+                    let mut o = Obj { class: "stdClass".into(), props: Vec::new() };
+                    for (k, val) in a.entries {
+                        let name = match k {
+                            Key::Int(n) => n.to_string(),
+                            Key::Str(s) => String::from_utf8_lossy(&s).into_owned(),
+                        };
+                        o.set(&name, val);
+                    }
+                    Value::Object(Rc::new(RefCell::new(o)))
+                }
+                Value::Null => new_obj("stdClass"),
+                other => {
+                    let o = Rc::new(RefCell::new(Obj { class: "stdClass".into(), props: Vec::new() }));
+                    o.borrow_mut().set("scalar", other);
+                    Value::Object(o)
+                }
+            },
             CastType::Unset => Value::Null,
         }
     }
@@ -1967,6 +2029,162 @@ impl Eval {
                 let n = String::from_utf8_lossy(&to_bytes(&a(0))).to_ascii_lowercase();
                 Value::Bool(self.funcs.contains_key(&n) || is_known_builtin(&n))
             }
+            // ---- output buffering ----
+            "ob_start" => {
+                self.ob_stack.push(self.out.len());
+                Value::Bool(true)
+            }
+            "ob_get_contents" => match self.ob_stack.last() {
+                Some(&w) => Value::Str(self.out[w..].to_vec()),
+                None => Value::Bool(false),
+            },
+            "ob_get_clean" => match self.ob_stack.pop() {
+                Some(w) => {
+                    let s = self.out[w..].to_vec();
+                    self.out.truncate(w);
+                    Value::Str(s)
+                }
+                None => Value::Bool(false),
+            },
+            "ob_end_clean" | "ob_clean" => match self.ob_stack.last().copied() {
+                Some(w) => {
+                    self.out.truncate(w);
+                    if name == "ob_end_clean" {
+                        self.ob_stack.pop();
+                    }
+                    Value::Bool(true)
+                }
+                None => Value::Bool(false),
+            },
+            "ob_end_flush" | "ob_flush" | "flush" => {
+                if name == "ob_end_flush" {
+                    self.ob_stack.pop();
+                }
+                Value::Bool(true)
+            }
+            "ob_get_level" => Value::Int(self.ob_stack.len() as i64),
+            "ob_get_length" => match self.ob_stack.last() {
+                Some(&w) => Value::Int((self.out.len() - w) as i64),
+                None => Value::Bool(false),
+            },
+            // ---- path / filename helpers ----
+            "basename" => {
+                let s = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let s = s.trim_end_matches(['/', '\\']);
+                let mut base = s.rsplit(['/', '\\']).next().unwrap_or("").to_string();
+                if args.len() > 1 {
+                    let suf = String::from_utf8_lossy(&to_bytes(&a(1))).into_owned();
+                    if base.len() > suf.len() && base.ends_with(&suf) {
+                        base.truncate(base.len() - suf.len());
+                    }
+                }
+                Value::Str(base.into_bytes())
+            }
+            "dirname" => {
+                let s = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let s = s.trim_end_matches(['/', '\\']);
+                match s.rfind(['/', '\\']) {
+                    Some(0) => Value::Str(b"/".to_vec()),
+                    Some(i) => Value::Str(s[..i].as_bytes().to_vec()),
+                    None => Value::Str(b".".to_vec()),
+                }
+            }
+            // ---- class / object introspection ----
+            "get_class" => match a(0) {
+                Value::Object(rc) => Value::Str(rc.borrow().class.clone().into_bytes()),
+                _ => match &self.current_class {
+                    Some(c) => Value::Str(c.clone().into_bytes()),
+                    None => Value::Bool(false),
+                },
+            },
+            "get_parent_class" => {
+                let cname = match a(0) {
+                    Value::Object(rc) => Some(rc.borrow().class.clone()),
+                    Value::Str(s) => Some(String::from_utf8_lossy(&s).into_owned()),
+                    _ => self.current_class.clone(),
+                };
+                match cname.and_then(|c| self.find_class(&c)).and_then(|d| d.parent.clone()) {
+                    Some(p) => Value::Str(p.last().as_bytes().to_vec()),
+                    None => Value::Bool(false),
+                }
+            }
+            "class_exists" | "interface_exists" | "trait_exists" | "enum_exists" => {
+                let n = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                Value::Bool(self.find_class(&n).is_some())
+            }
+            "get_object_vars" => {
+                let mut o = Arr::new();
+                if let Value::Object(rc) = a(0) {
+                    for (k, v) in &rc.borrow().props {
+                        o.insert(Key::Str(k.as_bytes().to_vec()), v.clone());
+                    }
+                }
+                Value::Array(o)
+            }
+            "method_exists" => {
+                let cn = match a(0) {
+                    Value::Object(rc) => rc.borrow().class.clone(),
+                    v => String::from_utf8_lossy(&to_bytes(&v)).into_owned(),
+                };
+                let m = String::from_utf8_lossy(&to_bytes(&a(1))).into_owned();
+                Value::Bool(self.find_method(&cn, &m).is_some())
+            }
+            "property_exists" => {
+                let p = String::from_utf8_lossy(&to_bytes(&a(1))).into_owned();
+                let in_obj = matches!(&a(0), Value::Object(rc) if rc.borrow().get(&p).is_some());
+                let cn = match a(0) {
+                    Value::Object(rc) => rc.borrow().class.clone(),
+                    v => String::from_utf8_lossy(&to_bytes(&v)).into_owned(),
+                };
+                let in_class = self.ancestry(&cn).iter().any(|c| c.props.iter().any(|pd| pd.name == p));
+                Value::Bool(in_obj || in_class)
+            }
+            "is_a" | "is_subclass_of" => {
+                let cn = match a(0) {
+                    Value::Object(rc) => rc.borrow().class.clone(),
+                    v => String::from_utf8_lossy(&to_bytes(&v)).into_owned(),
+                };
+                let t = String::from_utf8_lossy(&to_bytes(&a(1))).into_owned();
+                let sub = self.is_subclass(&cn, &t);
+                Value::Bool(if name == "is_subclass_of" {
+                    sub && !cn.eq_ignore_ascii_case(&t)
+                } else {
+                    sub
+                })
+            }
+            // ---- environment / config stubs (setup calls; sane defaults) ----
+            "getenv" => {
+                if args.is_empty() {
+                    Value::Array(Arr::new())
+                } else {
+                    match std::env::var(String::from_utf8_lossy(&to_bytes(&a(0))).as_ref()) {
+                        Ok(v) => Value::Str(v.into_bytes()),
+                        Err(_) => Value::Bool(false),
+                    }
+                }
+            }
+            "putenv" | "set_time_limit" | "ignore_user_abort" | "setlocale" | "extension_loaded" => {
+                Value::Bool(false)
+            }
+            "ini_get" | "ini_set" => Value::Bool(false),
+            "error_reporting" => Value::Int(0),
+            "set_error_handler" | "restore_error_handler" | "set_exception_handler"
+            | "restore_exception_handler" | "error_clear_last" | "debug_print_backtrace"
+            | "gc_enable" | "gc_disable" | "header" | "clearstatcache" | "usleep" | "sleep" => {
+                Value::Null
+            }
+            "trigger_error" | "spl_autoload_register" | "spl_autoload_unregister"
+            | "date_default_timezone_set" | "assert" | "gc_enabled" | "headers_sent" => {
+                Value::Bool(true)
+            }
+            "date_default_timezone_get" => Value::Str(b"UTC".to_vec()),
+            "debug_backtrace" => Value::Array(Arr::new()),
+            "gc_collect_cycles" | "http_response_code" | "getmypid" | "hrtime" => Value::Int(0),
+            "memory_get_usage" | "memory_get_peak_usage" => Value::Int(2_000_000),
+            "php_sapi_name" => Value::Str(b"cli".to_vec()),
+            "phpversion" => Value::Str(b"8.3.0".to_vec()),
+            "php_uname" => Value::Str(b"Linux".to_vec()),
+            "error_get_last" => Value::Null,
             _ => return Err(RunError(format!("unknown function {name}()"))),
         })
     }
