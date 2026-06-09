@@ -271,6 +271,126 @@ class ReflectionFunction {
 }
 class ReflectionNamedType { public $name; public function __construct($n) { $this->name = $n; } public function getName() { return $this->name; } public function allowsNull() { return false; } }
 class ReflectionException extends Exception {}
+
+class ArrayIterator implements Iterator, ArrayAccess, Countable {
+    private $__d; private $__k; private $__p = 0;
+    public function __construct($array = []) { $this->__d = $array; $this->__k = array_keys($array); }
+    public function rewind(): void { $this->__k = array_keys($this->__d); $this->__p = 0; }
+    public function valid(): bool { return $this->__p < count($this->__k); }
+    public function current(): mixed { return $this->__d[$this->__k[$this->__p]]; }
+    public function key(): mixed { return $this->__k[$this->__p]; }
+    public function next(): void { $this->__p = $this->__p + 1; }
+    public function offsetExists($k): bool { return isset($this->__d[$k]); }
+    public function offsetGet($k): mixed { return $this->__d[$k] ?? null; }
+    public function offsetSet($k, $v): void { if ($k === null) { $this->__d[] = $v; } else { $this->__d[$k] = $v; } }
+    public function offsetUnset($k): void { unset($this->__d[$k]); }
+    public function count(): int { return count($this->__d); }
+    public function getArrayCopy() { return $this->__d; }
+    public function append($v) { $this->__d[] = $v; }
+}
+class ArrayObject implements ArrayAccess, IteratorAggregate, Countable {
+    private $__d;
+    public function __construct($array = []) { $this->__d = $array; }
+    public function offsetExists($k): bool { return isset($this->__d[$k]); }
+    public function offsetGet($k): mixed { return $this->__d[$k] ?? null; }
+    public function offsetSet($k, $v): void { if ($k === null) { $this->__d[] = $v; } else { $this->__d[$k] = $v; } }
+    public function offsetUnset($k): void { unset($this->__d[$k]); }
+    public function count(): int { return count($this->__d); }
+    public function getArrayCopy() { return $this->__d; }
+    public function append($v) { $this->__d[] = $v; }
+    public function getIterator(): Iterator { return new ArrayIterator($this->__d); }
+}
+class SplDoublyLinkedList implements Iterator, Countable, ArrayAccess {
+    protected $__d = []; protected $__p = 0; protected $__lifo = false;
+    public function push($v) { $this->__d[] = $v; }
+    public function pop() { return array_pop($this->__d); }
+    public function shift() { return array_shift($this->__d); }
+    public function unshift($v) { array_unshift($this->__d, $v); }
+    public function top() { return $this->__d[count($this->__d) - 1]; }
+    public function bottom() { return $this->__d[0]; }
+    public function isEmpty() { return count($this->__d) === 0; }
+    public function count(): int { return count($this->__d); }
+    public function offsetExists($k): bool { return isset($this->__d[$k]); }
+    public function offsetGet($k): mixed { return $this->__d[$k]; }
+    public function offsetSet($k, $v): void { if ($k === null) { $this->__d[] = $v; } else { $this->__d[$k] = $v; } }
+    public function offsetUnset($k): void { unset($this->__d[$k]); $n = []; foreach ($this->__d as $x) { $n[] = $x; } $this->__d = $n; }
+    public function rewind(): void { $this->__p = $this->__lifo ? count($this->__d) - 1 : 0; }
+    public function valid(): bool { return $this->__p >= 0 && $this->__p < count($this->__d); }
+    public function current(): mixed { return $this->__d[$this->__p]; }
+    public function key(): mixed { return $this->__p; }
+    public function next(): void { if ($this->__lifo) { $this->__p = $this->__p - 1; } else { $this->__p = $this->__p + 1; } }
+}
+class SplStack extends SplDoublyLinkedList { public function __construct() { $this->__lifo = true; } }
+class SplQueue extends SplDoublyLinkedList {
+    public function enqueue($v) { $this->push($v); }
+    public function dequeue() { return $this->shift(); }
+}
+class SplFixedArray implements ArrayAccess, Countable, Iterator {
+    private $__d = []; private $__size = 0; private $__p = 0;
+    public function __construct($size = 0) { $this->__size = $size; for ($i = 0; $i < $size; $i = $i + 1) { $this->__d[$i] = null; } }
+    public function offsetExists($k): bool { return $k >= 0 && $k < $this->__size; }
+    public function offsetGet($k): mixed { return $this->__d[$k] ?? null; }
+    public function offsetSet($k, $v): void { $this->__d[$k] = $v; }
+    public function offsetUnset($k): void { $this->__d[$k] = null; }
+    public function count(): int { return $this->__size; }
+    public function getSize() { return $this->__size; }
+    public function setSize($s) { $this->__size = $s; return true; }
+    public function toArray() { return $this->__d; }
+    public static function fromArray($a) { $f = new SplFixedArray(count($a)); $i = 0; foreach ($a as $v) { $f[$i] = $v; $i++; } return $f; }
+    public function rewind(): void { $this->__p = 0; }
+    public function valid(): bool { return $this->__p < $this->__size; }
+    public function current(): mixed { return $this->__d[$this->__p] ?? null; }
+    public function key(): mixed { return $this->__p; }
+    public function next(): void { $this->__p = $this->__p + 1; }
+}
+class SplObjectStorage implements Countable, Iterator, ArrayAccess {
+    private $__o = []; private $__v = []; private $__k = []; private $__p = 0;
+    public function attach($obj, $data = null) { $h = spl_object_id($obj); $this->__o[$h] = $obj; $this->__v[$h] = $data; }
+    public function detach($obj) { $h = spl_object_id($obj); unset($this->__o[$h]); unset($this->__v[$h]); }
+    public function contains($obj) { return isset($this->__o[spl_object_id($obj)]); }
+    public function count(): int { return count($this->__o); }
+    public function offsetExists($obj): bool { return $this->contains($obj); }
+    public function offsetGet($obj): mixed { return $this->__v[spl_object_id($obj)] ?? null; }
+    public function offsetSet($obj, $data): void { $this->attach($obj, $data); }
+    public function offsetUnset($obj): void { $this->detach($obj); }
+    public function rewind(): void { $this->__k = array_keys($this->__o); $this->__p = 0; }
+    public function valid(): bool { return $this->__p < count($this->__k); }
+    public function current(): mixed { return $this->__o[$this->__k[$this->__p]]; }
+    public function key(): mixed { return $this->__p; }
+    public function getInfo() { return $this->__v[$this->__k[$this->__p]] ?? null; }
+    public function next(): void { $this->__p = $this->__p + 1; }
+}
+abstract class SplHeap implements Countable, Iterator {
+    protected $__h = [];
+    abstract protected function compare($a, $b): int;
+    protected function __top_index() { $best = 0; for ($i = 1; $i < count($this->__h); $i++) { if ($this->compare($this->__h[$i], $this->__h[$best]) > 0) { $best = $i; } } return $best; }
+    public function insert($v) { $this->__h[] = $v; return true; }
+    public function top() { return $this->__h[$this->__top_index()]; }
+    public function extract() { if (count($this->__h) === 0) { return null; } $i = $this->__top_index(); $v = $this->__h[$i]; array_splice($this->__h, $i, 1); return $v; }
+    public function count(): int { return count($this->__h); }
+    public function isEmpty() { return count($this->__h) === 0; }
+    public function rewind(): void {}
+    public function valid(): bool { return count($this->__h) > 0; }
+    public function current(): mixed { return $this->top(); }
+    public function key(): mixed { return count($this->__h) - 1; }
+    public function next(): void { $this->extract(); }
+}
+class SplMinHeap extends SplHeap { protected function compare($a, $b): int { return ($a < $b) ? 1 : (($a > $b) ? -1 : 0); } }
+class SplMaxHeap extends SplHeap { protected function compare($a, $b): int { return ($a > $b) ? 1 : (($a < $b) ? -1 : 0); } }
+class SplPriorityQueue implements Countable, Iterator {
+    private $__d = [];
+    private function __top_index() { $best = 0; for ($i = 1; $i < count($this->__d); $i++) { if ($this->__d[$i][0] > $this->__d[$best][0]) { $best = $i; } } return $best; }
+    public function insert($value, $priority) { $this->__d[] = [$priority, $value]; return true; }
+    public function top() { return $this->__d[$this->__top_index()][1]; }
+    public function extract() { if (count($this->__d) === 0) { return null; } $i = $this->__top_index(); $v = $this->__d[$i][1]; array_splice($this->__d, $i, 1); return $v; }
+    public function count(): int { return count($this->__d); }
+    public function isEmpty() { return count($this->__d) === 0; }
+    public function rewind(): void {}
+    public function valid(): bool { return count($this->__d) > 0; }
+    public function current(): mixed { return $this->top(); }
+    public function key(): mixed { return count($this->__d) - 1; }
+    public function next(): void { $this->extract(); }
+}
 "##;
 
 const STEP_LIMIT: u64 = 20_000_000;
@@ -523,24 +643,62 @@ impl Eval {
             }
             Stmt::Foreach { array, key, value, by_ref: _, body } => {
                 let arr = self.eval(array)?;
-                if let Value::Array(a) = arr {
-                    for (k, v) in a.entries.clone() {
-                        self.tick()?;
-                        if let Some(ke) = key {
-                            let kv = match k {
-                                Key::Int(n) => Value::Int(n),
-                                Key::Str(s) => Value::Str(s),
-                            };
-                            self.assign_to(ke, kv)?;
-                        }
-                        self.assign_to(value, v)?;
-                        match self.exec_block(body)? {
-                            Flow::Break(n) => return self.unwind_break(n),
-                            Flow::Continue(n) if n > 1 => return Ok(Flow::Continue(n - 1)),
-                            Flow::Return(rv) => return Ok(Flow::Return(rv)),
-                            _ => {}
+                match arr {
+                    Value::Array(a) => {
+                        for (k, v) in a.entries.clone() {
+                            if let Some(f) = self.foreach_step(key, value, body, Some(akey_to_value(&k)), v)? {
+                                return Ok(f);
+                            }
                         }
                     }
+                    Value::Object(rc) => {
+                        let class = rc.borrow().class.clone();
+                        // IteratorAggregate: getIterator() returns the real iterator
+                        let iter = if self.find_method(&class, "getiterator").is_some() {
+                            self.call_method(Value::Object(rc.clone()), "getIterator", vec![])?
+                        } else {
+                            Value::Object(rc.clone())
+                        };
+                        let it_class = match &iter {
+                            Value::Object(irc) => Some(irc.borrow().class.clone()),
+                            _ => None,
+                        };
+                        if let Some(ic) = it_class {
+                            if self.find_method(&ic, "rewind").is_some()
+                                && self.find_method(&ic, "valid").is_some()
+                            {
+                                // Iterator protocol
+                                self.call_method(iter.clone(), "rewind", vec![])?;
+                                loop {
+                                    self.tick()?;
+                                    if !to_bool(&self.call_method(iter.clone(), "valid", vec![])?) {
+                                        break;
+                                    }
+                                    let cur = self.call_method(iter.clone(), "current", vec![])?;
+                                    let k = if key.is_some() {
+                                        Some(self.call_method(iter.clone(), "key", vec![])?)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(f) = self.foreach_step(key, value, body, k, cur)? {
+                                        return Ok(f);
+                                    }
+                                    self.call_method(iter.clone(), "next", vec![])?;
+                                }
+                                return Ok(Flow::Normal);
+                            }
+                        }
+                        // plain object: iterate its (public) properties
+                        let props = rc.borrow().props.clone();
+                        for (k, v) in props {
+                            if let Some(f) =
+                                self.foreach_step(key, value, body, Some(Value::Str(k.into_bytes())), v)?
+                            {
+                                return Ok(f);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             Stmt::Switch { subject, cases } => {
@@ -624,6 +782,29 @@ impl Eval {
 
     fn unwind_break(&self, n: u32) -> R<Flow> {
         Ok(if n > 1 { Flow::Break(n - 1) } else { Flow::Normal })
+    }
+
+    /// One foreach iteration: bind key/value, run the body. Returns `Some(flow)`
+    /// if the loop must stop (break/return propagation), `None` to continue.
+    fn foreach_step(
+        &mut self,
+        key: &Option<Expr>,
+        value: &Expr,
+        body: &[Stmt],
+        kv: Option<Value>,
+        vv: Value,
+    ) -> R<Option<Flow>> {
+        self.tick()?;
+        if let (Some(ke), Some(k)) = (key, kv) {
+            self.assign_to(ke, k)?;
+        }
+        self.assign_to(value, vv)?;
+        Ok(match self.exec_block(body)? {
+            Flow::Break(n) => Some(if n > 1 { Flow::Break(n - 1) } else { Flow::Normal }),
+            Flow::Continue(n) if n > 1 => Some(Flow::Continue(n - 1)),
+            Flow::Return(rv) => Some(Flow::Return(rv)),
+            _ => None,
+        })
     }
 
     // ---- expressions ----------------------------------------------------
@@ -1096,6 +1277,29 @@ impl Eval {
     /// reference and cloning only the final element. (Naively evaluating `base`
     /// clones the whole container on every access — O(n^2) in array-heavy loops.)
     fn read_index(&mut self, base: &Expr, idx: &Option<Box<Expr>>) -> R<Value> {
+        // ArrayAccess: `$expr[$k]` where the base is an object → offsetGet($k).
+        // (Single level; deeper chains fall through to the array path below.)
+        let base_obj = match base {
+            Expr::Var(name) => matches!(self.vars().get(name), Some(Value::Object(_))),
+            Expr::Prop(..) | Expr::Index(..) | Expr::MethodCall(..) | Expr::Call(..) | Expr::StaticCall(..) => {
+                false // resolved on demand below to avoid double-eval of arrays
+            }
+            _ => false,
+        };
+        if base_obj {
+            let iv = match idx {
+                Some(i) => self.eval(i)?,
+                None => Value::Null,
+            };
+            let obj = self.eval(base)?;
+            if let Value::Object(rc) = &obj {
+                let class = rc.borrow().class.clone();
+                if self.find_method(&class, "offsetget").is_some() {
+                    return self.call_method(obj.clone(), "offsetGet", vec![iv]);
+                }
+            }
+            return Ok(Value::Null);
+        }
         let first = match idx {
             Some(i) => Arr::norm_key(&self.eval(i)?),
             None => return Ok(Value::Null), // `$a[]` isn't a readable expression
@@ -1228,6 +1432,18 @@ impl Eval {
         // and nested `$var[a][b]` are handled here.
         match base {
             Expr::Var(name) => {
+                // ArrayAccess: `$obj[$k] = v` / `$obj[] = v` → offsetSet($k, v)
+                if matches!(self.vars().get(name), Some(Value::Object(_))) {
+                    let obj = self.vars().get(name).cloned().unwrap();
+                    if let Value::Object(rc) = &obj {
+                        let class = rc.borrow().class.clone();
+                        if self.find_method(&class, "offsetset").is_some() {
+                            let kv = key.as_ref().map(akey_to_value).unwrap_or(Value::Null);
+                            self.call_method(obj.clone(), "offsetSet", vec![kv, val])?;
+                            return Ok(());
+                        }
+                    }
+                }
                 let entry = self
                     .vars()
                     .entry(name.clone())
@@ -2100,8 +2316,60 @@ impl Eval {
             "count" | "sizeof" => match a(0) {
                 Value::Array(arr) => Value::Int(arr.len() as i64),
                 Value::Null => Value::Int(0),
+                Value::Object(rc) => {
+                    let class = rc.borrow().class.clone();
+                    if self.find_method(&class, "count").is_some() {
+                        return self.call_method(Value::Object(rc), "count", vec![]);
+                    }
+                    Value::Int(1)
+                }
                 _ => Value::Int(1),
             },
+            "spl_object_id" | "spl_object_hash" => match a(0) {
+                Value::Object(rc) => {
+                    let id = Rc::as_ptr(&rc) as *const () as usize as i64;
+                    if name == "spl_object_hash" {
+                        Value::Str(format!("{id:032x}").into_bytes())
+                    } else {
+                        Value::Int(id)
+                    }
+                }
+                _ => Value::Int(0),
+            },
+            "iterator_to_array" => {
+                // consume any iterable into an array
+                let mut out = Arr::new();
+                match a(0) {
+                    Value::Array(arr) => return Ok(Value::Array(arr)),
+                    Value::Object(rc) => {
+                        let v = Value::Object(rc);
+                        let class = match &v { Value::Object(r) => r.borrow().class.clone(), _ => String::new() };
+                        let iter = if self.find_method(&class, "getiterator").is_some() {
+                            self.call_method(v, "getIterator", vec![])?
+                        } else {
+                            v
+                        };
+                        let ic = match &iter { Value::Object(r) => r.borrow().class.clone(), _ => String::new() };
+                        if self.find_method(&ic, "rewind").is_some() {
+                            self.call_method(iter.clone(), "rewind", vec![])?;
+                            let use_keys = args.len() < 2 || to_bool(&a(1)); // default: preserve keys
+                            while to_bool(&self.call_method(iter.clone(), "valid", vec![])?) {
+                                let cur = self.call_method(iter.clone(), "current", vec![])?;
+                                if use_keys {
+                                    let k = self.call_method(iter.clone(), "key", vec![])?;
+                                    out.insert(Arr::norm_key(&k), cur);
+                                } else {
+                                    out.push(cur);
+                                }
+                                self.call_method(iter.clone(), "next", vec![])?;
+                                self.tick()?;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                Value::Array(out)
+            }
             "var_dump" => {
                 for v in &args {
                     let mut s = String::new();
