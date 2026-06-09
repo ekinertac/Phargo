@@ -13,5 +13,7 @@
 //!   * The AST is owned and built once; loop/function bodies are tree nodes, not
 //!     source offsets, so nothing is ever re-parsed.
 
+pub mod ast;
 pub mod lexer;
+pub mod parser;
 pub mod token;
