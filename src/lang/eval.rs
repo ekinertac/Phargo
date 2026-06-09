@@ -2065,6 +2065,12 @@ fn format_spec(conv: u8, spec: &str, arg: &Value) -> Vec<u8> {
 
 // ---- var_dump / print_r formatting -------------------------------------
 fn var_dump(v: &Value, indent: usize, out: &mut String) {
+    var_dump_seen(v, indent, out, &mut Vec::new());
+}
+
+/// `seen` holds the Rc addresses of objects on the current path, so circular
+/// object graphs print `*RECURSION*` instead of recursing into a memory bomb.
+fn var_dump_seen(v: &Value, indent: usize, out: &mut String, seen: &mut Vec<usize>) {
     let pad = "  ".repeat(indent);
     match v {
         Value::Null => out.push_str(&format!("{pad}NULL\n")),
@@ -2085,17 +2091,24 @@ fn var_dump(v: &Value, indent: usize, out: &mut String) {
                         out.push_str(&format!("{pad}  [\"{}\"]=>\n", String::from_utf8_lossy(s)))
                     }
                 }
-                var_dump(val, indent + 1, out);
+                var_dump_seen(val, indent + 1, out, seen);
             }
             out.push_str(&format!("{pad}}}\n"));
         }
         Value::Object(o) => {
-            let o = o.borrow();
-            out.push_str(&format!("{pad}object({})#1 ({}) {{\n", o.class, o.props.len()));
-            for (k, val) in &o.props {
-                out.push_str(&format!("{pad}  [\"{k}\"]=>\n"));
-                var_dump(val, indent + 1, out);
+            let id = Rc::as_ptr(o) as *const () as usize;
+            if seen.contains(&id) {
+                out.push_str(&format!("{pad}*RECURSION*\n"));
+                return;
             }
+            let ob = o.borrow();
+            out.push_str(&format!("{pad}object({})#1 ({}) {{\n", ob.class, ob.props.len()));
+            seen.push(id);
+            for (k, val) in &ob.props {
+                out.push_str(&format!("{pad}  [\"{k}\"]=>\n"));
+                var_dump_seen(val, indent + 1, out, seen);
+            }
+            seen.pop();
             out.push_str(&format!("{pad}}}\n"));
         }
         Value::Closure(_) => out.push_str(&format!("{pad}object(Closure)#1 (0) {{\n{pad}}}\n")),
