@@ -103,6 +103,96 @@ class UnderflowException extends RuntimeException {}
 class OverflowException extends RuntimeException {}
 class JsonException extends Exception {}
 
+interface DateTimeInterface {}
+class DateTimeZone {
+    public $name;
+    public function __construct($name = "UTC") { $this->name = $name; }
+    public function getName() { return $this->name; }
+    public function getOffset($dt) { return 0; }
+}
+class DateTime implements DateTimeInterface {
+    public $__ts;
+    public function __construct($s = "now") { $this->__ts = strtotime($s); }
+    public function format($fmt) { return date($fmt, $this->__ts); }
+    public function getTimestamp() { return $this->__ts; }
+    public function setTimestamp($ts) { $this->__ts = $ts; return $this; }
+    public function setDate($y, $m, $d) { $this->__ts = mktime((int)date("H", $this->__ts), (int)date("i", $this->__ts), (int)date("s", $this->__ts), $m, $d, $y); return $this; }
+    public function setTime($h, $i, $s = 0) { $this->__ts = mktime($h, $i, $s, (int)date("n", $this->__ts), (int)date("j", $this->__ts), (int)date("Y", $this->__ts)); return $this; }
+    public function getTimezone() { return new DateTimeZone("UTC"); }
+    public function setTimezone($tz) { return $this; }
+    public function getOffset() { return 0; }
+    public function add($iv) { $this->__ts = phargo_civil_add($this->__ts, $iv->y, $iv->m, $iv->d, $iv->h, $iv->i, $iv->s); return $this; }
+    public function sub($iv) { $this->__ts = phargo_civil_add($this->__ts, -$iv->y, -$iv->m, -$iv->d, -$iv->h, -$iv->i, -$iv->s); return $this; }
+    public function modify($s) { $this->__ts = __phargo_modify($this->__ts, $s); return $this; }
+    public function diff($other) { return DateInterval::__fromArray(phargo_date_diff($this->__ts, $other->getTimestamp())); }
+    public static function createFromFormat($fmt, $s, $tz = null) { return new DateTime($s); }
+}
+class DateTimeImmutable implements DateTimeInterface {
+    public $__ts;
+    public function __construct($s = "now") { $this->__ts = strtotime($s); }
+    public function format($fmt) { return date($fmt, $this->__ts); }
+    public function getTimestamp() { return $this->__ts; }
+    public function getTimezone() { return new DateTimeZone("UTC"); }
+    public function add($iv) { $n = clone $this; $n->__ts = phargo_civil_add($this->__ts, $iv->y, $iv->m, $iv->d, $iv->h, $iv->i, $iv->s); return $n; }
+    public function sub($iv) { $n = clone $this; $n->__ts = phargo_civil_add($this->__ts, -$iv->y, -$iv->m, -$iv->d, -$iv->h, -$iv->i, -$iv->s); return $n; }
+    public function modify($s) { $n = clone $this; $n->__ts = __phargo_modify($this->__ts, $s); return $n; }
+    public function diff($other) { return DateInterval::__fromArray(phargo_date_diff($this->__ts, $other->getTimestamp())); }
+    public static function createFromFormat($fmt, $s, $tz = null) { return new DateTimeImmutable($s); }
+}
+class DateInterval {
+    public $y = 0; public $m = 0; public $d = 0;
+    public $h = 0; public $i = 0; public $s = 0;
+    public $f = 0; public $days = false; public $invert = 0;
+    public function __construct($spec = "") {
+        if ($spec === "") { return; }
+        $inT = false; $num = "";
+        for ($k = 0; $k < strlen($spec); $k++) {
+            $c = $spec[$k];
+            if ($c === "P") { continue; }
+            if ($c === "T") { $inT = true; continue; }
+            if (ctype_digit($c)) { $num .= $c; continue; }
+            $n = (int)$num; $num = "";
+            if ($c === "Y") { $this->y = $n; }
+            elseif ($c === "M") { if ($inT) { $this->i = $n; } else { $this->m = $n; } }
+            elseif ($c === "W") { $this->d += $n * 7; }
+            elseif ($c === "D") { $this->d = $n; }
+            elseif ($c === "H") { $this->h = $n; }
+            elseif ($c === "S") { $this->s = $n; }
+        }
+    }
+    public static function __fromArray($a) {
+        $iv = new DateInterval();
+        $iv->y = $a["y"]; $iv->m = $a["m"]; $iv->d = $a["d"];
+        $iv->h = $a["h"]; $iv->i = $a["i"]; $iv->s = $a["s"];
+        $iv->days = $a["days"]; $iv->invert = $a["invert"];
+        return $iv;
+    }
+    public function format($f) {
+        $r = ""; $n = strlen($f);
+        for ($k = 0; $k < $n; $k++) {
+            if ($f[$k] === "%" && $k + 1 < $n) {
+                $k++; $c = $f[$k];
+                if ($c === "y") { $r .= $this->y; }
+                elseif ($c === "Y") { $r .= sprintf("%02d", $this->y); }
+                elseif ($c === "m") { $r .= $this->m; }
+                elseif ($c === "M") { $r .= sprintf("%02d", $this->m); }
+                elseif ($c === "d") { $r .= $this->d; }
+                elseif ($c === "D") { $r .= sprintf("%02d", $this->d); }
+                elseif ($c === "h") { $r .= $this->h; }
+                elseif ($c === "H") { $r .= sprintf("%02d", $this->h); }
+                elseif ($c === "i") { $r .= $this->i; }
+                elseif ($c === "I") { $r .= sprintf("%02d", $this->i); }
+                elseif ($c === "s") { $r .= $this->s; }
+                elseif ($c === "S") { $r .= sprintf("%02d", $this->s); }
+                elseif ($c === "a") { $r .= $this->days; }
+                elseif ($c === "R") { $r .= $this->invert ? "-" : "+"; }
+                elseif ($c === "%") { $r .= "%"; }
+                else { $r .= $c; }
+            } else { $r .= $f[$k]; }
+        }
+        return $r;
+    }
+}
 class ReflectionClass {
     public $name;
     public function __construct($arg) { $this->name = is_object($arg) ? get_class($arg) : $arg; }
@@ -2377,6 +2467,162 @@ impl Eval {
             "chdir" => {
                 let dir = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 Value::Bool(std::env::set_current_dir(&dir).is_ok())
+            }
+            // ---- date / time (reuse the legacy engine's civil-calendar functions) ----
+            "time" => Value::Int(crate::now_unix()),
+            "date" | "gmdate" => {
+                let fmt = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let ts = if args.len() > 1 { to_i64(&a(1)) } else { crate::now_unix() };
+                Value::Str(crate::php_date(&fmt, ts).into_bytes())
+            }
+            "strftime" | "gmstrftime" => {
+                let fmt = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let ts = if args.len() > 1 { to_i64(&a(1)) } else { crate::now_unix() };
+                Value::Str(crate::php_strftime(&fmt, ts).into_bytes())
+            }
+            "mktime" | "gmmktime" => {
+                let now = crate::now_unix();
+                let (cy, cm, cd) = crate::civil_from_days(now.div_euclid(86400));
+                let secs = now.rem_euclid(86400);
+                let g = |i: usize, dflt: i64| if args.len() > i { to_i64(&a(i)) } else { dflt };
+                Value::Int(crate::make_ts(
+                    g(0, secs / 3600),
+                    g(1, (secs % 3600) / 60),
+                    g(2, secs % 60),
+                    g(3, cm),
+                    g(4, cd),
+                    g(5, cy),
+                ))
+            }
+            "strtotime" => {
+                let s = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let base = if args.len() > 1 { to_i64(&a(1)) } else { crate::now_unix() };
+                match crate::php_strtotime(&s, base) {
+                    Some(t) => Value::Int(t),
+                    None => Value::Bool(false),
+                }
+            }
+            "checkdate" => {
+                let (m, d, y) = (to_i64(&a(0)), to_i64(&a(1)), to_i64(&a(2)));
+                Value::Bool(
+                    (1..=12).contains(&m)
+                        && d >= 1
+                        && (1..=32767).contains(&y)
+                        && d <= crate::days_in_month(y, m),
+                )
+            }
+            "microtime" => {
+                if to_bool(&a(0)) {
+                    Value::Float(crate::now_unix() as f64)
+                } else {
+                    Value::Str(format!("0.00000000 {}", crate::now_unix()).into_bytes())
+                }
+            }
+            "ctype_digit" => {
+                let s = to_bytes(&a(0));
+                Value::Bool(!s.is_empty() && s.iter().all(|b| b.is_ascii_digit()))
+            }
+            "ctype_alpha" => {
+                let s = to_bytes(&a(0));
+                Value::Bool(!s.is_empty() && s.iter().all(|b| b.is_ascii_alphabetic()))
+            }
+            "ctype_alnum" => {
+                let s = to_bytes(&a(0));
+                Value::Bool(!s.is_empty() && s.iter().all(|b| b.is_ascii_alphanumeric()))
+            }
+            "ctype_space" => {
+                let s = to_bytes(&a(0));
+                Value::Bool(!s.is_empty() && s.iter().all(|b| b.is_ascii_whitespace()))
+            }
+            "phargo_civil_add" => {
+                let ts = to_i64(&a(0));
+                let days0 = ts.div_euclid(86400);
+                let secs0 = ts.rem_euclid(86400);
+                let (y, mo, d) = crate::civil_from_days(days0);
+                let (dy, dm, dd) = (to_i64(&a(1)), to_i64(&a(2)), to_i64(&a(3)));
+                let (dh, di, ds) = (to_i64(&a(4)), to_i64(&a(5)), to_i64(&a(6)));
+                let total_months = (y * 12 + (mo - 1)) + dy * 12 + dm;
+                let ny = total_months.div_euclid(12);
+                let nmo = total_months.rem_euclid(12) + 1;
+                let nday = d.min(crate::days_in_month(ny, nmo));
+                let base = crate::days_from_civil(ny, nmo, nday) * 86400 + secs0;
+                Value::Int(base + dd * 86400 + dh * 3600 + di * 60 + ds)
+            }
+            "phargo_date_diff" => {
+                let (t1, t2) = (to_i64(&a(0)), to_i64(&a(1)));
+                let invert = t1 > t2;
+                let (lo, hi) = if t1 <= t2 { (t1, t2) } else { (t2, t1) };
+                let dec = |ts: i64| {
+                    let days = ts.div_euclid(86400);
+                    let s = ts.rem_euclid(86400);
+                    let (y, m, d) = crate::civil_from_days(days);
+                    (y, m, d, s / 3600, (s % 3600) / 60, s % 60)
+                };
+                let (y1, mo1, d1, h1, mi1, s1) = dec(lo);
+                let (y2, mo2, d2, h2, mi2, s2) = dec(hi);
+                let (mut s, mut mi, mut h, mut d, mut mo, mut y) =
+                    (s2 - s1, mi2 - mi1, h2 - h1, d2 - d1, mo2 - mo1, y2 - y1);
+                if s < 0 { s += 60; mi -= 1; }
+                if mi < 0 { mi += 60; h -= 1; }
+                if h < 0 { h += 24; d -= 1; }
+                if d < 0 {
+                    let pm = if mo2 == 1 { 12 } else { mo2 - 1 };
+                    let py = if mo2 == 1 { y2 - 1 } else { y2 };
+                    d += crate::days_in_month(py, pm);
+                    mo -= 1;
+                }
+                if mo < 0 { mo += 12; y -= 1; }
+                let total_days = lo.div_euclid(86400).abs_diff(hi.div_euclid(86400)) as i64;
+                let mut r = Arr::new();
+                for (k, v) in [("y", y), ("m", mo), ("d", d), ("h", h), ("i", mi), ("s", s), ("days", total_days)] {
+                    r.insert(Key::Str(k.as_bytes().to_vec()), Value::Int(v));
+                }
+                r.insert(Key::Str(b"invert".to_vec()), Value::Int(invert as i64));
+                let _ = (d1, h1, mi1, s1, mo1, y1);
+                Value::Array(r)
+            }
+            "__phargo_modify" => {
+                let ts = to_i64(&a(0));
+                let s = String::from_utf8_lossy(&to_bytes(&a(1))).to_ascii_lowercase();
+                let (mut dy, mut dm, mut dd, mut dh, mut di, mut ds) = (0i64, 0, 0, 0, 0, 0);
+                let chars: Vec<char> = s.chars().collect();
+                let mut i = 0;
+                while i < chars.len() {
+                    if s[i..].starts_with("tomorrow") { dd += 1; i += 8; continue; }
+                    if s[i..].starts_with("yesterday") { dd -= 1; i += 9; continue; }
+                    let c = chars[i];
+                    if c == '+' || c == '-' || c.is_ascii_digit() {
+                        let start = i;
+                        if c == '+' || c == '-' { i += 1; }
+                        while i < chars.len() && chars[i].is_ascii_digit() { i += 1; }
+                        let num: i64 = s[start..i].parse().unwrap_or(0);
+                        while i < chars.len() && chars[i].is_whitespace() { i += 1; }
+                        let ws = i;
+                        while i < chars.len() && chars[i].is_ascii_alphabetic() { i += 1; }
+                        let unit = &s[ws..i];
+                        match unit {
+                            u if u.starts_with("year") => dy += num,
+                            u if u.starts_with("month") => dm += num,
+                            u if u.starts_with("week") => dd += num * 7,
+                            u if u.starts_with("day") => dd += num,
+                            u if u.starts_with("hour") => dh += num,
+                            u if u.starts_with("min") => di += num,
+                            u if u.starts_with("sec") => ds += num,
+                            _ => {}
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                let days0 = ts.div_euclid(86400);
+                let secs0 = ts.rem_euclid(86400);
+                let (y, mo, d) = crate::civil_from_days(days0);
+                let total_months = (y * 12 + (mo - 1)) + dy * 12 + dm;
+                let ny = total_months.div_euclid(12);
+                let nmo = total_months.rem_euclid(12) + 1;
+                let nday = d.min(crate::days_in_month(ny, nmo));
+                let base = crate::days_from_civil(ny, nmo, nday) * 86400 + secs0;
+                Value::Int(base + dd * 86400 + dh * 3600 + di * 60 + ds)
             }
             // ---- filesystem ----
             "file_get_contents" => {
