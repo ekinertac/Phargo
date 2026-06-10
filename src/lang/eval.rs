@@ -48,6 +48,8 @@ pub struct Eval {
     included: HashSet<String>,
     /// Output-buffering watermarks into `out` (one per active `ob_start`).
     ob_stack: Vec<usize>,
+    /// Active generator collection buffer (eager generators collect yields here).
+    gen_buf: Option<Arr>,
     steps: u64,
 }
 
@@ -272,6 +274,19 @@ class ReflectionFunction {
 class ReflectionNamedType { public $name; public function __construct($n) { $this->name = $n; } public function getName() { return $this->name; } public function allowsNull() { return false; } }
 class ReflectionException extends Exception {}
 
+// Generators are eager in this engine: the function body runs to completion,
+// collecting yields into __d; this object iterates them. send() can't feed values
+// back (eager), and infinite generators hit the step limit. getReturn() works.
+class Generator implements Iterator {
+    public $__d = []; public $__k = []; public $__p = 0; public $__ret = null;
+    public function rewind(): void { $this->__p = 0; }
+    public function valid(): bool { return $this->__p < count($this->__k); }
+    public function current(): mixed { return $this->valid() ? $this->__d[$this->__k[$this->__p]] : null; }
+    public function key(): mixed { return $this->valid() ? $this->__k[$this->__p] : null; }
+    public function next(): void { $this->__p = $this->__p + 1; }
+    public function send($value) { $this->__p = $this->__p + 1; return $this->current(); }
+    public function getReturn() { return $this->__ret; }
+}
 class ArrayIterator implements Iterator, ArrayAccess, Countable {
     private $__d; private $__k; private $__p = 0;
     public function __construct($array = []) { $this->__d = $array; $this->__k = array_keys($array); }
@@ -417,6 +432,7 @@ impl Eval {
             cur_file: None,
             included: HashSet::new(),
             ob_stack: Vec::new(),
+            gen_buf: None,
             steps: 0,
         }
     }
@@ -1078,6 +1094,49 @@ impl Eval {
                 let v = self.eval(inner)?;
                 self.thrown = Some(v);
                 return Err(RunError("__phargo_throw__".into()));
+            }
+            Expr::Yield(key, value) => {
+                let v = match value {
+                    Some(e) => self.eval(e)?,
+                    None => Value::Null,
+                };
+                let k = match key {
+                    Some(e) => Some(self.eval(e)?),
+                    None => None,
+                };
+                if let Some(buf) = self.gen_buf.as_mut() {
+                    match k {
+                        Some(kv) => buf.insert(Arr::norm_key(&kv), v),
+                        None => buf.push(v),
+                    }
+                }
+                Value::Null // eager generators: send() values aren't modeled
+            }
+            Expr::YieldFrom(e) => {
+                let src = self.eval(e)?;
+                match src {
+                    Value::Array(a) => {
+                        if let Some(buf) = self.gen_buf.as_mut() {
+                            for (k, v) in a.entries {
+                                match k {
+                                    Key::Int(_) => buf.push(v),
+                                    Key::Str(_) => buf.insert(k, v),
+                                }
+                            }
+                        }
+                    }
+                    Value::Object(_) => {
+                        // a sub-generator/iterable — drain via iterator_to_array
+                        let drained = self.builtin("iterator_to_array", vec![src, Value::Bool(false)])?;
+                        if let (Some(buf), Value::Array(a)) = (self.gen_buf.as_mut(), drained) {
+                            for (_, v) in a.entries {
+                                buf.push(v);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                Value::Null
             }
             Expr::Closure(c) => {
                 let mut captures = Vec::new();
@@ -1915,12 +1974,9 @@ impl Eval {
             ClosureKind::Full(f) => {
                 self.bind_params(&mut scope, &f.params, &args)?;
                 self.scopes.push(scope);
-                let r = self.exec_block(&f.body);
+                let r = self.run_fn_body(&f.body);
                 self.scopes.pop();
-                r.map(|flow| match flow {
-                    Flow::Return(v) => v,
-                    _ => Value::Null,
-                })
+                r
             }
             ClosureKind::Arrow(f) => {
                 self.bind_params(&mut scope, &f.params, &args)?;
@@ -1932,6 +1988,45 @@ impl Eval {
         };
         self.call_depth -= 1;
         r
+    }
+
+    /// Run a function/method body that has already had its scope pushed. If the
+    /// body contains `yield`, run it as an (eager) generator and return a
+    /// Generator object; otherwise return the `return` value.
+    fn run_fn_body(&mut self, body: &[Stmt]) -> R<Value> {
+        if has_yield(body) {
+            let prev = self.gen_buf.take();
+            self.gen_buf = Some(Arr::new());
+            let r = self.exec_block(body);
+            let buf = self.gen_buf.take().unwrap_or_default();
+            self.gen_buf = prev;
+            let ret = match r? {
+                Flow::Return(v) => v,
+                _ => Value::Null,
+            };
+            Ok(self.make_generator(buf, ret))
+        } else {
+            match self.exec_block(body)? {
+                Flow::Return(v) => Ok(v),
+                _ => Ok(Value::Null),
+            }
+        }
+    }
+
+    fn make_generator(&self, buf: Arr, ret: Value) -> Value {
+        let mut karr = Arr::new();
+        for (k, _) in &buf.entries {
+            karr.push(akey_to_value(k));
+        }
+        let o = Rc::new(RefCell::new(Obj { class: "Generator".into(), props: Vec::new() }));
+        {
+            let mut b = o.borrow_mut();
+            b.set("__d", Value::Array(buf));
+            b.set("__k", Value::Array(karr));
+            b.set("__p", Value::Int(0));
+            b.set("__ret", ret);
+        }
+        Value::Object(o)
     }
 
     fn call_user(&mut self, f: &FuncDecl, args: Vec<Value>) -> R<Value> {
@@ -1956,13 +2051,10 @@ impl Eval {
             scope.insert(p.name.clone(), v);
         }
         self.scopes.push(scope);
-        let r = self.exec_block(&f.body);
+        let r = self.run_fn_body(&f.body);
         self.scopes.pop();
         self.call_depth -= 1;
-        match r? {
-            Flow::Return(v) => Ok(v),
-            _ => Ok(Value::Null),
-        }
+        r
     }
 }
 
@@ -2177,14 +2269,11 @@ impl Eval {
         }
         let prev_class = self.current_class.replace(decl_class.to_string());
         self.scopes.push(scope);
-        let r = self.exec_block(&body);
+        let r = self.run_fn_body(&body);
         self.scopes.pop();
         self.current_class = prev_class;
         self.call_depth -= 1;
-        match r? {
-            Flow::Return(v) => Ok(v),
-            _ => Ok(Value::Null),
-        }
+        r
     }
 
     fn call_static(
@@ -2213,14 +2302,11 @@ impl Eval {
         self.bind_params(&mut scope, &m.params, &args)?;
         let prev_class = self.current_class.replace(decl_class.clone());
         self.scopes.push(scope);
-        let r = self.exec_block(&body);
+        let r = self.run_fn_body(&body);
         self.scopes.pop();
         self.current_class = prev_class;
         self.call_depth -= 1;
-        match r? {
-            Flow::Return(v) => Ok(v),
-            _ => Ok(Value::Null),
-        }
+        r
     }
 
     fn bind_params(
@@ -5201,6 +5287,68 @@ fn json_string(b: &[u8], p: &mut usize) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+// ---- generator detection: does a function body contain `yield`? (not
+// descending into nested closures/functions, whose yields are their own) ----
+fn has_yield(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_has_yield)
+}
+
+fn stmt_has_yield(s: &Stmt) -> bool {
+    match s {
+        Stmt::Expr(e) | Stmt::Throw(e) => expr_has_yield(e),
+        Stmt::Echo(es) => es.iter().any(expr_has_yield),
+        Stmt::Return(Some(e)) => expr_has_yield(e),
+        Stmt::Block(b) => has_yield(b),
+        Stmt::If { cond, then, elseifs, els } => {
+            expr_has_yield(cond)
+                || has_yield(then)
+                || elseifs.iter().any(|(c, b)| expr_has_yield(c) || has_yield(b))
+                || els.as_ref().is_some_and(|b| has_yield(b))
+        }
+        Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+            expr_has_yield(cond) || has_yield(body)
+        }
+        Stmt::For { init, cond, step, body } => {
+            init.iter().chain(cond).chain(step).any(expr_has_yield) || has_yield(body)
+        }
+        Stmt::Foreach { array, body, .. } => expr_has_yield(array) || has_yield(body),
+        Stmt::Switch { subject, cases } => {
+            expr_has_yield(subject) || cases.iter().any(|c| has_yield(&c.body))
+        }
+        Stmt::Try { body, catches, finally } => {
+            has_yield(body)
+                || catches.iter().any(|c| has_yield(&c.body))
+                || finally.as_ref().is_some_and(|b| has_yield(b))
+        }
+        _ => false,
+    }
+}
+
+fn expr_has_yield(e: &Expr) -> bool {
+    match e {
+        Expr::Yield(..) | Expr::YieldFrom(..) => true,
+        Expr::Binary(_, a, b) | Expr::AssignOp(_, a, b) | Expr::Assign(a, b)
+        | Expr::AssignRef(a, b) | Expr::InstanceOf(a, b) => expr_has_yield(a) || expr_has_yield(b),
+        Expr::Unary(_, x) | Expr::Cast(_, x) | Expr::Print(x) | Expr::ErrorSuppress(x)
+        | Expr::Throw(x) | Expr::Empty(x) | Expr::Clone(x) | Expr::PreInc(x)
+        | Expr::PreDec(x) | Expr::PostInc(x) | Expr::PostDec(x) => expr_has_yield(x),
+        Expr::Ternary(a, b, c) => {
+            expr_has_yield(a) || b.as_ref().is_some_and(|e| expr_has_yield(e)) || expr_has_yield(c)
+        }
+        Expr::Index(a, b) => expr_has_yield(a) || b.as_ref().is_some_and(|e| expr_has_yield(e)),
+        Expr::Call(_, args)
+        | Expr::MethodCall(_, _, args, _)
+        | Expr::StaticCall(_, _, args)
+        | Expr::New(_, args) => args.iter().any(|a| expr_has_yield(&a.value)),
+        Expr::Array(items) => items
+            .iter()
+            .any(|it| expr_has_yield(&it.value) || it.key.as_ref().is_some_and(expr_has_yield)),
+        Expr::Match(s, arms) => expr_has_yield(s) || arms.iter().any(|a| expr_has_yield(&a.body)),
+        Expr::Isset(es) => es.iter().any(expr_has_yield),
+        _ => false, // Closure/ArrowFn intentionally not descended into
+    }
 }
 
 fn ucwords_str(s: &str) -> String {

@@ -1278,13 +1278,23 @@ impl Parser {
                         Ok(Expr::Throw(Box::new(self.expr_bp(0)?)))
                     }
                     "yield" => {
-                        // not yet supported by the evaluator; parse to keep going
                         self.bump();
-                        if matches!(self.kind(), Kind::Semi | Kind::RParen | Kind::Eof) {
-                            Ok(Expr::Null)
+                        if self.eat_kw("from") {
+                            let e = self.expr_bp(10)?;
+                            Ok(Expr::YieldFrom(Box::new(e)))
+                        } else if matches!(
+                            self.kind(),
+                            Kind::Semi | Kind::RParen | Kind::RBracket | Kind::Eof | Kind::Comma
+                        ) {
+                            Ok(Expr::Yield(None, None))
                         } else {
-                            let _ = self.expr_bp(10)?;
-                            Ok(Expr::Null)
+                            let first = self.expr_bp(10)?;
+                            if self.eat(&Kind::FatArrow) {
+                                let v = self.expr_bp(10)?;
+                                Ok(Expr::Yield(Some(Box::new(first)), Some(Box::new(v))))
+                            } else {
+                                Ok(Expr::Yield(None, Some(Box::new(first))))
+                            }
                         }
                     }
                     "isset" => {

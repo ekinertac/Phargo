@@ -127,6 +127,8 @@ pub enum Expr {
     List(Vec<Option<ArrayItem>>),   // list(...) / [...] as an assignment target
     ConstFetchExpr(Box<Expr>),      // (rare) dynamic
     FirstClassCallable(Box<Expr>),  // foo(...)
+    Yield(Option<Box<Expr>>, Option<Box<Expr>>), // yield [key =>] value
+    YieldFrom(Box<Expr>),                        // yield from iterable
 }
 
 /// Property/method name after `->` or `::`: usually an identifier, but can be
