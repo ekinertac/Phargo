@@ -18,9 +18,12 @@ I'm not (yet) a Rust or PHP-internals expert. This is an open experiment in AI-a
 
 ## How it works
 
-- `src/lib.rs` — the engine. `run(php_source) -> printed output`.
-- `src/main.rs` — the scoreboard. Runs every `.phpt` in `tests/phpt/`, compares output to each test's expected section, writes `PROGRESS.md`.
-- `tests/phpt/` — the oracle. Real PHP `.phpt` format: each file bundles the code *and* its expected output, so we can score against it with no PHP runtime installed.
+- `src/lang/` — **the engine**: a proper language implementation — byte-level lexer (`lexer.rs`/`token.rs`) → recursive-descent parser → owned AST (`ast.rs`/`parser.rs`) → tree-walking evaluator (`value.rs`/`eval.rs`). `run(php_source) -> printed output`.
+- `src/lib.rs` — a 52-line crate root: the public `run`/`run_with_path` entry points + the shared subsystems the evaluator reuses (`regex.rs`, `datetime.rs`).
+- `src/main.rs` — the scoreboard. Runs every `.phpt` in `vendor/php-src/`, compares output to each test's expected section, writes `PROGRESS.md`.
+- `tests/phpt/` — curated smoke tests. Real PHP `.phpt` format: each file bundles the code *and* its expected output, so we can score against it with no PHP runtime installed.
+
+> **Note:** the engine was rebuilt from scratch (the original single-pass interpreter is retired). The from-scratch lexer→parser→AST→evaluator now passes *more* corpus tests than the engine it replaced — see the git history.
 
 ## Run it
 
@@ -30,4 +33,4 @@ cargo run
 
 ## Status
 
-**v58: 1981 / 21862 upstream php-src tests passing (9.06%).** The core language is largely there — variables, the full operator/type-juggling model, control flow, functions/closures (+ variadics `...$x`, argument unpacking `...$arr`, named args), arrays + ~200 builtins, classes/interfaces/traits/enums, exceptions, constructor promotion, attributes, dynamic `new $cls()` / `$obj->$m()`, class introspection + Reflection, `foreach` over user `Iterator`/`IteratorAggregate`, `ArrayAccess` (`$obj[$k]`), SPL containers (`ArrayObject`/`ArrayIterator`/`SplStack`/`SplQueue`/`SplFixedArray`/`SplObjectStorage`), date/time (`date`/`mktime`/`strtotime`/`DateTime`), a from-scratch regex engine (`preg_*`), `include`/`require`/`eval`, output buffering, filesystem + path functions, file streams (`fopen` family + `STDIN`/`STDOUT`/`STDERR`), UTF-8 `mbstring` basics, and `serialize`/`unserialize`. The climb continues — see [PROGRESS.md](PROGRESS.md).
+**v2 engine: 2048 / 21862 upstream php-src tests passing (9.37%).** Rebuilt from scratch as a real lexer→parser→AST→evaluator, the engine now passes **more** corpus tests than the original single-pass interpreter it replaced (1,981), with **byte-correct strings**, correct operator precedence, and an AST (parse once, no re-parsing). The core language is there — variables, the full operator/type-juggling model, control flow, functions/closures (+ variadics `...$x`, argument unpacking `...$arr`, named args), arrays + ~200 builtins, classes/interfaces/traits/enums, exceptions, constructor promotion, attributes + 8.4 property hooks, dynamic `new $cls()` / `$obj->$m()`, class introspection + Reflection, `foreach` over user `Iterator`/`IteratorAggregate`, `ArrayAccess` (`$obj[$k]`), SPL containers (`ArrayObject`/`ArrayIterator`/`SplStack`/`SplQueue`/`SplFixedArray`/`SplObjectStorage`/`SplHeap`), date/time (`date`/`mktime`/`strtotime`/`DateTime`/`DateInterval`), a from-scratch regex engine (`preg_*`), `include`/`require`/`eval`, output buffering, filesystem + path functions, `serialize`/`unserialize`, and `var_export`/`var_dump`. The climb continues — see [PROGRESS.md](PROGRESS.md).
