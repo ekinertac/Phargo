@@ -521,36 +521,17 @@ pub fn run(source: &str) -> R<String> {
 
 /// Like [`run`], but records the script's file path so `__FILE__`/`__DIR__` and
 /// relative `include`/`require` resolve against it.
+///
+/// As of the v2 cutover this is the v2 engine (`lang::` — lexer → parser → AST →
+/// evaluator). The legacy single-pass `Engine` below is retired; the shared
+/// subsystems it still hosts (regex, date/time) are reused by v2 via `crate::`.
 pub fn run_with_path(source: &str, path: Option<PathBuf>) -> R<String> {
-    // The prelude registers the exception/SPL classes, then the script runs.
-    let full = format!("{PRELUDE}{source}");
-    let mut engine = Engine {
-        src: full.chars().collect(),
-        pos: 0,
-        out: String::new(),
-        vars: HashMap::new(),
-        live: true,
-        steps: 0,
-        funcs: HashMap::new(),
-        classes: HashMap::new(),
-        current_class: None,
-        static_props: HashMap::new(),
-        return_val: None,
-        call_depth: 0,
-        thrown: None,
-        consts: HashMap::new(),
-        ob_stack: Vec::new(),
-        cur_file: path,
-        included: HashSet::new(),
-        enum_cases: HashMap::new(),
-        bc_scale: 0,
-        exited: false,
-    };
-    // Bound the main run by the length captured now: `include`/`eval` append to
-    // `src` during execution, and the top-level loop must not run into them.
-    let end = engine.src.len();
-    engine.program_ranged(end)?;
-    Ok(engine.out)
+    let toks = lang::lexer::Lexer::tokenize(source.as_bytes())
+        .map_err(|e| EngineError(format!("Parse error: {}", e.msg)))?;
+    let ast = lang::parser::Parser::parse(toks)
+        .map_err(|e| EngineError(format!("Parse error: {}", e.msg)))?;
+    let out = lang::eval::Eval::run_with_path(&ast, path).map_err(|e| EngineError(e.0))?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 struct Engine {

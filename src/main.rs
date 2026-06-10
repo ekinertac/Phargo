@@ -37,7 +37,7 @@ fn main() {
     // Deep recursion (engine + EXPECTF matcher) overflows the 1 MB default
     // stack on Windows; give the work a big stack.
     std::thread::Builder::new()
-        .stack_size(256 * 1024 * 1024)
+        .stack_size(1024 * 1024 * 1024)
         .spawn(run_scoreboard)
         .unwrap()
         .join()
