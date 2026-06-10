@@ -11,6 +11,69 @@
 
 use std::path::PathBuf;
 
+// ---------------------------------------------------------------------------
+// Process-wide heap ceiling — the last line of defence.
+//
+// The evaluator has per-test resource guards (string/array/range/generator
+// caps), but those only catch the bombs we've anticipated. A novel runaway
+// allocation must NEVER be allowed to exhaust machine RAM — a scoreboard run
+// that eats every byte of physical memory + pagefile can hard-restart the host.
+// So we cap the whole process at a generous ceiling, far above any legitimate
+// peak (normal runs stay well under 1 GB). Past the ceiling, `alloc` returns
+// null and Rust aborts THIS process — losing one run, never the machine.
+mod capped_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const HEAP_CEILING: usize = 6 * 1024 * 1024 * 1024; // 6 GiB
+    static HEAP_USED: AtomicUsize = AtomicUsize::new(0);
+
+    pub struct Capped;
+
+    unsafe impl GlobalAlloc for Capped {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let sz = layout.size();
+            if HEAP_USED.fetch_add(sz, Ordering::Relaxed) + sz > HEAP_CEILING {
+                HEAP_USED.fetch_sub(sz, Ordering::Relaxed);
+                return std::ptr::null_mut();
+            }
+            let p = System.alloc(layout);
+            if p.is_null() {
+                HEAP_USED.fetch_sub(sz, Ordering::Relaxed);
+            }
+            p
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            System.dealloc(ptr, layout);
+            HEAP_USED.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let old = layout.size();
+            if new_size > old {
+                let delta = new_size - old;
+                if HEAP_USED.fetch_add(delta, Ordering::Relaxed) + delta > HEAP_CEILING {
+                    HEAP_USED.fetch_sub(delta, Ordering::Relaxed);
+                    return std::ptr::null_mut();
+                }
+                let p = System.realloc(ptr, layout, new_size);
+                if p.is_null() {
+                    HEAP_USED.fetch_sub(delta, Ordering::Relaxed);
+                }
+                p
+            } else {
+                let p = System.realloc(ptr, layout, new_size);
+                if !p.is_null() {
+                    HEAP_USED.fetch_sub(old - new_size, Ordering::Relaxed);
+                }
+                p
+            }
+        }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: capped_alloc::Capped = capped_alloc::Capped;
+
 // Shared subsystems reused by the v2 evaluator via `crate::` (char/byte/int —
 // no engine-value dependency): the from-scratch regex VM and civil-calendar
 // date/time math.

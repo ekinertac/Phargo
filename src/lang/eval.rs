@@ -50,6 +50,10 @@ pub struct Eval {
     ob_stack: Vec<usize>,
     /// Active generator collection buffer (eager generators collect yields here).
     gen_buf: Option<Arr>,
+    /// Total node count accumulated into the active generator buffer. Capped so
+    /// an infinite generator that yields large values (e.g. `while(1) yield from
+    /// [10000 elems]`) can't exhaust the heap before the step limit trips.
+    gen_nodes: usize,
     steps: u64,
 }
 
@@ -433,6 +437,7 @@ impl Eval {
             included: HashSet::new(),
             ob_stack: Vec::new(),
             gen_buf: None,
+            gen_nodes: 0,
             steps: 0,
         }
     }
@@ -1104,6 +1109,10 @@ impl Eval {
                     Some(e) => Some(self.eval(e)?),
                     None => None,
                 };
+                self.gen_nodes = self.gen_nodes.saturating_add(value_size(&v, MAX_ARRAY_NODES));
+                if self.gen_nodes >= MAX_ARRAY_NODES {
+                    return Err(RunError("generator buffer limit exceeded".into()));
+                }
                 if let Some(buf) = self.gen_buf.as_mut() {
                     match k {
                         Some(kv) => buf.insert(Arr::norm_key(&kv), v),
@@ -1116,8 +1125,13 @@ impl Eval {
                 let src = self.eval(e)?;
                 match src {
                     Value::Array(a) => {
-                        if let Some(buf) = self.gen_buf.as_mut() {
-                            for (k, v) in a.entries {
+                        for (k, v) in a.entries {
+                            self.gen_nodes =
+                                self.gen_nodes.saturating_add(value_size(&v, MAX_ARRAY_NODES));
+                            if self.gen_nodes >= MAX_ARRAY_NODES {
+                                return Err(RunError("generator buffer limit exceeded".into()));
+                            }
+                            if let Some(buf) = self.gen_buf.as_mut() {
                                 match k {
                                     Key::Int(_) => buf.push(v),
                                     Key::Str(_) => buf.insert(k, v),
@@ -1128,9 +1142,17 @@ impl Eval {
                     Value::Object(_) => {
                         // a sub-generator/iterable — drain via iterator_to_array
                         let drained = self.builtin("iterator_to_array", vec![src, Value::Bool(false)])?;
-                        if let (Some(buf), Value::Array(a)) = (self.gen_buf.as_mut(), drained) {
+                        if let Value::Array(a) = drained {
                             for (_, v) in a.entries {
-                                buf.push(v);
+                                self.gen_nodes = self
+                                    .gen_nodes
+                                    .saturating_add(value_size(&v, MAX_ARRAY_NODES));
+                                if self.gen_nodes >= MAX_ARRAY_NODES {
+                                    return Err(RunError("generator buffer limit exceeded".into()));
+                                }
+                                if let Some(buf) = self.gen_buf.as_mut() {
+                                    buf.push(v);
+                                }
                             }
                         }
                     }
@@ -1996,10 +2018,13 @@ impl Eval {
     fn run_fn_body(&mut self, body: &[Stmt]) -> R<Value> {
         if has_yield(body) {
             let prev = self.gen_buf.take();
+            let prev_nodes = self.gen_nodes;
             self.gen_buf = Some(Arr::new());
+            self.gen_nodes = 0;
             let r = self.exec_block(body);
             let buf = self.gen_buf.take().unwrap_or_default();
             self.gen_buf = prev;
+            self.gen_nodes = prev_nodes;
             let ret = match r? {
                 Flow::Return(v) => v,
                 _ => Value::Null,
