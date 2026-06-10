@@ -2806,11 +2806,12 @@ impl Eval {
             "array_diff" => {
                 let mut out = Arr::new();
                 if let Value::Array(arr) = a(0) {
-                    let mut others: Vec<Vec<u8>> = Vec::new();
+                    // O(1) membership via a hash set (was O(n*m) — bug74093: two ~3M arrays)
+                    let mut others: HashSet<Vec<u8>> = HashSet::new();
                     for v in &args[1..] {
                         if let Value::Array(o) = v {
                             for (_, x) in &o.entries {
-                                others.push(to_bytes(x));
+                                others.insert(to_bytes(x));
                             }
                         }
                     }
@@ -2825,13 +2826,13 @@ impl Eval {
             "array_intersect" => {
                 let mut out = Arr::new();
                 if let Value::Array(arr) = a(0) {
-                    let sets: Vec<Vec<Vec<u8>>> = args[1..]
+                    let sets: Vec<HashSet<Vec<u8>>> = args[1..]
                         .iter()
                         .map(|v| {
                             if let Value::Array(o) = v {
                                 o.entries.iter().map(|(_, x)| to_bytes(x)).collect()
                             } else {
-                                vec![]
+                                HashSet::new()
                             }
                         })
                         .collect();
@@ -3093,12 +3094,10 @@ impl Eval {
             }
             "array_unique" => {
                 let mut out = Arr::new();
-                let mut seen: Vec<Vec<u8>> = Vec::new();
+                let mut seen: HashSet<Vec<u8>> = HashSet::new();
                 if let Value::Array(arr) = a(0) {
                     for (k, v) in arr.entries {
-                        let key = to_bytes(&v);
-                        if !seen.contains(&key) {
-                            seen.push(key);
+                        if seen.insert(to_bytes(&v)) {
                             out.insert(k, v);
                         }
                     }
