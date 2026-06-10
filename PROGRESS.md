@@ -4,60 +4,60 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 1981 / 21862  (9.06% of the entire PHP test suite)**
+**`.phpt` pass rate: 2048 / 21862  (9.37% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 9.09%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 9.40%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 1981 | 19815 | 66 | 21862 |
+| 2048 | 19748 | 66 | 21862 |
 
-_Curated smoke tests (dev guards, **not** in the number above): 92/93 passing._
+_Curated smoke tests (dev guards, **not** in the number above): 68/93 passing._
 
 ## By area
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 654 | 5329 | 12.3% |
-| `ext/standard` | 474 | 3877 | 12.2% |
-| `ext/opcache` | 316 | 916 | 34.5% |
-| `core` | 158 | 868 | 18.2% |
-| `ext/dom` | 7 | 868 | 0.8% |
+| `Zend` | 839 | 5329 | 15.7% |
+| `ext/standard` | 359 | 3877 | 9.3% |
+| `ext/opcache` | 384 | 916 | 41.9% |
+| `core` | 159 | 868 | 18.3% |
+| `ext/dom` | 8 | 868 | 0.9% |
 | `ext/spl` | 78 | 796 | 9.8% |
 | `ext/date` | 55 | 689 | 8.0% |
 | `ext/soap` | 0 | 593 | 0.0% |
 | `ext/phar` | 13 | 574 | 2.3% |
-| `ext/reflection` | 28 | 519 | 5.4% |
-| `ext/intl` | 2 | 496 | 0.4% |
-| `ext/mysqli` | 0 | 452 | 0.0% |
-| `ext/mbstring` | 34 | 420 | 8.1% |
+| `ext/reflection` | 40 | 519 | 7.7% |
+| `ext/intl` | 3 | 496 | 0.6% |
+| `ext/mysqli` | 1 | 452 | 0.2% |
+| `ext/mbstring` | 6 | 420 | 1.4% |
 | `ext/uri` | 0 | 328 | 0.0% |
 | `ext/gd` | 0 | 318 | 0.0% |
-| `ext/session` | 3 | 268 | 1.1% |
+| `ext/session` | 2 | 268 | 0.7% |
 | `ext/openssl` | 1 | 257 | 0.4% |
 | `ext/curl` | 0 | 175 | 0.0% |
-| `ext/bcmath` | 30 | 168 | 17.9% |
-| `ext/pcre` | 38 | 168 | 22.6% |
+| `ext/bcmath` | 0 | 168 | 0.0% |
+| `ext/pcre` | 42 | 168 | 25.0% |
 | `ext/pdo_mysql` | 0 | 167 | 0.0% |
 | `ext/zend_test` | 4 | 159 | 2.5% |
-| `ext/zlib` | 6 | 157 | 3.8% |
-| `ext/simplexml` | 15 | 156 | 9.6% |
+| `ext/zlib` | 7 | 157 | 4.5% |
+| `ext/simplexml` | 0 | 156 | 0.0% |
 | `sapi/fpm` | 0 | 141 | 0.0% |
 | `ext/ldap` | 0 | 140 | 0.0% |
 | `ext/pdo` | 0 | 127 | 0.0% |
 | `ext/sockets` | 0 | 123 | 0.0% |
-| `ext/filter` | 13 | 120 | 10.8% |
+| `ext/filter` | 18 | 120 | 15.0% |
 | `ext/zip` | 2 | 118 | 1.7% |
 | `sapi/cli` | 1 | 114 | 0.9% |
 | `ext/ffi` | 0 | 105 | 0.0% |
 | `ext/pgsql` | 0 | 102 | 0.0% |
 | `ext/gmp` | 0 | 101 | 0.0% |
 | `ext/exif` | 5 | 99 | 5.1% |
-| `ext/json` | 13 | 98 | 13.3% |
+| `ext/json` | 0 | 98 | 0.0% |
 | `ext/sqlite3` | 0 | 97 | 0.0% |
-| `ext/pdo_sqlite` | 0 | 86 | 0.0% |
+| `ext/pdo_sqlite` | 1 | 86 | 1.2% |
 | `ext/xsl` | 0 | 81 | 0.0% |
-| `ext/hash` | 2 | 80 | 2.5% |
+| `ext/hash` | 0 | 80 | 0.0% |
 | `ext/iconv` | 2 | 77 | 2.6% |
 | `ext/random` | 0 | 69 | 0.0% |
 | `sapi/phpdbg` | 0 | 69 | 0.0% |
@@ -68,13 +68,13 @@ _Curated smoke tests (dev guards, **not** in the number above): 92/93 passing._
 | `ext/posix` | 0 | 62 | 0.0% |
 | `ext/dba` | 0 | 59 | 0.0% |
 | `ext/ftp` | 0 | 57 | 0.0% |
-| `ext/xmlreader` | 3 | 56 | 5.4% |
+| `ext/xmlreader` | 2 | 56 | 3.6% |
 | `ext/calendar` | 0 | 53 | 0.0% |
 | `ext/tokenizer` | 0 | 53 | 0.0% |
 | `ext/xmlwriter` | 0 | 51 | 0.0% |
 | `ext/odbc` | 0 | 50 | 0.0% |
 | `ext/tidy` | 2 | 50 | 4.0% |
-| `ext/ctype` | 16 | 49 | 32.7% |
+| `ext/ctype` | 8 | 49 | 16.3% |
 | `ext/pdo_firebird` | 0 | 49 | 0.0% |
 | `ext/com_dotnet` | 0 | 38 | 0.0% |
 | `ext/snmp` | 0 | 38 | 0.0% |
