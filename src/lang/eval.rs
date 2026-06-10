@@ -2621,7 +2621,7 @@ impl Eval {
             // ---- more string builtins ----
             "str_pad" => {
                 let s = to_bytes(&a(0));
-                let len = to_i64(&a(1)).max(0) as usize;
+                let len = (to_i64(&a(1)).max(0) as usize).min(MAX_STR);
                 let pad = {
                     let p = to_bytes(&a(2));
                     if p.is_empty() { vec![b' '] } else { p }
@@ -2750,6 +2750,10 @@ impl Eval {
                 let s = to_bytes(&a(0));
                 let n = if args.len() > 1 { to_i64(&a(1)).max(1) as usize } else { 76 };
                 let end = if args.len() > 2 { to_bytes(&a(2)) } else { b"\r\n".to_vec() };
+                // memory-bomb guard: a long `end` * many chunks can explode
+                if (s.len() / n + 1).saturating_mul(n + end.len()) > MAX_STR {
+                    return Err(self.throw_error("Error", "chunk_split result too large"));
+                }
                 let mut out = Vec::new();
                 for chunk in s.chunks(n) {
                     out.extend_from_slice(chunk);
