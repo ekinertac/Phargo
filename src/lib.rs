@@ -15,8 +15,10 @@ use std::path::PathBuf;
 // no engine-value dependency): the from-scratch regex VM and civil-calendar
 // date/time math.
 mod datetime;
+mod hash;
 mod regex;
 pub(crate) use datetime::*;
+pub(crate) use hash::*;
 pub(crate) use regex::*;
 
 // The engine.

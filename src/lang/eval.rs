@@ -2490,6 +2490,57 @@ impl Eval {
             }
             "ord" => Value::Int(to_bytes(&a(0)).first().copied().unwrap_or(0) as i64),
             "chr" => Value::Str(vec![(to_i64(&a(0)).rem_euclid(256)) as u8]),
+            // ---- hashing / encoding (reuse the shared hash.rs subsystem) ----
+            "md5" => {
+                let h = crate::md5_hex(&to_bytes(&a(0)));
+                if to_bool(&a(1)) { Value::Str(hex_to_bytes(&h)) } else { Value::Str(h.into_bytes()) }
+            }
+            "sha1" => {
+                let h = crate::sha1_hex(&to_bytes(&a(0)));
+                if to_bool(&a(1)) { Value::Str(hex_to_bytes(&h)) } else { Value::Str(h.into_bytes()) }
+            }
+            "crc32" => Value::Int(crate::crc32(&to_bytes(&a(0))) as i64),
+            "hash" => {
+                let algo = String::from_utf8_lossy(&to_bytes(&a(0))).to_ascii_lowercase();
+                let data = to_bytes(&a(1));
+                let h = match algo.as_str() {
+                    "md5" => crate::md5_hex(&data),
+                    "sha1" => crate::sha1_hex(&data),
+                    "crc32b" => format!("{:08x}", crate::crc32(&data)),
+                    _ => {
+                        return Err(self.throw_error(
+                            "ValueError",
+                            &format!("hash(): Argument #1 ($algo) must be a valid hashing algorithm ({algo})"),
+                        ))
+                    }
+                };
+                if to_bool(&a(2)) { Value::Str(hex_to_bytes(&h)) } else { Value::Str(h.into_bytes()) }
+            }
+            "base64_encode" => Value::Str(crate::base64_encode(&to_bytes(&a(0))).into_bytes()),
+            "base64_decode" => {
+                Value::Str(crate::base64_decode(&String::from_utf8_lossy(&to_bytes(&a(0)))))
+            }
+            "bin2hex" => {
+                let s = to_bytes(&a(0));
+                let mut o = String::with_capacity(s.len() * 2);
+                for b in s {
+                    o.push_str(&format!("{b:02x}"));
+                }
+                Value::Str(o.into_bytes())
+            }
+            "hex2bin" => Value::Str(hex_to_bytes(&String::from_utf8_lossy(&to_bytes(&a(0))))),
+            "dechex" => Value::Str(format!("{:x}", to_i64(&a(0))).into_bytes()),
+            "hexdec" => Value::Int(
+                i64::from_str_radix(String::from_utf8_lossy(&to_bytes(&a(0))).trim(), 16).unwrap_or(0),
+            ),
+            "decbin" => Value::Str(format!("{:b}", to_i64(&a(0))).into_bytes()),
+            "bindec" => Value::Int(
+                i64::from_str_radix(String::from_utf8_lossy(&to_bytes(&a(0))).trim(), 2).unwrap_or(0),
+            ),
+            "decoct" => Value::Str(format!("{:o}", to_i64(&a(0))).into_bytes()),
+            "octdec" => Value::Int(
+                i64::from_str_radix(String::from_utf8_lossy(&to_bytes(&a(0))).trim(), 8).unwrap_or(0),
+            ),
             "implode" | "join" => {
                 // implode(sep, arr) or implode(arr)
                 let (sep, arr) = match (&a(0), &a(1)) {
@@ -3353,6 +3404,18 @@ impl Eval {
                 }
                 Value::Array(out)
             }
+            "json_encode" => {
+                let mut out = Vec::new();
+                json_encode(&a(0), &mut out, 0);
+                Value::Str(out)
+            }
+            "json_decode" => {
+                let bytes = to_bytes(&a(0));
+                let assoc = to_bool(&a(1));
+                json_decode(&bytes, assoc).unwrap_or(Value::Null)
+            }
+            "json_last_error" => Value::Int(0),
+            "json_last_error_msg" => Value::Str(b"No error".to_vec()),
             "serialize" => {
                 let mut out = Vec::new();
                 php_serialize(&a(0), &mut out, 0);
@@ -4488,6 +4551,306 @@ fn key_cmp(a: &Key, b: &Key) -> std::cmp::Ordering {
         (Key::Int(_), Key::Str(_)) => Ordering::Less,
         (Key::Str(_), Key::Int(_)) => Ordering::Greater,
     }
+}
+
+// ---- JSON (byte-based, for the v2 Value) -------------------------------
+fn json_is_list(a: &Arr) -> bool {
+    a.entries.iter().enumerate().all(|(i, (k, _))| matches!(k, Key::Int(n) if *n == i as i64))
+}
+
+fn json_encode(v: &Value, out: &mut Vec<u8>, depth: usize) {
+    if depth > 512 {
+        out.extend_from_slice(b"null");
+        return;
+    }
+    match v {
+        Value::Null => out.extend_from_slice(b"null"),
+        Value::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
+        Value::Int(n) => out.extend_from_slice(n.to_string().as_bytes()),
+        Value::Float(f) => {
+            if f.is_finite() {
+                out.extend_from_slice(format_float(*f).as_bytes());
+            } else {
+                out.push(b'0');
+            }
+        }
+        Value::Str(s) => json_str(s, out),
+        Value::Array(a) => {
+            if json_is_list(a) {
+                out.push(b'[');
+                for (i, (_, val)) in a.entries.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    json_encode(val, out, depth + 1);
+                }
+                out.push(b']');
+            } else {
+                out.push(b'{');
+                for (i, (k, val)) in a.entries.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    match k {
+                        Key::Int(n) => json_str(n.to_string().as_bytes(), out),
+                        Key::Str(s) => json_str(s, out),
+                    }
+                    out.push(b':');
+                    json_encode(val, out, depth + 1);
+                }
+                out.push(b'}');
+            }
+        }
+        Value::Object(rc) => {
+            out.push(b'{');
+            for (i, (name, val)) in rc.borrow().props.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                json_str(name.as_bytes(), out);
+                out.push(b':');
+                json_encode(val, out, depth + 1);
+            }
+            out.push(b'}');
+        }
+        Value::Closure(_) => out.extend_from_slice(b"null"),
+    }
+}
+
+fn json_str(s: &[u8], out: &mut Vec<u8>) {
+    out.push(b'"');
+    for &b in s {
+        match b {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'/' => out.extend_from_slice(b"\\/"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            c if c < 0x20 => out.extend_from_slice(format!("\\u{c:04x}").as_bytes()),
+            c => out.push(c),
+        }
+    }
+    out.push(b'"');
+}
+
+fn json_decode(b: &[u8], assoc: bool) -> Option<Value> {
+    let mut p = 0;
+    json_ws(b, &mut p);
+    let v = json_val(b, &mut p, assoc, 0)?;
+    json_ws(b, &mut p);
+    if p == b.len() {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+fn json_ws(b: &[u8], p: &mut usize) {
+    while *p < b.len() && matches!(b[*p], b' ' | b'\t' | b'\n' | b'\r') {
+        *p += 1;
+    }
+}
+
+fn json_val(b: &[u8], p: &mut usize, assoc: bool, depth: usize) -> Option<Value> {
+    if depth > 512 || *p >= b.len() {
+        return None;
+    }
+    json_ws(b, p);
+    match b.get(*p)? {
+        b'n' => {
+            if b[*p..].starts_with(b"null") {
+                *p += 4;
+                Some(Value::Null)
+            } else {
+                None
+            }
+        }
+        b't' => {
+            if b[*p..].starts_with(b"true") {
+                *p += 4;
+                Some(Value::Bool(true))
+            } else {
+                None
+            }
+        }
+        b'f' => {
+            if b[*p..].starts_with(b"false") {
+                *p += 5;
+                Some(Value::Bool(false))
+            } else {
+                None
+            }
+        }
+        b'"' => json_string(b, p).map(Value::Str),
+        b'[' => {
+            *p += 1;
+            let mut arr = Arr::new();
+            json_ws(b, p);
+            if b.get(*p) == Some(&b']') {
+                *p += 1;
+                return Some(Value::Array(arr));
+            }
+            loop {
+                let v = json_val(b, p, assoc, depth + 1)?;
+                arr.push(v);
+                json_ws(b, p);
+                match b.get(*p)? {
+                    b',' => *p += 1,
+                    b']' => {
+                        *p += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            Some(Value::Array(arr))
+        }
+        b'{' => {
+            *p += 1;
+            let mut arr = Arr::new();
+            json_ws(b, p);
+            if b.get(*p) == Some(&b'}') {
+                *p += 1;
+                return finish_obj(arr, assoc);
+            }
+            loop {
+                json_ws(b, p);
+                let key = json_string(b, p)?;
+                json_ws(b, p);
+                if b.get(*p)? != &b':' {
+                    return None;
+                }
+                *p += 1;
+                let v = json_val(b, p, assoc, depth + 1)?;
+                arr.insert(Arr::norm_key(&Value::Str(key)), v);
+                json_ws(b, p);
+                match b.get(*p)? {
+                    b',' => *p += 1,
+                    b'}' => {
+                        *p += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            finish_obj(arr, assoc)
+        }
+        _ => {
+            // number
+            let start = *p;
+            if b[*p] == b'-' {
+                *p += 1;
+            }
+            let mut is_float = false;
+            while *p < b.len() && matches!(b[*p], b'0'..=b'9') {
+                *p += 1;
+            }
+            if b.get(*p) == Some(&b'.') {
+                is_float = true;
+                *p += 1;
+                while *p < b.len() && b[*p].is_ascii_digit() {
+                    *p += 1;
+                }
+            }
+            if matches!(b.get(*p), Some(b'e' | b'E')) {
+                is_float = true;
+                *p += 1;
+                if matches!(b.get(*p), Some(b'+' | b'-')) {
+                    *p += 1;
+                }
+                while *p < b.len() && b[*p].is_ascii_digit() {
+                    *p += 1;
+                }
+            }
+            let txt = std::str::from_utf8(&b[start..*p]).ok()?;
+            if txt.is_empty() || txt == "-" {
+                return None;
+            }
+            if is_float {
+                Some(Value::Float(txt.parse().ok()?))
+            } else {
+                match txt.parse::<i64>() {
+                    Ok(n) => Some(Value::Int(n)),
+                    Err(_) => Some(Value::Float(txt.parse().ok()?)),
+                }
+            }
+        }
+    }
+}
+
+fn finish_obj(arr: Arr, assoc: bool) -> Option<Value> {
+    if assoc {
+        Some(Value::Array(arr))
+    } else {
+        let o = Rc::new(RefCell::new(Obj { class: "stdClass".into(), props: Vec::new() }));
+        for (k, v) in arr.entries {
+            let name = match k {
+                Key::Int(n) => n.to_string(),
+                Key::Str(s) => String::from_utf8_lossy(&s).into_owned(),
+            };
+            o.borrow_mut().set(&name, v);
+        }
+        Some(Value::Object(o))
+    }
+}
+
+fn json_string(b: &[u8], p: &mut usize) -> Option<Vec<u8>> {
+    if b.get(*p)? != &b'"' {
+        return None;
+    }
+    *p += 1;
+    let mut out = Vec::new();
+    while *p < b.len() {
+        match b[*p] {
+            b'"' => {
+                *p += 1;
+                return Some(out);
+            }
+            b'\\' => {
+                *p += 1;
+                match b.get(*p)? {
+                    b'"' => out.push(b'"'),
+                    b'\\' => out.push(b'\\'),
+                    b'/' => out.push(b'/'),
+                    b'n' => out.push(b'\n'),
+                    b't' => out.push(b'\t'),
+                    b'r' => out.push(b'\r'),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0c),
+                    b'u' => {
+                        let hex = std::str::from_utf8(b.get(*p + 1..*p + 5)?).ok()?;
+                        let cp = u32::from_str_radix(hex, 16).ok()?;
+                        *p += 4;
+                        if let Some(c) = char::from_u32(cp) {
+                            let mut buf = [0u8; 4];
+                            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                        }
+                    }
+                    _ => return None,
+                }
+                *p += 1;
+            }
+            c => {
+                out.push(c);
+                *p += 1;
+            }
+        }
+    }
+    None
+}
+
+fn hex_to_bytes(h: &str) -> Vec<u8> {
+    let h = h.as_bytes();
+    (0..h.len() / 2)
+        .filter_map(|i| {
+            let hi = (h[i * 2] as char).to_digit(16)?;
+            let lo = (h[i * 2 + 1] as char).to_digit(16)?;
+            Some(((hi << 4) | lo) as u8)
+        })
+        .collect()
 }
 
 fn string_char(s: &[u8], k: &Key) -> Value {
