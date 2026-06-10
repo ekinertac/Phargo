@@ -2541,6 +2541,364 @@ impl Eval {
             "octdec" => Value::Int(
                 i64::from_str_radix(String::from_utf8_lossy(&to_bytes(&a(0))).trim(), 8).unwrap_or(0),
             ),
+            // ---- mbstring (UTF-8, code-point based) ----
+            "mb_strlen" => {
+                Value::Int(String::from_utf8_lossy(&to_bytes(&a(0))).chars().count() as i64)
+            }
+            "mb_substr" => {
+                let s: Vec<char> = String::from_utf8_lossy(&to_bytes(&a(0))).chars().collect();
+                let len = s.len() as i64;
+                let mut start = to_i64(&a(1));
+                if start < 0 {
+                    start = (len + start).max(0);
+                }
+                let start = start.min(len) as usize;
+                let end = if args.len() > 2 && !matches!(a(2), Value::Null) {
+                    let l = to_i64(&a(2));
+                    if l < 0 {
+                        ((len + l).max(start as i64)) as usize
+                    } else {
+                        (start + l as usize).min(s.len())
+                    }
+                } else {
+                    s.len()
+                };
+                Value::Str(s[start..end.max(start)].iter().collect::<String>().into_bytes())
+            }
+            "mb_strtoupper" => {
+                Value::Str(String::from_utf8_lossy(&to_bytes(&a(0))).to_uppercase().into_bytes())
+            }
+            "mb_strtolower" => {
+                Value::Str(String::from_utf8_lossy(&to_bytes(&a(0))).to_lowercase().into_bytes())
+            }
+            "mb_str_split" => {
+                let s: Vec<char> = String::from_utf8_lossy(&to_bytes(&a(0))).chars().collect();
+                let n = if args.len() > 1 { to_i64(&a(1)).max(1) as usize } else { 1 };
+                let mut arr = Arr::new();
+                for chunk in s.chunks(n) {
+                    arr.push(Value::Str(chunk.iter().collect::<String>().into_bytes()));
+                }
+                Value::Array(arr)
+            }
+            "mb_strpos" => {
+                let hay: Vec<char> = String::from_utf8_lossy(&to_bytes(&a(0))).chars().collect();
+                let needle: Vec<char> = String::from_utf8_lossy(&to_bytes(&a(1))).chars().collect();
+                let from = to_i64(&a(2)).max(0) as usize;
+                if needle.is_empty() {
+                    Value::Int(from as i64)
+                } else {
+                    match (from..=hay.len().saturating_sub(needle.len()))
+                        .find(|&i| hay[i..i + needle.len()] == needle[..])
+                    {
+                        Some(i) => Value::Int(i as i64),
+                        None => Value::Bool(false),
+                    }
+                }
+            }
+            "mb_ord" => match String::from_utf8_lossy(&to_bytes(&a(0))).chars().next() {
+                Some(c) => Value::Int(c as i64),
+                None => Value::Bool(false),
+            },
+            "mb_chr" => match char::from_u32(to_i64(&a(0)) as u32) {
+                Some(c) => Value::Str(c.to_string().into_bytes()),
+                None => Value::Bool(false),
+            },
+            "mb_internal_encoding" | "mb_detect_encoding" | "mb_http_output" => {
+                Value::Str(b"UTF-8".to_vec())
+            }
+            "mb_convert_encoding" | "mb_scrub" => a(0),
+            "mb_check_encoding" => Value::Bool(true),
+            "mb_convert_case" => {
+                let bytes = to_bytes(&a(0));
+                let s = String::from_utf8_lossy(&bytes);
+                let r = match to_i64(&a(1)) {
+                    0 => s.to_uppercase(),
+                    1 => s.to_lowercase(),
+                    _ => ucwords_str(&s), // MB_CASE_TITLE
+                };
+                Value::Str(r.into_bytes())
+            }
+            // ---- more string builtins ----
+            "str_pad" => {
+                let s = to_bytes(&a(0));
+                let len = to_i64(&a(1)).max(0) as usize;
+                let pad = {
+                    let p = to_bytes(&a(2));
+                    if p.is_empty() { vec![b' '] } else { p }
+                };
+                let ptype = if args.len() > 3 { to_i64(&a(3)) } else { 1 };
+                if s.len() >= len {
+                    Value::Str(s)
+                } else {
+                    let total = len - s.len();
+                    let mk = |n: usize| -> Vec<u8> { pad.iter().cloned().cycle().take(n).collect() };
+                    let r = match ptype {
+                        0 => {
+                            let mut r = mk(total);
+                            r.extend_from_slice(&s);
+                            r
+                        }
+                        2 => {
+                            let l = total / 2;
+                            let mut o = mk(l);
+                            o.extend_from_slice(&s);
+                            o.extend(mk(total - l));
+                            o
+                        }
+                        _ => {
+                            let mut r = s.clone();
+                            r.extend(mk(total));
+                            r
+                        }
+                    };
+                    Value::Str(r)
+                }
+            }
+            "number_format" => {
+                let n = to_f64(&a(0));
+                let dec = if args.len() > 1 { to_i64(&a(1)).max(0) as usize } else { 0 };
+                let dp = if args.len() > 2 {
+                    String::from_utf8_lossy(&to_bytes(&a(2))).into_owned()
+                } else {
+                    ".".into()
+                };
+                let ts = if args.len() > 3 {
+                    String::from_utf8_lossy(&to_bytes(&a(3))).into_owned()
+                } else {
+                    ",".into()
+                };
+                let formatted = format!("{:.*}", dec, n.abs());
+                let (int_part, frac_part) = match formatted.split_once('.') {
+                    Some((i, f)) => (i.to_string(), f.to_string()),
+                    None => (formatted, String::new()),
+                };
+                let digits: Vec<char> = int_part.chars().collect();
+                let mut int_ts = String::new();
+                for (i, c) in digits.iter().enumerate() {
+                    if i > 0 && (digits.len() - i) % 3 == 0 {
+                        int_ts.push_str(&ts);
+                    }
+                    int_ts.push(*c);
+                }
+                let mut result = String::new();
+                let nonzero = int_part != "0" || frac_part.chars().any(|c| c != '0');
+                if n < 0.0 && nonzero {
+                    result.push('-');
+                }
+                result.push_str(&int_ts);
+                if dec > 0 {
+                    result.push_str(&dp);
+                    result.push_str(&frac_part);
+                }
+                Value::Str(result.into_bytes())
+            }
+            "ucwords" => {
+                Value::Str(ucwords_str(&String::from_utf8_lossy(&to_bytes(&a(0)))).into_bytes())
+            }
+            "nl2br" => {
+                let s = to_bytes(&a(0));
+                let mut out = Vec::new();
+                let mut i = 0;
+                while i < s.len() {
+                    if s[i] == b'\r' && s.get(i + 1) == Some(&b'\n') {
+                        out.extend_from_slice(b"<br />\r\n");
+                        i += 2;
+                    } else if s[i] == b'\n' || s[i] == b'\r' {
+                        out.extend_from_slice(b"<br />");
+                        out.push(s[i]);
+                        i += 1;
+                    } else {
+                        out.push(s[i]);
+                        i += 1;
+                    }
+                }
+                Value::Str(out)
+            }
+            "substr_count" => {
+                let hay = to_bytes(&a(0));
+                let needle = to_bytes(&a(1));
+                if needle.is_empty() {
+                    Value::Int(0)
+                } else {
+                    let mut count = 0;
+                    let mut i = 0;
+                    while i + needle.len() <= hay.len() {
+                        if hay[i..i + needle.len()] == needle[..] {
+                            count += 1;
+                            i += needle.len();
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    Value::Int(count)
+                }
+            }
+            "str_split" => {
+                let s = to_bytes(&a(0));
+                let n = if args.len() > 1 { to_i64(&a(1)).max(1) as usize } else { 1 };
+                let mut arr = Arr::new();
+                if s.is_empty() {
+                    arr.push(Value::Str(Vec::new()));
+                } else {
+                    for chunk in s.chunks(n) {
+                        arr.push(Value::Str(chunk.to_vec()));
+                    }
+                }
+                Value::Array(arr)
+            }
+            "chunk_split" => {
+                let s = to_bytes(&a(0));
+                let n = if args.len() > 1 { to_i64(&a(1)).max(1) as usize } else { 76 };
+                let end = if args.len() > 2 { to_bytes(&a(2)) } else { b"\r\n".to_vec() };
+                let mut out = Vec::new();
+                for chunk in s.chunks(n) {
+                    out.extend_from_slice(chunk);
+                    out.extend_from_slice(&end);
+                }
+                Value::Str(out)
+            }
+            "str_word_count" => {
+                let s = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let words: Vec<&str> = s.split_whitespace().collect();
+                if to_i64(&a(1)) >= 1 {
+                    let mut arr = Arr::new();
+                    for w in words {
+                        arr.push(Value::Str(w.as_bytes().to_vec()));
+                    }
+                    Value::Array(arr)
+                } else {
+                    Value::Int(words.len() as i64)
+                }
+            }
+            "levenshtein" => {
+                Value::Int(levenshtein(&to_bytes(&a(0)), &to_bytes(&a(1))) as i64)
+            }
+            "wordwrap" => {
+                let s = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let width = if args.len() > 1 { to_i64(&a(1)).max(1) as usize } else { 75 };
+                let brk = if args.len() > 2 {
+                    String::from_utf8_lossy(&to_bytes(&a(2))).into_owned()
+                } else {
+                    "\n".into()
+                };
+                let mut out = String::new();
+                let mut line_len = 0;
+                for (i, word) in s.split(' ').enumerate() {
+                    if i > 0 {
+                        if line_len + 1 + word.len() > width {
+                            out.push_str(&brk);
+                            line_len = 0;
+                        } else {
+                            out.push(' ');
+                            line_len += 1;
+                        }
+                    }
+                    out.push_str(word);
+                    line_len += word.len();
+                }
+                Value::Str(out.into_bytes())
+            }
+            // ---- more array builtins ----
+            "array_diff" => {
+                let mut out = Arr::new();
+                if let Value::Array(arr) = a(0) {
+                    let mut others: Vec<Vec<u8>> = Vec::new();
+                    for v in &args[1..] {
+                        if let Value::Array(o) = v {
+                            for (_, x) in &o.entries {
+                                others.push(to_bytes(x));
+                            }
+                        }
+                    }
+                    for (k, v) in arr.entries {
+                        if !others.contains(&to_bytes(&v)) {
+                            out.insert(k, v);
+                        }
+                    }
+                }
+                Value::Array(out)
+            }
+            "array_intersect" => {
+                let mut out = Arr::new();
+                if let Value::Array(arr) = a(0) {
+                    let sets: Vec<Vec<Vec<u8>>> = args[1..]
+                        .iter()
+                        .map(|v| {
+                            if let Value::Array(o) = v {
+                                o.entries.iter().map(|(_, x)| to_bytes(x)).collect()
+                            } else {
+                                vec![]
+                            }
+                        })
+                        .collect();
+                    for (k, v) in arr.entries {
+                        let vb = to_bytes(&v);
+                        if sets.iter().all(|s| s.contains(&vb)) {
+                            out.insert(k, v);
+                        }
+                    }
+                }
+                Value::Array(out)
+            }
+            "array_fill_keys" => {
+                let mut out = Arr::new();
+                let val = a(1);
+                if let Value::Array(keys) = a(0) {
+                    for (_, k) in keys.entries {
+                        out.insert(Arr::norm_key(&k), val.clone());
+                    }
+                }
+                Value::Array(out)
+            }
+            "array_walk" => {
+                let cb = a(1);
+                let extra = a(2);
+                if let Value::Array(arr) = a(0) {
+                    for (k, v) in arr.entries {
+                        let kv = match k {
+                            Key::Int(n) => Value::Int(n),
+                            Key::Str(s) => Value::Str(s),
+                        };
+                        let mut cargs = vec![v, kv];
+                        if args.len() > 2 {
+                            cargs.push(extra.clone());
+                        }
+                        self.call_value(cb.clone(), cargs)?;
+                    }
+                }
+                Value::Bool(true)
+            }
+            "array_product" => {
+                let mut fi = 1i64;
+                let mut ff = 1f64;
+                let mut isf = false;
+                if let Value::Array(arr) = a(0) {
+                    for (_, v) in &arr.entries {
+                        match to_num(v) {
+                            Num::Int(n) if !isf => fi = fi.wrapping_mul(n),
+                            n => {
+                                if !isf {
+                                    ff = fi as f64;
+                                    isf = true;
+                                }
+                                ff *= n.as_f64();
+                            }
+                        }
+                    }
+                }
+                if isf { Value::Float(ff) } else { Value::Int(fi) }
+            }
+            "array_count_values" => {
+                let mut out = Arr::new();
+                if let Value::Array(arr) = a(0) {
+                    for (_, v) in arr.entries {
+                        let k = Arr::norm_key(&v);
+                        let cur = out.get(&k).map(to_i64).unwrap_or(0);
+                        out.insert(k, Value::Int(cur + 1));
+                    }
+                }
+                Value::Array(out)
+            }
             "implode" | "join" => {
                 // implode(sep, arr) or implode(arr)
                 let (sep, arr) = match (&a(0), &a(1)) {
@@ -4840,6 +5198,45 @@ fn json_string(b: &[u8], p: &mut usize) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+fn ucwords_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut cap = true;
+    for c in s.chars() {
+        if cap && c.is_alphabetic() {
+            out.extend(c.to_uppercase());
+            cap = false;
+        } else {
+            out.push(c);
+            cap = c.is_whitespace();
+        }
+    }
+    out
+}
+
+fn levenshtein(a: &[u8], b: &[u8]) -> usize {
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    // cap to keep it bounded on pathological inputs
+    if a.len() > 4096 || b.len() > 4096 {
+        return a.len().abs_diff(b.len());
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 fn hex_to_bytes(h: &str) -> Vec<u8> {
