@@ -350,6 +350,39 @@ class DirectoryIterator implements Iterator {
     public function getBasename($suffix = "") { $f = $this->__d[$this->__p]; if ($suffix !== "" && str_ends_with($f, $suffix)) { $f = substr($f, 0, strlen($f) - strlen($suffix)); } return $f; }
     public function __toString() { return $this->__d[$this->__p]; }
 }
+class SplFileObject implements Iterator {
+    const DROP_NEW_LINE = 1; const READ_AHEAD = 2; const SKIP_EMPTY = 4; const READ_CSV = 8;
+    private $__fp; private $__line = 0; private $__cur = false; private $__path; private $__flags = 0;
+    public function __construct($filename, $mode = "r") {
+        $this->__path = $filename;
+        $this->__fp = fopen($filename, $mode);
+        if ($this->__fp === false) { throw new RuntimeException("SplFileObject::__construct(" . $filename . "): Failed to open stream"); }
+    }
+    public function fgets() { return fgets($this->__fp); }
+    public function fread($n) { return fread($this->__fp, $n); }
+    public function fwrite($s) { return fwrite($this->__fp, $s); }
+    public function fgetc() { return fgetc($this->__fp); }
+    public function fgetcsv($sep = ",", $enc = "\"", $esc = "\\") { return fgetcsv($this->__fp, 0, $sep, $enc, $esc); }
+    public function fputcsv($fields, $sep = ",", $enc = "\"", $esc = "\\", $eol = "\n") { return fputcsv($this->__fp, $fields, $sep, $enc, $esc, $eol); }
+    public function eof() { return feof($this->__fp); }
+    public function fseek($o, $w = 0) { return fseek($this->__fp, $o, $w); }
+    public function ftell() { return ftell($this->__fp); }
+    public function fflush() { return fflush($this->__fp); }
+    public function rewind(): void { fseek($this->__fp, 0, 0); $this->__line = 0; $this->__cur = fgets($this->__fp); }
+    public function valid(): bool { return $this->__cur !== false; }
+    public function current(): mixed { $line = $this->__cur; if (($this->__flags & 1) && is_string($line)) { $line = rtrim($line, "\r\n"); } return $line; }
+    public function key(): mixed { return $this->__line; }
+    public function next(): void { $this->__cur = fgets($this->__fp); $this->__line = $this->__line + 1; }
+    public function setFlags($f) { $this->__flags = $f; }
+    public function getFlags() { return $this->__flags; }
+    public function getPathname() { return $this->__path; }
+    public function getRealPath() { return realpath($this->__path); }
+    public function getFilename() { return basename($this->__path); }
+    public function getBasename($suffix = "") { return basename($this->__path, $suffix); }
+}
+class SplTempFileObject extends SplFileObject {
+    public function __construct($maxmem = 0) { parent::__construct("php://temp", "w+"); }
+}
 class ArrayObject implements ArrayAccess, IteratorAggregate, Countable {
     private $__d;
     public function __construct($array = []) { $this->__d = $array; }
@@ -3565,6 +3598,12 @@ impl Eval {
                 }
                 Value::Str(out)
             }
+            "str_getcsv" => {
+                let s = to_bytes(&a(0));
+                let delim = first_byte_or(&to_bytes(&a(1)), b',');
+                let quote = if args.len() > 2 { first_byte_or(&to_bytes(&a(2)), b'"') } else { b'"' };
+                parse_csv(&s, delim, quote)
+            }
             "array_keys" => {
                 let mut out = Arr::new();
                 if let Value::Array(arr) = a(0) {
@@ -4612,6 +4651,53 @@ impl Eval {
                 Value::Str(s) if s.is_empty() => Value::Bool(false),
                 v => v,
             },
+            "fgetcsv" => {
+                // fgetcsv($stream, $length=null, $separator=',', $enclosure='"', ...)
+                match self.stream_gets(&a(0), None) {
+                    Value::Str(mut l) => {
+                        while matches!(l.last(), Some(b'\n') | Some(b'\r')) {
+                            l.pop();
+                        }
+                        let delim = first_byte_or(&to_bytes(&a(2)), b',');
+                        let quote = if args.len() > 3 { first_byte_or(&to_bytes(&a(3)), b'"') } else { b'"' };
+                        parse_csv(&l, delim, quote)
+                    }
+                    _ => Value::Bool(false),
+                }
+            }
+            "fputcsv" => {
+                // fputcsv($stream, $fields, $separator=',', $enclosure='"', ..., $eol="\n")
+                let delim = first_byte_or(&to_bytes(&a(2)), b',');
+                let quote = if args.len() > 3 { first_byte_or(&to_bytes(&a(3)), b'"') } else { b'"' };
+                let mut line: Vec<u8> = Vec::new();
+                if let Value::Array(arr) = a(1) {
+                    for (i, (_, v)) in arr.entries.iter().enumerate() {
+                        if i > 0 {
+                            line.push(delim);
+                        }
+                        let f = to_bytes(v);
+                        let needs_q = f.contains(&delim)
+                            || f.contains(&quote)
+                            || f.contains(&b'\n')
+                            || f.contains(&b'\r');
+                        if needs_q {
+                            line.push(quote);
+                            for &b in &f {
+                                if b == quote {
+                                    line.push(quote);
+                                }
+                                line.push(b);
+                            }
+                            line.push(quote);
+                        } else {
+                            line.extend_from_slice(&f);
+                        }
+                    }
+                }
+                let eol = if args.len() > 5 { to_bytes(&a(5)) } else { b"\n".to_vec() };
+                line.extend_from_slice(&eol);
+                self.stream_write(&a(0), &line)?
+            }
             "stream_get_contents" => {
                 let n = if args.len() > 1 && !matches!(a(1), Value::Null) && to_i64(&a(1)) >= 0 {
                     Some(to_i64(&a(1)) as usize)
@@ -5012,6 +5098,47 @@ fn trim_bytes(s: &[u8], left: bool, right: bool) -> Vec<u8> {
 /// Is this value a stream resource (a `__Stream` pseudo-object)?
 fn is_stream(v: &Value) -> bool {
     matches!(v, Value::Object(o) if o.borrow().class == "__Stream")
+}
+
+/// Parse one CSV record into an array of fields (basic RFC4180 quoting).
+fn parse_csv(s: &[u8], delim: u8, quote: u8) -> Value {
+    let mut fields = Arr::new();
+    let mut field: Vec<u8> = Vec::new();
+    let mut in_q = false;
+    let mut i = 0;
+    let n = s.len();
+    while i < n {
+        let c = s[i];
+        if in_q {
+            if c == quote {
+                if i + 1 < n && s[i + 1] == quote {
+                    field.push(quote);
+                    i += 2;
+                    continue;
+                }
+                in_q = false;
+                i += 1;
+            } else {
+                field.push(c);
+                i += 1;
+            }
+        } else if c == quote && field.is_empty() {
+            in_q = true;
+            i += 1;
+        } else if c == delim {
+            fields.push(Value::Str(std::mem::take(&mut field)));
+            i += 1;
+        } else {
+            field.push(c);
+            i += 1;
+        }
+    }
+    fields.push(Value::Str(field));
+    Value::Array(fields)
+}
+
+fn first_byte_or(v: &[u8], d: u8) -> u8 {
+    v.first().copied().unwrap_or(d)
 }
 
 /// Binary-safe comparison returning PHP 8's -1 / 0 / 1.
