@@ -50,6 +50,9 @@ pub struct Eval {
     ob_stack: Vec<usize>,
     /// Next stream resource id handed out by `fopen` (cosmetic, for var_dump/id).
     next_res_id: i64,
+    /// Enum cases are singletons: cache (class, case) -> the one shared instance
+    /// so `Enum::from(x) === Enum::Case` holds (object identity).
+    enum_cases: HashMap<(String, String), Value>,
     /// Active generator collection buffer (eager generators collect yields here).
     gen_buf: Option<Arr>,
     /// Total node count accumulated into the active generator buffer. Capped so
@@ -232,7 +235,24 @@ class ReflectionClass {
     public function newInstanceWithoutConstructor() { $n = $this->name; return new $n(); }
 }
 class ReflectionObject extends ReflectionClass {}
-class ReflectionEnum extends ReflectionClass {}
+class ReflectionEnum extends ReflectionClass {
+    public function isEnum() { return true; }
+    public function getCases() { $r = []; $n = $this->name; foreach ($n::cases() as $c) { $r[] = $this->isBacked() ? new ReflectionEnumBackedCase($n, $c->name) : new ReflectionEnumUnitCase($n, $c->name); } return $r; }
+    public function getCase($name) { $n = $this->name; return $this->isBacked() ? new ReflectionEnumBackedCase($n, $name) : new ReflectionEnumUnitCase($n, $name); }
+    public function hasCase($name) { $n = $this->name; foreach ($n::cases() as $c) { if ($c->name === $name) return true; } return false; }
+    public function isBacked() { $n = $this->name; foreach ($n::cases() as $c) { return isset($c->value); } return false; }
+    public function getBackingType() { $n = $this->name; foreach ($n::cases() as $c) { return new ReflectionNamedType(is_int($c->value) ? "int" : "string"); } return null; }
+}
+class ReflectionEnumUnitCase {
+    public $class; public $name;
+    public function __construct($c, $n) { $this->class = is_object($c) ? get_class($c) : $c; $this->name = $n; }
+    public function getName() { return $this->name; }
+    public function getValue() { return constant($this->class . "::" . $this->name); }
+    public function getDeclaringClass() { return new ReflectionEnum($this->class); }
+}
+class ReflectionEnumBackedCase extends ReflectionEnumUnitCase {
+    public function getBackingValue() { return $this->getValue()->value; }
+}
 class ReflectionMethod {
     public $class; public $name;
     public function __construct($c, $m = null) { if ($m === null) { $parts = explode("::", $c); $c = $parts[0]; $m = $parts[1]; } $this->class = is_object($c) ? get_class($c) : $c; $this->name = $m; }
@@ -439,6 +459,7 @@ impl Eval {
             included: HashSet::new(),
             ob_stack: Vec::new(),
             next_res_id: 1,
+            enum_cases: HashMap::new(),
             gen_buf: None,
             gen_nodes: 0,
             steps: 0,
@@ -2318,6 +2339,44 @@ impl Eval {
         args: Vec<Value>,
         this: Option<Value>,
     ) -> R<Value> {
+        // Enum built-in static methods: cases() / from() / tryFrom().
+        if let Some(c) = self.find_class(class) {
+            if c.kind == ClassKind::Enum {
+                let backed = c.enum_backing.is_some();
+                match method {
+                    "cases" => {
+                        let names: Vec<String> = c.cases.iter().map(|e| e.name.clone()).collect();
+                        let mut arr = Arr::new();
+                        for n in names {
+                            arr.push(self.class_const(class, &n)?);
+                        }
+                        return Ok(Value::Array(arr));
+                    }
+                    "from" | "tryFrom" if backed => {
+                        let want = args.first().cloned().unwrap_or(Value::Null);
+                        let names: Vec<String> = c.cases.iter().map(|e| e.name.clone()).collect();
+                        for n in &names {
+                            let case = self.class_const(class, n)?;
+                            if let Value::Object(o) = &case {
+                                let cv = o.borrow().get("value").cloned().unwrap_or(Value::Null);
+                                if loose_eq(&cv, &want) && type_name(&cv) == type_name(&want) {
+                                    return Ok(case);
+                                }
+                            }
+                        }
+                        if method == "tryFrom" {
+                            return Ok(Value::Null);
+                        }
+                        let disp = String::from_utf8_lossy(&to_bytes(&want)).into_owned();
+                        return Err(self.throw_error(
+                            "ValueError",
+                            &format!("{disp} is not a valid backing value for enum {class}"),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
         let (decl_class, m) = match self.find_method(class, method) {
             Some(x) => x,
             None => return Err(RunError(format!("call to undefined method {class}::{method}()"))),
@@ -2412,16 +2471,22 @@ impl Eval {
         if let Some(c) = self.find_class(class) {
             if c.kind == ClassKind::Enum {
                 if c.cases.iter().any(|e| e.name == name) {
+                    let key = (c.name.clone(), name.to_string());
+                    if let Some(v) = self.enum_cases.get(&key) {
+                        return Ok(v.clone());
+                    }
                     // model an enum case as an object with `name` (+ `value`)
                     let obj = Rc::new(RefCell::new(Obj { class: c.name.clone(), props: Vec::new() }));
                     obj.borrow_mut().set("name", Value::Str(name.as_bytes().to_vec()));
                     if let Some(ec) = c.cases.iter().find(|e| e.name == name) {
-                        if let Some(v) = &ec.value {
+                        if let Some(v) = &ec.value.clone() {
                             let val = self.eval(v)?;
                             obj.borrow_mut().set("value", val);
                         }
                     }
-                    return Ok(Value::Object(obj));
+                    let v = Value::Object(obj);
+                    self.enum_cases.insert(key, v.clone());
+                    return Ok(v);
                 }
             }
         }
@@ -3805,6 +3870,24 @@ impl Eval {
             "function_exists" => {
                 let n = String::from_utf8_lossy(&to_bytes(&a(0))).to_ascii_lowercase();
                 Value::Bool(self.funcs.contains_key(&n) || is_known_builtin(&n))
+            }
+            "constant" => {
+                let name = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                if let Some((cls, c)) = name.split_once("::") {
+                    self.class_const(cls, c)?
+                } else if let Some(v) = self.consts.get(&name) {
+                    v.clone()
+                } else {
+                    php_const(&name).unwrap_or(Value::Null)
+                }
+            }
+            "defined" => {
+                let name = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                if let Some((cls, c)) = name.split_once("::") {
+                    Value::Bool(self.class_const(cls, c).is_ok())
+                } else {
+                    Value::Bool(self.consts.contains_key(&name) || php_const(&name).is_some())
+                }
             }
             // ---- output buffering ----
             "ob_start" => {
