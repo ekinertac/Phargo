@@ -3117,6 +3117,152 @@ impl Eval {
             }
             "str_starts_with" => Value::Bool(to_bytes(&a(0)).starts_with(&to_bytes(&a(1)))),
             "str_ends_with" => Value::Bool(to_bytes(&a(0)).ends_with(&to_bytes(&a(1)))),
+            "strstr" | "strchr" => {
+                let hay = to_bytes(&a(0));
+                let needle = to_bytes(&a(1));
+                let before = to_bool(&a(2));
+                match find_bytes(&hay, &needle, 0) {
+                    Some(i) => {
+                        if before {
+                            Value::Str(hay[..i].to_vec())
+                        } else {
+                            Value::Str(hay[i..].to_vec())
+                        }
+                    }
+                    None => Value::Bool(false),
+                }
+            }
+            "stristr" => {
+                let hay = to_bytes(&a(0));
+                let needle = to_bytes(&a(1));
+                let before = to_bool(&a(2));
+                match find_bytes(&hay.to_ascii_lowercase(), &needle.to_ascii_lowercase(), 0) {
+                    Some(i) => {
+                        if before {
+                            Value::Str(hay[..i].to_vec())
+                        } else {
+                            Value::Str(hay[i..].to_vec())
+                        }
+                    }
+                    None => Value::Bool(false),
+                }
+            }
+            "strrchr" => {
+                let hay = to_bytes(&a(0));
+                let needle = to_bytes(&a(1));
+                match needle.first() {
+                    Some(&c) => match hay.iter().rposition(|&b| b == c) {
+                        Some(i) => Value::Str(hay[i..].to_vec()),
+                        None => Value::Bool(false),
+                    },
+                    None => Value::Bool(false),
+                }
+            }
+            "strpbrk" => {
+                let hay = to_bytes(&a(0));
+                let chars = to_bytes(&a(1));
+                match hay.iter().position(|b| chars.contains(b)) {
+                    Some(i) => Value::Str(hay[i..].to_vec()),
+                    None => Value::Bool(false),
+                }
+            }
+            "strcmp" => Value::Int(byte_sign(&to_bytes(&a(0)), &to_bytes(&a(1)))),
+            "strcasecmp" => Value::Int(byte_sign(
+                &to_bytes(&a(0)).to_ascii_lowercase(),
+                &to_bytes(&a(1)).to_ascii_lowercase(),
+            )),
+            "strncmp" => {
+                let n = to_i64(&a(2)).max(0) as usize;
+                let s1 = to_bytes(&a(0));
+                let s2 = to_bytes(&a(1));
+                Value::Int(byte_sign(
+                    &s1[..n.min(s1.len())],
+                    &s2[..n.min(s2.len())],
+                ))
+            }
+            "strncasecmp" => {
+                let n = to_i64(&a(2)).max(0) as usize;
+                let s1 = to_bytes(&a(0)).to_ascii_lowercase();
+                let s2 = to_bytes(&a(1)).to_ascii_lowercase();
+                Value::Int(byte_sign(
+                    &s1[..n.min(s1.len())],
+                    &s2[..n.min(s2.len())],
+                ))
+            }
+            "substr_compare" => {
+                let main = to_bytes(&a(0));
+                let s = to_bytes(&a(1));
+                let mlen = main.len() as i64;
+                let mut off = to_i64(&a(2));
+                if off < 0 {
+                    off = (mlen + off).max(0);
+                }
+                let off = off.min(mlen) as usize;
+                let ci = to_bool(&a(4));
+                let mut m = main[off..].to_vec();
+                let mut s = s;
+                if args.len() > 3 && !matches!(a(3), Value::Null) {
+                    let l = to_i64(&a(3)).max(0) as usize;
+                    m.truncate(l);
+                    s.truncate(l);
+                }
+                if ci {
+                    Value::Int(byte_sign(&m.to_ascii_lowercase(), &s.to_ascii_lowercase()))
+                } else {
+                    Value::Int(byte_sign(&m, &s))
+                }
+            }
+            "strspn" => {
+                let subj = to_bytes(&a(0));
+                let mask = to_bytes(&a(1));
+                Value::Int(subj.iter().take_while(|b| mask.contains(b)).count() as i64)
+            }
+            "strcspn" => {
+                let subj = to_bytes(&a(0));
+                let mask = to_bytes(&a(1));
+                Value::Int(subj.iter().take_while(|b| !mask.contains(b)).count() as i64)
+            }
+            "addslashes" => {
+                let s = to_bytes(&a(0));
+                let mut out = Vec::with_capacity(s.len());
+                for &b in &s {
+                    if matches!(b, b'\'' | b'"' | b'\\' | 0) {
+                        out.push(b'\\');
+                    }
+                    if b == 0 {
+                        out.push(b'0');
+                    } else {
+                        out.push(b);
+                    }
+                }
+                Value::Str(out)
+            }
+            "stripslashes" => {
+                let s = to_bytes(&a(0));
+                let mut out = Vec::with_capacity(s.len());
+                let mut i = 0;
+                while i < s.len() {
+                    if s[i] == b'\\' && i + 1 < s.len() {
+                        i += 1;
+                        out.push(if s[i] == b'0' { 0 } else { s[i] });
+                    } else {
+                        out.push(s[i]);
+                    }
+                    i += 1;
+                }
+                Value::Str(out)
+            }
+            "quotemeta" => {
+                let s = to_bytes(&a(0));
+                let mut out = Vec::with_capacity(s.len());
+                for &b in &s {
+                    if matches!(b, b'.' | b'\\' | b'+' | b'*' | b'?' | b'[' | b'^' | b']' | b'$' | b'(' | b')') {
+                        out.push(b'\\');
+                    }
+                    out.push(b);
+                }
+                Value::Str(out)
+            }
             "array_keys" => {
                 let mut out = Arr::new();
                 if let Value::Array(arr) = a(0) {
@@ -4412,6 +4558,15 @@ fn trim_bytes(s: &[u8], left: bool, right: bool) -> Vec<u8> {
         }
     }
     s[start..end].to_vec()
+}
+
+/// Binary-safe comparison returning PHP 8's -1 / 0 / 1.
+fn byte_sign(a: &[u8], b: &[u8]) -> i64 {
+    match a.cmp(b) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
 }
 
 fn find_bytes(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
