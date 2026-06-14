@@ -615,12 +615,15 @@ impl Parser {
             loop {
                 if self.at_kw("public") {
                     self.bump();
+                    self.skip_set_visibility();
                     promote = Some(Visibility::Public);
                 } else if self.at_kw("protected") {
                     self.bump();
+                    self.skip_set_visibility();
                     promote = Some(Visibility::Protected);
                 } else if self.at_kw("private") {
                     self.bump();
+                    self.skip_set_visibility();
                     promote = Some(Visibility::Private);
                 } else if self.at_kw("readonly") {
                     self.bump();
@@ -694,6 +697,19 @@ impl Parser {
     fn skip_return_type(&mut self) {
         if self.eat(&Kind::Colon) {
             let _ = self.parse_type_opt();
+        }
+    }
+
+    /// PHP 8.4 asymmetric visibility: a visibility keyword may be followed by
+    /// `(set)`, e.g. `public private(set) int $x`. We don't model set-visibility
+    /// separately yet, so just consume the parenthesised modifier.
+    fn skip_set_visibility(&mut self) {
+        if matches!(self.kind(), Kind::LParen) {
+            self.bump();
+            while !matches!(self.kind(), Kind::RParen | Kind::Eof) {
+                self.bump();
+            }
+            self.eat(&Kind::RParen);
         }
     }
 
@@ -854,12 +870,15 @@ impl Parser {
             loop {
                 if self.at_kw("public") {
                     self.bump();
+                    self.skip_set_visibility();
                     visibility = Visibility::Public;
                 } else if self.at_kw("protected") {
                     self.bump();
+                    self.skip_set_visibility();
                     visibility = Visibility::Protected;
                 } else if self.at_kw("private") {
                     self.bump();
+                    self.skip_set_visibility();
                     visibility = Visibility::Private;
                 } else if self.at_kw("static") {
                     self.bump();
