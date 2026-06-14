@@ -238,6 +238,7 @@ pub fn type_name(v: &Value) -> &'static str {
         Value::Float(_) => "double",
         Value::Str(_) => "string",
         Value::Array(_) => "array",
+        Value::Object(o) if o.borrow().class == "__Stream" => "resource",
         Value::Object(_) | Value::Closure(_) => "object",
     }
 }

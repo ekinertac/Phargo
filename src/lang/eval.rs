@@ -48,6 +48,8 @@ pub struct Eval {
     included: HashSet<String>,
     /// Output-buffering watermarks into `out` (one per active `ob_start`).
     ob_stack: Vec<usize>,
+    /// Next stream resource id handed out by `fopen` (cosmetic, for var_dump/id).
+    next_res_id: i64,
     /// Active generator collection buffer (eager generators collect yields here).
     gen_buf: Option<Arr>,
     /// Total node count accumulated into the active generator buffer. Capped so
@@ -436,6 +438,7 @@ impl Eval {
             cur_file: None,
             included: HashSet::new(),
             ob_stack: Vec::new(),
+            next_res_id: 1,
             gen_buf: None,
             gen_nodes: 0,
             steps: 0,
@@ -472,6 +475,13 @@ impl Eval {
         let mut e = Eval::new();
         e.cur_file = path;
         e.load_prelude();
+        // Predefined stream resources.
+        let stdin = e.new_stream("php://stdin", "r", vec![], false, "stdin");
+        let stdout = e.new_stream("php://stdout", "w", vec![], false, "stdout");
+        let stderr = e.new_stream("php://stderr", "w", vec![], false, "stderr");
+        e.consts.insert("STDIN".into(), stdin);
+        e.consts.insert("STDOUT".into(), stdout);
+        e.consts.insert("STDERR".into(), stderr);
         e.hoist(program);
         match e.exec_block(program) {
             Ok(_) => Ok(e.out),
@@ -2432,6 +2442,193 @@ impl Eval {
     }
 }
 
+// ---- stream resources (fopen family) -----------------------------------
+//
+// A stream is modelled as a `Value::Object` of the pseudo-class `__Stream`,
+// holding an in-memory byte buffer + cursor. Real files are slurped on open and
+// flushed back to disk on every write/close. Because objects are
+// `Rc<RefCell<…>>`, a handle passed by value still mutates the same stream — so
+// fread/fwrite see each other's effects without by-ref plumbing. php://memory,
+// php://temp and php://std{out,err,in} are supported.
+impl Eval {
+    fn new_stream(&mut self, path: &str, mode: &str, buf: Vec<u8>, real: bool, std: &str) -> Value {
+        let id = self.next_res_id;
+        self.next_res_id += 1;
+        let o = new_obj("__Stream");
+        if let Value::Object(rc) = &o {
+            let mut b = rc.borrow_mut();
+            b.set("__stream", Value::Bool(true));
+            b.set("__id", Value::Int(id));
+            b.set("__path", Value::Str(path.as_bytes().to_vec()));
+            b.set("__mode", Value::Str(mode.as_bytes().to_vec()));
+            let pos = if mode.starts_with('a') { buf.len() as i64 } else { 0 };
+            b.set("__pos", Value::Int(pos));
+            b.set("__buf", Value::Str(buf));
+            b.set("__real", Value::Bool(real));
+            b.set("__std", Value::Str(std.as_bytes().to_vec()));
+        }
+        o
+    }
+
+    fn fopen_impl(&mut self, path: &str, mode: &str) -> Value {
+        let first = mode.chars().next().unwrap_or('r');
+        if path == "php://stdout" || path == "php://output" {
+            return self.new_stream(path, mode, vec![], false, "stdout");
+        }
+        if path == "php://stderr" {
+            return self.new_stream(path, mode, vec![], false, "stderr");
+        }
+        if path == "php://stdin" || path == "php://input" {
+            return self.new_stream(path, mode, vec![], false, "stdin");
+        }
+        if path.starts_with("php://memory") || path.starts_with("php://temp") || path.starts_with("php://fd") {
+            return self.new_stream(path, mode, vec![], false, "");
+        }
+        match first {
+            'r' => match std::fs::read(path) {
+                Ok(b) => self.new_stream(path, mode, b, true, ""),
+                Err(_) => Value::Bool(false),
+            },
+            'w' => {
+                let _ = std::fs::write(path, b"");
+                self.new_stream(path, mode, vec![], true, "")
+            }
+            'a' | 'c' => {
+                let buf = std::fs::read(path).unwrap_or_default();
+                if !std::path::Path::new(path).exists() {
+                    let _ = std::fs::write(path, b"");
+                }
+                self.new_stream(path, mode, buf, true, "")
+            }
+            'x' => {
+                if std::path::Path::new(path).exists() {
+                    Value::Bool(false)
+                } else {
+                    let _ = std::fs::write(path, b"");
+                    self.new_stream(path, mode, vec![], true, "")
+                }
+            }
+            _ => Value::Bool(false),
+        }
+    }
+
+    fn stream_write(&mut self, v: &Value, data: &[u8]) -> R<Value> {
+        let o = match v {
+            Value::Object(o) if o.borrow().class == "__Stream" => o.clone(),
+            _ => return Ok(Value::Bool(false)),
+        };
+        let std = { let b = o.borrow(); b.get("__std").map(to_bytes).unwrap_or_default() };
+        match std.as_slice() {
+            b"stdout" => {
+                self.out.extend_from_slice(data);
+                return Ok(Value::Int(data.len() as i64));
+            }
+            b"stderr" => return Ok(Value::Int(data.len() as i64)), // discarded
+            b"stdin" => return Ok(Value::Bool(false)),
+            _ => {}
+        }
+        let mut b = o.borrow_mut();
+        let mut buf = match b.get("__buf") {
+            Some(Value::Str(s)) => s.clone(),
+            _ => Vec::new(),
+        };
+        let pos = b.get("__pos").map(to_i64).unwrap_or(0).max(0) as usize;
+        let end = pos.saturating_add(data.len());
+        if end > MAX_STR {
+            return Err(RunError("stream write exceeds size limit".into()));
+        }
+        if end > buf.len() {
+            buf.resize(end, 0);
+        }
+        buf[pos..end].copy_from_slice(data);
+        b.set("__pos", Value::Int(end as i64));
+        let real = matches!(b.get("__real"), Some(Value::Bool(true)));
+        let path = b.get("__path").map(to_bytes).unwrap_or_default();
+        b.set("__buf", Value::Str(buf.clone()));
+        drop(b);
+        if real {
+            let _ = std::fs::write(String::from_utf8_lossy(&path).as_ref(), &buf);
+        }
+        Ok(Value::Int(data.len() as i64))
+    }
+
+    /// Read up to `n` bytes (None = the rest) from the cursor; advance it.
+    fn stream_read_n(&mut self, v: &Value, n: Option<usize>) -> Value {
+        let o = match v {
+            Value::Object(o) if o.borrow().class == "__Stream" => o.clone(),
+            _ => return Value::Bool(false),
+        };
+        let mut b = o.borrow_mut();
+        let buf = match b.get("__buf") {
+            Some(Value::Str(s)) => s.clone(),
+            _ => Vec::new(),
+        };
+        let pos = b.get("__pos").map(to_i64).unwrap_or(0).max(0) as usize;
+        if pos >= buf.len() {
+            return Value::Str(Vec::new());
+        }
+        let end = match n {
+            Some(k) => (pos + k).min(buf.len()),
+            None => buf.len(),
+        };
+        b.set("__pos", Value::Int(end as i64));
+        Value::Str(buf[pos..end].to_vec())
+    }
+
+    /// Read one line (through the next `\n`, inclusive), capped at `n-1` bytes.
+    fn stream_gets(&mut self, v: &Value, n: Option<usize>) -> Value {
+        let o = match v {
+            Value::Object(o) if o.borrow().class == "__Stream" => o.clone(),
+            _ => return Value::Bool(false),
+        };
+        let mut b = o.borrow_mut();
+        let buf = match b.get("__buf") {
+            Some(Value::Str(s)) => s.clone(),
+            _ => Vec::new(),
+        };
+        let pos = b.get("__pos").map(to_i64).unwrap_or(0).max(0) as usize;
+        if pos >= buf.len() {
+            return Value::Bool(false);
+        }
+        let mut end = buf[pos..]
+            .iter()
+            .position(|&c| c == b'\n')
+            .map(|i| pos + i + 1)
+            .unwrap_or(buf.len());
+        if let Some(k) = n {
+            if k > 0 {
+                end = end.min(pos + k - 1);
+            }
+        }
+        b.set("__pos", Value::Int(end as i64));
+        Value::Str(buf[pos..end].to_vec())
+    }
+
+    /// Move the cursor. whence: 0=SET, 1=CUR, 2=END. Returns 0 on success, -1 otherwise.
+    fn stream_seek(&mut self, v: &Value, offset: i64, whence: i64) -> i64 {
+        let o = match v {
+            Value::Object(o) if o.borrow().class == "__Stream" => o.clone(),
+            _ => return -1,
+        };
+        let mut b = o.borrow_mut();
+        let len = match b.get("__buf") {
+            Some(Value::Str(s)) => s.len() as i64,
+            _ => 0,
+        };
+        let cur = b.get("__pos").map(to_i64).unwrap_or(0);
+        let target = match whence {
+            1 => cur + offset,
+            2 => len + offset,
+            _ => offset,
+        };
+        if target < 0 {
+            return -1;
+        }
+        b.set("__pos", Value::Int(target));
+        0
+    }
+}
+
 // ---- builtin library (starter set) -------------------------------------
 impl Eval {
     fn builtin(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
@@ -2530,7 +2727,26 @@ impl Eval {
             "is_bool" => Value::Bool(matches!(a(0), Value::Bool(_))),
             "is_array" => Value::Bool(matches!(a(0), Value::Array(_))),
             "is_null" => Value::Bool(matches!(a(0), Value::Null)),
-            "is_object" => Value::Bool(matches!(a(0), Value::Object(_) | Value::Closure(_))),
+            "is_object" => Value::Bool(match a(0) {
+                Value::Object(o) => o.borrow().class != "__Stream",
+                Value::Closure(_) => true,
+                _ => false,
+            }),
+            "is_resource" => Value::Bool(is_stream(&a(0))),
+            "get_resource_type" => {
+                if is_stream(&a(0)) {
+                    Value::Str(b"stream".to_vec())
+                } else {
+                    Value::Null
+                }
+            }
+            "get_resource_id" => {
+                if let Value::Object(o) = a(0) {
+                    Value::Int(o.borrow().get("__id").map(to_i64).unwrap_or(0))
+                } else {
+                    Value::Int(0)
+                }
+            }
             "is_iterable" => Value::Bool(matches!(a(0), Value::Array(_) | Value::Object(_))),
             "is_numeric" => Value::Bool(match a(0) {
                 Value::Int(_) | Value::Float(_) => true,
@@ -4261,6 +4477,84 @@ impl Eval {
                     Err(_) => Value::Bool(false),
                 }
             }
+            "fopen" => {
+                let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let mode = String::from_utf8_lossy(&to_bytes(&a(1))).into_owned();
+                self.fopen_impl(&path, &mode)
+            }
+            "fwrite" | "fputs" => {
+                let data = to_bytes(&a(1));
+                let data = if args.len() > 2 {
+                    let n = to_i64(&a(2)).max(0) as usize;
+                    data[..n.min(data.len())].to_vec()
+                } else {
+                    data
+                };
+                self.stream_write(&a(0), &data)?
+            }
+            "fread" => {
+                let n = to_i64(&a(1)).max(0) as usize;
+                self.stream_read_n(&a(0), Some(n))
+            }
+            "fgets" => {
+                let n = if args.len() > 1 && !matches!(a(1), Value::Null) {
+                    Some(to_i64(&a(1)).max(0) as usize)
+                } else {
+                    None
+                };
+                self.stream_gets(&a(0), n)
+            }
+            "fgetc" => match self.stream_read_n(&a(0), Some(1)) {
+                Value::Str(s) if s.is_empty() => Value::Bool(false),
+                v => v,
+            },
+            "stream_get_contents" => {
+                let n = if args.len() > 1 && !matches!(a(1), Value::Null) && to_i64(&a(1)) >= 0 {
+                    Some(to_i64(&a(1)) as usize)
+                } else {
+                    None
+                };
+                if args.len() > 2 && to_i64(&a(2)) >= 0 {
+                    let _ = self.stream_seek(&a(0), to_i64(&a(2)), 0);
+                }
+                self.stream_read_n(&a(0), n)
+            }
+            "fpassthru" => {
+                let rest = self.stream_read_n(&a(0), None);
+                let bytes = to_bytes(&rest);
+                let n = bytes.len();
+                self.out.extend_from_slice(&bytes);
+                Value::Int(n as i64)
+            }
+            "feof" => {
+                if let Value::Object(o) = a(0) {
+                    let b = o.borrow();
+                    let pos = b.get("__pos").map(to_i64).unwrap_or(0);
+                    let len = match b.get("__buf") {
+                        Some(Value::Str(s)) => s.len() as i64,
+                        _ => 0,
+                    };
+                    Value::Bool(pos >= len)
+                } else {
+                    Value::Bool(true)
+                }
+            }
+            "ftell" => {
+                if let Value::Object(o) = a(0) {
+                    Value::Int(o.borrow().get("__pos").map(to_i64).unwrap_or(0))
+                } else {
+                    Value::Bool(false)
+                }
+            }
+            "fseek" => {
+                let whence = to_i64(&a(2));
+                Value::Int(self.stream_seek(&a(0), to_i64(&a(1)), whence))
+            }
+            "rewind" => {
+                let _ = self.stream_seek(&a(0), 0, 0);
+                Value::Bool(true)
+            }
+            "fflush" | "fclose" => Value::Bool(matches!(&a(0), Value::Object(o) if o.borrow().class == "__Stream")),
             "unlink" => {
                 let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 Value::Bool(std::fs::remove_file(&path).is_ok())
@@ -4560,6 +4854,11 @@ fn trim_bytes(s: &[u8], left: bool, right: bool) -> Vec<u8> {
     s[start..end].to_vec()
 }
 
+/// Is this value a stream resource (a `__Stream` pseudo-object)?
+fn is_stream(v: &Value) -> bool {
+    matches!(v, Value::Object(o) if o.borrow().class == "__Stream")
+}
+
 /// Binary-safe comparison returning PHP 8's -1 / 0 / 1.
 fn byte_sign(a: &[u8], b: &[u8]) -> i64 {
     match a.cmp(b) {
@@ -4732,6 +5031,11 @@ fn var_dump_seen(v: &Value, indent: usize, out: &mut String, seen: &mut Vec<usiz
                 return;
             }
             let ob = o.borrow();
+            if ob.class == "__Stream" {
+                let rid = ob.get("__id").map(to_i64).unwrap_or(0);
+                out.push_str(&format!("{pad}resource({rid}) of type (stream)\n"));
+                return;
+            }
             out.push_str(&format!("{pad}object({})#1 ({}) {{\n", ob.class, ob.props.len()));
             seen.push(id);
             for (k, val) in &ob.props {
