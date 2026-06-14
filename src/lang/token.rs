@@ -107,6 +107,7 @@ pub enum Kind {
     Not,       // !
     Amp,       // &  (bitwise / reference)
     Pipe,      // |
+    PipeArrow, // |>  (PHP 8.5 pipe operator)
     Caret,     // ^
     Tilde,     // ~
     Shl,       // <<

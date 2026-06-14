@@ -1070,12 +1070,26 @@ impl Parser {
             }
             // `instanceof`
             if self.at_kw("instanceof") {
-                if 38 < min_bp {
+                if 40 < min_bp {
                     break;
                 }
                 self.bump();
                 let rhs = self.instanceof_rhs()?;
                 lhs = Expr::InstanceOf(Box::new(lhs), Box::new(rhs));
+                continue;
+            }
+            // PHP 8.5 pipe operator  `lhs |> callable`  ==  callable(lhs).
+            // Binds tighter than comparison, looser than concat; left-assoc.
+            if matches!(self.kind(), Kind::PipeArrow) {
+                if 30 < min_bp {
+                    break;
+                }
+                self.bump();
+                let rhs = self.expr_bp(31)?;
+                lhs = Expr::Call(
+                    Box::new(rhs),
+                    vec![Arg { value: lhs, spread: false, by_ref: false, name: None }],
+                );
                 continue;
             }
             // keyword logical operators and / or / xor
@@ -1149,36 +1163,36 @@ impl Parser {
         match self.kind().clone() {
             Kind::Minus => {
                 self.bump();
-                Ok(Expr::Unary(UnOp::Neg, Box::new(self.expr_bp(40)?)))
+                Ok(Expr::Unary(UnOp::Neg, Box::new(self.expr_bp(42)?)))
             }
             Kind::Plus => {
                 self.bump();
-                Ok(Expr::Unary(UnOp::Pos, Box::new(self.expr_bp(40)?)))
+                Ok(Expr::Unary(UnOp::Pos, Box::new(self.expr_bp(42)?)))
             }
             Kind::Not => {
                 self.bump();
-                Ok(Expr::Unary(UnOp::Not, Box::new(self.expr_bp(39)?)))
+                Ok(Expr::Unary(UnOp::Not, Box::new(self.expr_bp(41)?)))
             }
             Kind::Tilde => {
                 self.bump();
-                Ok(Expr::Unary(UnOp::BitNot, Box::new(self.expr_bp(40)?)))
+                Ok(Expr::Unary(UnOp::BitNot, Box::new(self.expr_bp(42)?)))
             }
             Kind::At => {
                 self.bump();
-                Ok(Expr::ErrorSuppress(Box::new(self.expr_bp(40)?)))
+                Ok(Expr::ErrorSuppress(Box::new(self.expr_bp(42)?)))
             }
             Kind::Inc => {
                 self.bump();
-                Ok(Expr::PreInc(Box::new(self.expr_bp(40)?)))
+                Ok(Expr::PreInc(Box::new(self.expr_bp(42)?)))
             }
             Kind::Dec => {
                 self.bump();
-                Ok(Expr::PreDec(Box::new(self.expr_bp(40)?)))
+                Ok(Expr::PreDec(Box::new(self.expr_bp(42)?)))
             }
             Kind::Amp => {
                 // reference in expression position (e.g. `&$x` in array/uses); treat operand
                 self.bump();
-                self.expr_bp(40)
+                self.expr_bp(42)
             }
             Kind::LParen => {
                 // cast?  ( type )
@@ -1186,7 +1200,7 @@ impl Parser {
                     self.bump(); // (
                     self.bump(); // type ident
                     self.bump(); // )
-                    let e = self.expr_bp(40)?;
+                    let e = self.expr_bp(42)?;
                     return Ok(Expr::Cast(ct, Box::new(e)));
                 }
                 self.bump();
@@ -1286,7 +1300,7 @@ impl Parser {
                     "new" => self.parse_new(),
                     "clone" => {
                         self.bump();
-                        Ok(Expr::Clone(Box::new(self.expr_bp(40)?)))
+                        Ok(Expr::Clone(Box::new(self.expr_bp(42)?)))
                     }
                     "print" => {
                         self.bump();
@@ -1782,15 +1796,17 @@ fn infix_bp(k: &Kind) -> Option<(BinOp, u8, u8)> {
         Kind::Gt => (BinOp::Gt, 28, 29),
         Kind::Le => (BinOp::Le, 28, 29),
         Kind::Ge => (BinOp::Ge, 28, 29),
-        Kind::Dot => (BinOp::Concat, 30, 31),
-        Kind::Shl => (BinOp::Shl, 32, 33),
-        Kind::Shr => (BinOp::Shr, 32, 33),
-        Kind::Plus => (BinOp::Add, 34, 35),
-        Kind::Minus => (BinOp::Sub, 34, 35),
-        Kind::Star => (BinOp::Mul, 36, 37),
-        Kind::Slash => (BinOp::Div, 36, 37),
-        Kind::Percent => (BinOp::Mod, 36, 37),
-        Kind::Pow => (BinOp::Pow, 43, 42), // right-assoc, very tight
+        // (30/31 is the PHP 8.5 pipe operator `|>`, handled specially in the
+        // expression loop — it sits between comparison and concat.)
+        Kind::Dot => (BinOp::Concat, 32, 33),
+        Kind::Shl => (BinOp::Shl, 34, 35),
+        Kind::Shr => (BinOp::Shr, 34, 35),
+        Kind::Plus => (BinOp::Add, 36, 37),
+        Kind::Minus => (BinOp::Sub, 36, 37),
+        Kind::Star => (BinOp::Mul, 38, 39),
+        Kind::Slash => (BinOp::Div, 38, 39),
+        Kind::Percent => (BinOp::Mod, 38, 39),
+        Kind::Pow => (BinOp::Pow, 45, 44), // right-assoc, very tight
         _ => return None,
     })
 }

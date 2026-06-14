@@ -627,6 +627,7 @@ impl<'a> Lexer<'a> {
                 b".=" => Some(Kind::DotEq),
                 b"&=" => Some(Kind::AndEq),
                 b"|=" => Some(Kind::OrEq),
+                b"|>" => Some(Kind::PipeArrow),
                 b"^=" => Some(Kind::XorEq),
                 b"**" => Some(Kind::Pow),
                 b"->" => Some(Kind::Arrow),
