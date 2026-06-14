@@ -150,6 +150,27 @@ class DateTimeImmutable implements DateTimeInterface {
     public function diff($other) { return DateInterval::__fromArray(phargo_date_diff($this->__ts, $other->getTimestamp())); }
     public static function createFromFormat($fmt, $s, $tz = null) { return new DateTimeImmutable($s); }
 }
+function date_create($s = "now", $tz = null) { return new DateTime($s); }
+function date_create_immutable($s = "now", $tz = null) { return new DateTimeImmutable($s); }
+function date_create_from_format($fmt, $s, $tz = null) { return DateTime::createFromFormat($fmt, $s, $tz); }
+function date_create_immutable_from_format($fmt, $s, $tz = null) { return DateTimeImmutable::createFromFormat($fmt, $s, $tz); }
+function date_diff($a, $b, $absolute = false) { return $a->diff($b); }
+function date_format($d, $fmt) { return $d->format($fmt); }
+function date_add($d, $iv) { return $d->add($iv); }
+function date_sub($d, $iv) { return $d->sub($iv); }
+function date_modify($d, $s) { return $d->modify($s); }
+function date_timestamp_get($d) { return $d->getTimestamp(); }
+function date_timestamp_set($d, $ts) { return $d->setTimestamp($ts); }
+function date_offset_get($d) { return $d->getOffset(); }
+function date_timezone_get($d) { return $d->getTimezone(); }
+function date_timezone_set($d, $tz) { return $d->setTimezone($tz); }
+function date_date_set($d, $y, $m, $day) { return $d->setDate($y, $m, $day); }
+function date_time_set($d, $h, $i, $s = 0) { return $d->setTime($h, $i, $s); }
+function timezone_open($tz) { return new DateTimeZone($tz); }
+function timezone_name_get($tz) { return $tz->getName(); }
+function timezone_offset_get($tz, $dt) { return 0; }
+function date_interval_create_from_date_string($s) { $a = strtotime("now"); $b = strtotime($s); return DateInterval::__fromArray(phargo_date_diff($a, $b)); }
+function date_interval_format($iv, $fmt) { return $iv->format($fmt); }
 class DateInterval {
     public $y = 0; public $m = 0; public $d = 0;
     public $h = 0; public $i = 0; public $s = 0;
