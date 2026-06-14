@@ -329,6 +329,27 @@ class ArrayIterator implements Iterator, ArrayAccess, Countable {
     public function getArrayCopy() { return $this->__d; }
     public function append($v) { $this->__d[] = $v; }
 }
+class RecursiveArrayIterator extends ArrayIterator {
+    public function hasChildren() { return is_array($this->current()); }
+    public function getChildren() { return new RecursiveArrayIterator($this->current()); }
+}
+class DirectoryIterator implements Iterator {
+    private $__d; private $__p = 0; private $__path;
+    public function __construct($path) { $this->__path = $path; $this->__d = scandir($path); }
+    public function rewind(): void { $this->__p = 0; }
+    public function valid(): bool { return $this->__p < count($this->__d); }
+    public function current(): mixed { return $this; }
+    public function key(): mixed { return $this->__p; }
+    public function next(): void { $this->__p = $this->__p + 1; }
+    public function getFilename() { return $this->__d[$this->__p]; }
+    public function getPathname() { return $this->__path . DIRECTORY_SEPARATOR . $this->__d[$this->__p]; }
+    public function getPath() { return $this->__path; }
+    public function isDot() { $f = $this->__d[$this->__p]; return $f === "." || $f === ".."; }
+    public function isDir() { return is_dir($this->getPathname()); }
+    public function isFile() { return is_file($this->getPathname()); }
+    public function getBasename($suffix = "") { $f = $this->__d[$this->__p]; if ($suffix !== "" && str_ends_with($f, $suffix)) { $f = substr($f, 0, strlen($f) - strlen($suffix)); } return $f; }
+    public function __toString() { return $this->__d[$this->__p]; }
+}
 class ArrayObject implements ArrayAccess, IteratorAggregate, Countable {
     private $__d;
     public function __construct($array = []) { $this->__d = $array; }
@@ -4707,6 +4728,57 @@ impl Eval {
                     Err(_) => Value::Bool(false),
                 }
             }
+            "opendir" => {
+                let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                match std::fs::read_dir(&path) {
+                    Ok(rd) => {
+                        let mut names: Vec<Vec<u8>> = vec![b".".to_vec(), b"..".to_vec()];
+                        for e in rd.flatten() {
+                            names.push(e.file_name().to_string_lossy().as_bytes().to_vec());
+                        }
+                        names.sort();
+                        let mut entries = Arr::new();
+                        for n in names {
+                            entries.push(Value::Str(n));
+                        }
+                        let o = new_obj("__Dir");
+                        if let Value::Object(rc) = &o {
+                            let mut b = rc.borrow_mut();
+                            b.set("__entries", Value::Array(entries));
+                            b.set("__pos", Value::Int(0));
+                            b.set("path", Value::Str(path.as_bytes().to_vec()));
+                        }
+                        o
+                    }
+                    Err(_) => Value::Bool(false),
+                }
+            }
+            "readdir" => {
+                if let Value::Object(o) = a(0) {
+                    let mut b = o.borrow_mut();
+                    let pos = b.get("__pos").map(to_i64).unwrap_or(0).max(0) as usize;
+                    let next = match b.get("__entries") {
+                        Some(Value::Array(e)) => e.entries.get(pos).map(|(_, v)| v.clone()),
+                        _ => None,
+                    };
+                    match next {
+                        Some(v) => {
+                            b.set("__pos", Value::Int(pos as i64 + 1));
+                            v
+                        }
+                        None => Value::Bool(false),
+                    }
+                } else {
+                    Value::Bool(false)
+                }
+            }
+            "rewinddir" => {
+                if let Value::Object(o) = a(0) {
+                    o.borrow_mut().set("__pos", Value::Int(0));
+                }
+                Value::Null
+            }
+            "closedir" => Value::Null,
             "realpath" => {
                 let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 match std::fs::canonicalize(&path) {
