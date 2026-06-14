@@ -228,6 +228,9 @@ impl Parser {
                 "abstract" | "final" | "class" | "interface" | "trait" | "enum" => {
                     return self.stmt_class();
                 }
+                "readonly" if self.kw_at(1, "class") => {
+                    return self.stmt_class();
+                }
                 "global" => {
                     self.bump();
                     let mut names = Vec::new();
