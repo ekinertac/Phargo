@@ -507,6 +507,153 @@ class SplPriorityQueue implements Countable, Iterator {
     public function key(): mixed { return count($this->__d) - 1; }
     public function next(): void { $this->extract(); }
 }
+
+// ---- DOM (built on the __dom_parse XML parser) ----
+function __dom_escape_text($s) { return str_replace(["&", "<", ">"], ["&amp;", "&lt;", "&gt;"], $s); }
+function __dom_escape_attr($s) { return str_replace(["&", "<", "\""], ["&amp;", "&lt;", "&quot;"], $s); }
+class DOMNode {
+    public $nodeType = 0; public $nodeName = ""; public $__kids = []; public $__attrs = [];
+    public $__parent = null; public $ownerDocument = null;
+    public function __get($n) {
+        switch ($n) {
+            case "childNodes": return new DOMNodeList($this->__kids);
+            case "firstChild": return $this->__kids[0] ?? null;
+            case "lastChild": return empty($this->__kids) ? null : $this->__kids[count($this->__kids) - 1];
+            case "parentNode": return $this->__parent;
+            case "textContent": return $this->__text();
+            case "nodeValue": return $this->nodeType == 1 ? $this->__text() : ($this->__nv ?? null);
+            case "tagName": case "localName": return $this->nodeName;
+            case "nextSibling": return $this->__sib(1);
+            case "previousSibling": return $this->__sib(-1);
+            case "attributes": return new DOMNamedNodeMap($this->__attrs);
+            case "length": return count($this->__kids);
+            case "namespaceURI": case "prefix": return null;
+            default: return null;
+        }
+    }
+    public function __text() {
+        if ($this->nodeType == 3 || $this->nodeType == 4) { return $this->__nv; }
+        $s = ""; foreach ($this->__kids as $k) { $s .= $k->__text(); } return $s;
+    }
+    public function __sib($dir) {
+        if ($this->__parent === null) { return null; }
+        $ks = $this->__parent->__kids;
+        foreach ($ks as $i => $k) { if ($k === $this) { return $ks[$i + $dir] ?? null; } }
+        return null;
+    }
+    public function appendChild($child) { $child->__parent = $this; $this->__kids[] = $child; return $child; }
+    public function removeChild($child) { $n = []; foreach ($this->__kids as $k) { if ($k !== $child) { $n[] = $k; } } $this->__kids = $n; $child->__parent = null; return $child; }
+    public function hasChildNodes() { return count($this->__kids) > 0; }
+    public function hasAttributes() { return count($this->__attrs) > 0; }
+    public function getElementsByTagName($name) { return new DOMNodeList($this->__collect($name)); }
+    public function __collect($name) {
+        $out = [];
+        foreach ($this->__kids as $k) {
+            if ($k->nodeType == 1) {
+                if ($name === "*" || $k->nodeName === $name) { $out[] = $k; }
+                foreach ($k->__collect($name) as $d) { $out[] = $d; }
+            }
+        }
+        return $out;
+    }
+}
+class DOMElement extends DOMNode {
+    public function __construct($name, $value = null) {
+        $this->nodeType = 1; $this->nodeName = $name;
+        if ($value !== null && $value !== "") { $t = new DOMText($value); $t->__parent = $this; $this->__kids[] = $t; }
+    }
+    public function getAttribute($n) { return $this->__attrs[$n] ?? ""; }
+    public function setAttribute($n, $v) { $this->__attrs[$n] = (string)$v; }
+    public function hasAttribute($n) { return isset($this->__attrs[$n]); }
+    public function removeAttribute($n) { unset($this->__attrs[$n]); }
+    public function getAttributeNode($n) { return isset($this->__attrs[$n]) ? new DOMAttr($n, $this->__attrs[$n]) : false; }
+}
+class DOMText extends DOMNode {
+    public $__nv;
+    public function __construct($data = "") { $this->nodeType = 3; $this->nodeName = "#text"; $this->__nv = $data; }
+    public function __get($n) { if ($n === "data" || $n === "wholeText") { return $this->__nv; } return parent::__get($n); }
+}
+class DOMComment extends DOMNode {
+    public $__nv;
+    public function __construct($data = "") { $this->nodeType = 8; $this->nodeName = "#comment"; $this->__nv = $data; }
+    public function __get($n) { if ($n === "data") { return $this->__nv; } return parent::__get($n); }
+}
+class DOMCdataSection extends DOMText {
+    public function __construct($data = "") { $this->nodeType = 4; $this->nodeName = "#cdata-section"; $this->__nv = $data; }
+}
+class DOMAttr extends DOMNode {
+    public $value;
+    public function __construct($name, $value = "") { $this->nodeType = 2; $this->nodeName = $name; $this->value = $value; }
+}
+class DOMNodeList implements Iterator, Countable {
+    public $length; private $__items; private $__p = 0;
+    public function __construct($items = []) { $this->__items = array_values($items); $this->length = count($this->__items); }
+    public function item($i) { return $this->__items[$i] ?? null; }
+    public function count(): int { return $this->length; }
+    public function rewind(): void { $this->__p = 0; }
+    public function valid(): bool { return $this->__p < $this->length; }
+    public function current(): mixed { return $this->__items[$this->__p]; }
+    public function key(): mixed { return $this->__p; }
+    public function next(): void { $this->__p = $this->__p + 1; }
+}
+class DOMNamedNodeMap implements Countable {
+    private $__a;
+    public function __construct($attrs) { $this->__a = $attrs; }
+    public function getNamedItem($n) { return isset($this->__a[$n]) ? new DOMAttr($n, $this->__a[$n]) : null; }
+    public function item($i) { $k = array_keys($this->__a); return isset($k[$i]) ? new DOMAttr($k[$i], $this->__a[$k[$i]]) : null; }
+    public function count(): int { return count($this->__a); }
+    public function __get($n) { return $n === "length" ? count($this->__a) : null; }
+}
+class DOMDocument extends DOMNode {
+    public $documentElement = null; public $encoding = "UTF-8"; public $version = "1.0"; public $formatOutput = false; public $preserveWhiteSpace = true;
+    public function __construct($version = "1.0", $encoding = "") { $this->nodeType = 9; $this->nodeName = "#document"; $this->version = $version; if ($encoding !== "") { $this->encoding = $encoding; } }
+    public function loadXML($xml, $opts = 0) {
+        $tree = __dom_parse($xml);
+        if ($tree === false) { return false; }
+        $root = $this->__build($tree); $root->__parent = $this;
+        $this->__kids = [$root]; $this->documentElement = $root; return true;
+    }
+    public function load($file, $opts = 0) { $xml = file_get_contents($file); if ($xml === false) { return false; } return $this->loadXML($xml); }
+    public function __build($n) {
+        if ($n["t"] == 1) {
+            $el = new DOMElement($n["name"]); $el->ownerDocument = $this; $el->__attrs = $n["attrs"];
+            foreach ($n["kids"] as $kid) { $c = $this->__build($kid); $c->__parent = $el; $el->__kids[] = $c; }
+            return $el;
+        } elseif ($n["t"] == 4) { $c = new DOMCdataSection($n["text"]); $c->ownerDocument = $this; return $c; }
+        elseif ($n["t"] == 8) { $c = new DOMComment($n["text"]); $c->ownerDocument = $this; return $c; }
+        else { $c = new DOMText($n["text"]); $c->ownerDocument = $this; return $c; }
+    }
+    public function createElement($name, $value = null) { $e = new DOMElement($name, $value); $e->ownerDocument = $this; return $e; }
+    public function createTextNode($data) { $t = new DOMText($data); $t->ownerDocument = $this; return $t; }
+    public function createCDATASection($data) { $t = new DOMCdataSection($data); $t->ownerDocument = $this; return $t; }
+    public function createComment($data) { $t = new DOMComment($data); $t->ownerDocument = $this; return $t; }
+    public function createAttribute($name) { $a = new DOMAttr($name); $a->ownerDocument = $this; return $a; }
+    public function appendChild($child) { $child->__parent = $this; $this->__kids[] = $child; if ($child->nodeType == 1) { $this->documentElement = $child; } return $child; }
+    public function getElementById($id) {
+        foreach ($this->__collect("*") as $e) { if (($e->__attrs["id"] ?? null) === $id) { return $e; } }
+        return null;
+    }
+    public function saveXML($node = null) {
+        if ($node === null) {
+            $s = "<?xml version=\"" . $this->version . "\"?>\n";
+            foreach ($this->__kids as $k) { $s .= $this->__ser($k); }
+            return $s . "\n";
+        }
+        return $this->__ser($node);
+    }
+    public function saveHTML($node = null) { if ($node === null) { $s = ""; foreach ($this->__kids as $k) { $s .= $this->__ser($k); } return $s . "\n"; } return $this->__ser($node); }
+    public function __ser($n) {
+        if ($n->nodeType == 3) { return __dom_escape_text($n->__nv); }
+        if ($n->nodeType == 4) { return "<![CDATA[" . $n->__nv . "]]>"; }
+        if ($n->nodeType == 8) { return "<!--" . $n->__nv . "-->"; }
+        $s = "<" . $n->nodeName;
+        foreach ($n->__attrs as $k => $v) { $s .= " " . $k . "=\"" . __dom_escape_attr($v) . "\""; }
+        if (empty($n->__kids)) { return $s . "/>"; }
+        $s .= ">";
+        foreach ($n->__kids as $c) { $s .= $this->__ser($c); }
+        return $s . "</" . $n->nodeName . ">";
+    }
+}
 "##;
 
 const STEP_LIMIT: u64 = 20_000_000;
@@ -1163,7 +1310,18 @@ impl Eval {
                 let pname = self.prop_name_str(name)?;
                 match &o {
                     Value::Object(rc) => {
-                        rc.borrow().get(&pname).cloned().unwrap_or(Value::Null)
+                        let existing = rc.borrow().get(&pname).cloned();
+                        match existing {
+                            Some(v) => v,
+                            None => {
+                                let class = rc.borrow().class.clone();
+                                if self.find_method(&class, "__get").is_some() {
+                                    self.call_method(o.clone(), "__get", vec![Value::Str(pname.into_bytes())])?
+                                } else {
+                                    Value::Null
+                                }
+                            }
+                        }
                     }
                     _ => Value::Null,
                 }
@@ -3952,6 +4110,10 @@ impl Eval {
                 let n = String::from_utf8_lossy(&to_bytes(&a(0))).to_ascii_lowercase();
                 Value::Bool(self.funcs.contains_key(&n) || is_known_builtin(&n))
             }
+            "__dom_parse" => match super::xml::parse(&to_bytes(&a(0))) {
+                Ok(v) => v,
+                Err(_) => Value::Bool(false),
+            },
             "constant" => {
                 let name = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 if let Some((cls, c)) = name.split_once("::") {
