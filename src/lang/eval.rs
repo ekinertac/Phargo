@@ -545,6 +545,34 @@ class DOMNode {
     public function removeChild($child) { $n = []; foreach ($this->__kids as $k) { if ($k !== $child) { $n[] = $k; } } $this->__kids = $n; $child->__parent = null; return $child; }
     public function hasChildNodes() { return count($this->__kids) > 0; }
     public function hasAttributes() { return count($this->__attrs) > 0; }
+    public function insertBefore($new, $ref = null) {
+        $new->__parent = $this;
+        if ($ref === null) { $this->__kids[] = $new; return $new; }
+        $out = [];
+        foreach ($this->__kids as $k) { if ($k === $ref) { $out[] = $new; } $out[] = $k; }
+        $this->__kids = $out;
+        return $new;
+    }
+    public function replaceChild($new, $old) {
+        $new->__parent = $this;
+        $out = [];
+        foreach ($this->__kids as $k) { $out[] = ($k === $old) ? $new : $k; }
+        $this->__kids = $out;
+        return $old;
+    }
+    public function cloneNode($deep = true) {
+        if ($this->nodeType == 3) { $c = new DOMText($this->__nv); $c->ownerDocument = $this->ownerDocument; return $c; }
+        if ($this->nodeType == 4) { $c = new DOMCdataSection($this->__nv); $c->ownerDocument = $this->ownerDocument; return $c; }
+        if ($this->nodeType == 8) { $c = new DOMComment($this->__nv); $c->ownerDocument = $this->ownerDocument; return $c; }
+        $c = new DOMElement($this->nodeName);
+        $c->__attrs = $this->__attrs;
+        $c->ownerDocument = $this->ownerDocument;
+        if ($deep) {
+            foreach ($this->__kids as $k) { $kc = $k->cloneNode(true); $kc->__parent = $c; $c->__kids[] = $kc; }
+        }
+        return $c;
+    }
+    public function normalize() {}
     public function getElementsByTagName($name) { return new DOMNodeList($this->__collect($name)); }
     public function __collect($name) {
         $out = [];
@@ -567,6 +595,11 @@ class DOMElement extends DOMNode {
     public function hasAttribute($n) { return isset($this->__attrs[$n]); }
     public function removeAttribute($n) { unset($this->__attrs[$n]); }
     public function getAttributeNode($n) { return isset($this->__attrs[$n]) ? new DOMAttr($n, $this->__attrs[$n]) : false; }
+    public function getAttributeNS($ns, $n) { return $this->getAttribute($n); }
+    public function setAttributeNS($ns, $n, $v) { $this->setAttribute($n, $v); }
+    public function hasAttributeNS($ns, $n) { return $this->hasAttribute($n); }
+    public function removeAttributeNS($ns, $n) { $this->removeAttribute($n); }
+    public function setIdAttribute($n, $isId) {}
 }
 class DOMText extends DOMNode {
     public $__nv;
@@ -624,6 +657,10 @@ class DOMDocument extends DOMNode {
         else { $c = new DOMText($n["text"]); $c->ownerDocument = $this; return $c; }
     }
     public function createElement($name, $value = null) { $e = new DOMElement($name, $value); $e->ownerDocument = $this; return $e; }
+    public function createElementNS($ns, $qname, $value = null) { return $this->createElement($qname, $value); }
+    public function createAttributeNS($ns, $qname) { $a = new DOMAttr($qname); $a->ownerDocument = $this; return $a; }
+    public function importNode($node, $deep = false) { $c = $node->cloneNode($deep); $c->ownerDocument = $this; return $c; }
+    public function getElementsByTagNameNS($ns, $name) { return $this->getElementsByTagName($name); }
     public function createTextNode($data) { $t = new DOMText($data); $t->ownerDocument = $this; return $t; }
     public function createCDATASection($data) { $t = new DOMCdataSection($data); $t->ownerDocument = $this; return $t; }
     public function createComment($data) { $t = new DOMComment($data); $t->ownerDocument = $this; return $t; }
