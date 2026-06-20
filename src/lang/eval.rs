@@ -201,6 +201,13 @@ class DateInterval {
         $iv->days = $a["days"]; $iv->invert = $a["invert"];
         return $iv;
     }
+    public function __serialize(): array {
+        return ["y" => $this->y, "m" => $this->m, "d" => $this->d, "h" => $this->h,
+                "i" => $this->i, "s" => $this->s, "f" => $this->f, "invert" => $this->invert, "days" => $this->days];
+    }
+    public function __unserialize($d): void {
+        foreach ($d as $k => $v) { $this->$k = $v; }
+    }
     public function format($f) {
         $r = ""; $n = strlen($f);
         for ($k = 0; $k < $n; $k++) {
@@ -987,6 +994,80 @@ impl Eval {
         Ok(())
     }
 
+    /// Serialize a value to PHP's serialize() format. A method (not a free fn) so
+    /// it can honor the `__serialize()` magic method.
+    fn ser_val(&mut self, v: &Value, out: &mut Vec<u8>, depth: usize) -> R<()> {
+        if depth > 256 || out.len() > MAX_STR {
+            out.extend_from_slice(b"N;");
+            return Ok(());
+        }
+        match v {
+            Value::Null => out.extend_from_slice(b"N;"),
+            Value::Bool(b) => out.extend_from_slice(if *b { b"b:1;" } else { b"b:0;" }),
+            Value::Int(n) => out.extend_from_slice(format!("i:{n};").as_bytes()),
+            Value::Float(f) => out.extend_from_slice(format!("d:{};", ser_float(*f)).as_bytes()),
+            Value::Str(s) => {
+                out.extend_from_slice(format!("s:{}:\"", s.len()).as_bytes());
+                out.extend_from_slice(s);
+                out.extend_from_slice(b"\";");
+            }
+            Value::Array(a) => {
+                out.extend_from_slice(format!("a:{}:{{", a.len()).as_bytes());
+                let entries = a.entries.clone();
+                for (k, val) in &entries {
+                    self.ser_key(k, out);
+                    self.ser_val(val, out, depth + 1)?;
+                }
+                out.push(b'}');
+            }
+            Value::Object(rc) => {
+                let class = rc.borrow().class.clone();
+                // __serialize(): produce an O: wrapper around the returned array.
+                if self.find_method(&class, "__serialize").is_some() {
+                    let arr = self.call_method(v.clone(), "__serialize", vec![])?;
+                    if let Value::Array(a) = arr {
+                        out.extend_from_slice(
+                            format!("O:{}:\"{}\":{}:{{", class.len(), class, a.len()).as_bytes(),
+                        );
+                        let entries = a.entries.clone();
+                        for (k, val) in &entries {
+                            self.ser_key(k, out);
+                            self.ser_val(val, out, depth + 1)?;
+                        }
+                        out.push(b'}');
+                        return Ok(());
+                    }
+                }
+                let props = rc.borrow().props.clone();
+                out.extend_from_slice(
+                    format!("O:{}:\"{}\":{}:{{", class.len(), class, props.len()).as_bytes(),
+                );
+                for (name, val) in &props {
+                    out.extend_from_slice(format!("s:{}:\"{}\";", name.len(), name).as_bytes());
+                    self.ser_val(val, out, depth + 1)?;
+                }
+                out.push(b'}');
+            }
+            Value::Closure(_) => out.extend_from_slice(b"N;"),
+            Value::Ref(c) => {
+                let inner = c.borrow().clone();
+                self.ser_val(&inner, out, depth)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ser_key(&self, k: &Key, out: &mut Vec<u8>) {
+        match k {
+            Key::Int(n) => out.extend_from_slice(format!("i:{n};").as_bytes()),
+            Key::Str(s) => {
+                out.extend_from_slice(format!("s:{}:\"", s.len()).as_bytes());
+                out.extend_from_slice(s);
+                out.extend_from_slice(b"\";");
+            }
+        }
+    }
+
     /// After unserialize, call `__wakeup()` on every object in the graph that
     /// defines it (depth-first), matching PHP's unserialize behavior.
     fn apply_wakeup(&mut self, v: &Value, depth: usize) -> R<()> {
@@ -1001,14 +1082,23 @@ impl Eval {
                 }
             }
             Value::Object(rc) => {
-                let (class, props) = {
+                let (class, props): (String, Vec<(String, Value)>) = {
                     let b = rc.borrow();
-                    (b.class.clone(), b.props.iter().map(|(_, x)| x.clone()).collect::<Vec<_>>())
+                    (b.class.clone(), b.props.clone())
                 };
-                for x in props {
-                    self.apply_wakeup(&x, depth + 1)?;
+                for (_, x) in &props {
+                    self.apply_wakeup(x, depth + 1)?;
                 }
-                if self.find_method(&class, "__wakeup").is_some() {
+                if self.find_method(&class, "__unserialize").is_some() {
+                    // The serialized props ARE the __serialize() array; hand them to
+                    // __unserialize as an array (string keys preserved), after clearing.
+                    let mut arr = Arr::new();
+                    for (name, val) in &props {
+                        arr.insert(Key::Str(name.as_bytes().to_vec()), val.clone());
+                    }
+                    rc.borrow_mut().props.clear();
+                    self.call_method(v.clone(), "__unserialize", vec![Value::Array(arr)])?;
+                } else if self.find_method(&class, "__wakeup").is_some() {
                     self.call_method(v.clone(), "__wakeup", vec![])?;
                 }
             }
@@ -5181,7 +5271,7 @@ impl Eval {
             "json_last_error_msg" => Value::Str(b"No error".to_vec()),
             "serialize" => {
                 let mut out = Vec::new();
-                php_serialize(&a(0), &mut out, 0);
+                self.ser_val(&a(0), &mut out, 0)?;
                 Value::Str(out)
             }
             "unserialize" => {
@@ -6472,54 +6562,6 @@ fn php_const(n: &str) -> Option<Value> {
 }
 
 // ---- serialize / unserialize (byte-based, for the v2 Value) -------------
-fn php_serialize(v: &Value, out: &mut Vec<u8>, depth: usize) {
-    // Depth cap + a hard output-size cap: this serializer doesn't emit `r:`/`R:`
-    // back-references, so shared/cyclic object graphs would otherwise blow up
-    // exponentially (bug36424).
-    if depth > 256 || out.len() > MAX_STR {
-        out.extend_from_slice(b"N;");
-        return;
-    }
-    match v {
-        Value::Null => out.extend_from_slice(b"N;"),
-        Value::Bool(b) => out.extend_from_slice(if *b { b"b:1;" } else { b"b:0;" }),
-        Value::Int(n) => out.extend_from_slice(format!("i:{n};").as_bytes()),
-        Value::Float(f) => out.extend_from_slice(format!("d:{};", ser_float(*f)).as_bytes()),
-        Value::Str(s) => {
-            out.extend_from_slice(format!("s:{}:\"", s.len()).as_bytes());
-            out.extend_from_slice(s);
-            out.extend_from_slice(b"\";");
-        }
-        Value::Array(a) => {
-            out.extend_from_slice(format!("a:{}:{{", a.len()).as_bytes());
-            for (k, val) in &a.entries {
-                match k {
-                    Key::Int(n) => out.extend_from_slice(format!("i:{n};").as_bytes()),
-                    Key::Str(s) => {
-                        out.extend_from_slice(format!("s:{}:\"", s.len()).as_bytes());
-                        out.extend_from_slice(s);
-                        out.extend_from_slice(b"\";");
-                    }
-                }
-                php_serialize(val, out, depth + 1);
-            }
-            out.push(b'}');
-        }
-        Value::Object(rc) => {
-            let o = rc.borrow();
-            out.extend_from_slice(
-                format!("O:{}:\"{}\":{}:{{", o.class.len(), o.class, o.props.len()).as_bytes(),
-            );
-            for (name, val) in &o.props {
-                out.extend_from_slice(format!("s:{}:\"{}\";", name.len(), name).as_bytes());
-                php_serialize(val, out, depth + 1);
-            }
-            out.push(b'}');
-        }
-        Value::Closure(_) => out.extend_from_slice(b"N;"),
-        Value::Ref(c) => php_serialize(&c.borrow(), out, depth),
-    }
-}
 
 fn ser_float(f: f64) -> String {
     if f.is_nan() {
