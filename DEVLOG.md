@@ -27,6 +27,32 @@ you would never think to write a test for.
 
 ---
 
+## 2026-06-20 — Reflection return types, and a cast that forgot to stringify
+
+**Pass rate: 2492 → 2504 (past 2500).**
+
+Chasing the biggest failure cluster — `ReflectionFunction::getReturnType` and
+friends — turned up something embarrassing: the parser was *throwing away* return
+type declarations. `function f(): int` parsed fine but `: int` went into the void
+(`skip_return_type` lived up to its name). So step one was actually keeping them:
+store `ret_type` on `FuncDecl`/`MethodDecl`, expose it via a `phargo_func_return_type`
+builtin, and wire `getReturnType`/`hasReturnType` plus a fleshed-out
+`ReflectionNamedType` (nullable `?int`, `isBuiltin`, `__toString`).
+
+But while testing, both Reflection's and SimpleXML's `(string)$obj` came back
+empty — even though `echo $obj` worked. The culprit: `echo` and string
+concatenation route through `stringify()` (which honors `__toString`), but the
+explicit **`(string)` cast** went straight to `to_bytes()`, whose object fallback
+is the empty string. So every `(string)` cast of a stringable object had silently
+produced `""` this whole time. One-line fix to route object string-casts through
+`stringify`, and a whole category of quiet wrongness disappeared.
+
+That's the recurring shape of this project: you go in to add feature X, and the
+test for X exposes a latent bug Y that was wrong all along but never directly
+tested. The corpus finds Y for you.
+
+---
+
 ## 2026-06-20 — SimpleXML, almost for free
 
 **Pass rate: 2466 → 2490.**

@@ -284,9 +284,20 @@ class ReflectionMethod {
     public function getParameters() { $r = []; foreach (phargo_func_params($this->class, $this->name) as $p) { $r[] = new ReflectionParameter($p); } return $r; }
     public function getNumberOfParameters() { return count(phargo_func_params($this->class, $this->name)); }
     public function getNumberOfRequiredParameters() { $n = 0; foreach (phargo_func_params($this->class, $this->name) as $p) { if (!$p["optional"]) $n++; } return $n; }
+    public function getReturnType() { $t = phargo_func_return_type($this->class, $this->name); return $t === null ? null : new ReflectionNamedType($t); }
+    public function hasReturnType() { return phargo_func_return_type($this->class, $this->name) !== null; }
+    public function getShortName() { return $this->name; }
     public function isStatic() { return false; }
     public function isPublic() { return true; }
+    public function isPrivate() { return false; }
+    public function isProtected() { return false; }
+    public function isFinal() { return false; }
     public function isAbstract() { return false; }
+    public function isConstructor() { return strtolower($this->name) === "__construct"; }
+    public function isVariadic() { foreach (phargo_func_params($this->class, $this->name) as $p) { if ($p["variadic"]) return true; } return false; }
+    public function getModifiers() { return 1; }
+    public function getDocComment() { return false; }
+    public function getAttributes($name = null, $flags = 0) { return []; }
     public function setAccessible($a) {}
 }
 class ReflectionParameter {
@@ -296,7 +307,10 @@ class ReflectionParameter {
     public function isOptional() { return $this->info["optional"]; }
     public function isVariadic() { return $this->info["variadic"]; }
     public function hasType() { return $this->info["type"] !== null; }
-    public function getType() { return $this->info["type"]; }
+    public function getType() { return $this->info["type"] === null ? null : new ReflectionNamedType($this->info["type"]); }
+    public function allowsNull() { return $this->info["type"] === null || $this->info["type"][0] === "?"; }
+    public function isPassedByReference() { return false; }
+    public function isDefaultValueAvailable() { return $this->info["optional"]; }
 }
 class ReflectionProperty {
     public $class; public $name;
@@ -317,8 +331,27 @@ class ReflectionFunction {
     public function getParameters() { $r = []; foreach (phargo_func_params("", $this->name) as $p) { $r[] = new ReflectionParameter($p); } return $r; }
     public function getNumberOfParameters() { return count(phargo_func_params("", $this->name)); }
     public function getNumberOfRequiredParameters() { $n = 0; foreach (phargo_func_params("", $this->name) as $p) { if (!$p["optional"]) $n++; } return $n; }
+    public function getReturnType() { $t = phargo_func_return_type("", $this->name); return $t === null ? null : new ReflectionNamedType($t); }
+    public function hasReturnType() { return phargo_func_return_type("", $this->name) !== null; }
+    public function getShortName() { return $this->name; }
+    public function isVariadic() { foreach (phargo_func_params("", $this->name) as $p) { if ($p["variadic"]) return true; } return false; }
+    public function getDocComment() { return false; }
+    public function getAttributes($name = null, $flags = 0) { return []; }
 }
-class ReflectionNamedType { public $name; public function __construct($n) { $this->name = $n; } public function getName() { return $this->name; } public function allowsNull() { return false; } }
+class ReflectionNamedType {
+    public $name; private $__nullable;
+    public function __construct($n) {
+        if (strlen($n) > 0 && $n[0] === "?") { $this->__nullable = true; $n = substr($n, 1); } else { $this->__nullable = false; }
+        $this->name = $n;
+    }
+    public function getName() { return $this->name; }
+    public function allowsNull() { $l = strtolower($this->name); return $this->__nullable || $l === "null" || $l === "mixed"; }
+    public function isBuiltin() {
+        $b = ["int", "float", "string", "bool", "array", "object", "mixed", "void", "null", "callable", "iterable", "never", "false", "true", "self", "static", "parent"];
+        return in_array(strtolower($this->name), $b);
+    }
+    public function __toString() { return ($this->__nullable ? "?" : "") . $this->name; }
+}
 class ReflectionException extends Exception {}
 
 // Generators are eager in this engine: the function body runs to completion,
@@ -1423,7 +1456,12 @@ impl Eval {
             }
             Expr::Cast(ct, e) => {
                 let v = self.eval(e)?;
-                self.cast(*ct, v)
+                // (string) on an object must honor __toString (to_bytes can't).
+                if matches!(ct, CastType::String) && matches!(v, Value::Object(_)) {
+                    Value::Str(self.stringify(&v)?)
+                } else {
+                    self.cast(*ct, v)
+                }
             }
             Expr::Match(subj, arms) => {
                 let s = self.eval(subj)?;
@@ -4662,6 +4700,19 @@ impl Eval {
                     }
                 }
                 Value::Array(arr)
+            }
+            "phargo_func_return_type" => {
+                let cls = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let fname = String::from_utf8_lossy(&to_bytes(&a(1))).into_owned();
+                let rt = if cls.is_empty() {
+                    self.funcs.get(&fname.to_ascii_lowercase()).and_then(|f| f.ret_type.clone())
+                } else {
+                    self.find_method(&cls, &fname).and_then(|(_, m)| m.ret_type.clone())
+                };
+                match rt {
+                    Some(t) => Value::Str(t.into_bytes()),
+                    None => Value::Null,
+                }
             }
             "tempnam" => {
                 let dir = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();

@@ -4,13 +4,13 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 2492 / 21862  (11.40% of the entire PHP test suite)**
+**`.phpt` pass rate: 2504 / 21862  (11.45% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 11.43%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 11.49%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 2492 | 19304 | 66 | 21862 |
+| 2504 | 19292 | 66 | 21862 |
 
 _Curated smoke tests (dev guards, **not** in the number above): 76/93 passing._
 
@@ -18,16 +18,16 @@ _Curated smoke tests (dev guards, **not** in the number above): 76/93 passing._
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 940 | 5329 | 17.6% |
+| `Zend` | 944 | 5329 | 17.7% |
 | `ext/standard` | 561 | 3877 | 14.5% |
-| `ext/opcache` | 400 | 916 | 43.7% |
+| `ext/opcache` | 401 | 916 | 43.8% |
 | `core` | 169 | 868 | 19.5% |
 | `ext/dom` | 31 | 868 | 3.6% |
-| `ext/spl` | 90 | 796 | 11.3% |
+| `ext/spl` | 91 | 796 | 11.4% |
 | `ext/date` | 67 | 689 | 9.7% |
 | `ext/soap` | 0 | 593 | 0.0% |
 | `ext/phar` | 13 | 574 | 2.3% |
-| `ext/reflection` | 41 | 519 | 7.9% |
+| `ext/reflection` | 44 | 519 | 8.5% |
 | `ext/intl` | 3 | 496 | 0.6% |
 | `ext/mysqli` | 1 | 452 | 0.2% |
 | `ext/mbstring` | 34 | 420 | 8.1% |
@@ -41,7 +41,7 @@ _Curated smoke tests (dev guards, **not** in the number above): 76/93 passing._
 | `ext/pdo_mysql` | 0 | 167 | 0.0% |
 | `ext/zend_test` | 4 | 159 | 2.5% |
 | `ext/zlib` | 8 | 157 | 5.1% |
-| `ext/simplexml` | 20 | 156 | 12.8% |
+| `ext/simplexml` | 23 | 156 | 14.7% |
 | `sapi/fpm` | 0 | 141 | 0.0% |
 | `ext/ldap` | 0 | 140 | 0.0% |
 | `ext/pdo` | 0 | 127 | 0.0% |

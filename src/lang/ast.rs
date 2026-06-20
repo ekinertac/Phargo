@@ -271,6 +271,7 @@ pub struct FuncDecl {
     pub params: Vec<Param>,
     pub body: Vec<Stmt>,
     pub by_ref_return: bool,
+    pub ret_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -324,6 +325,7 @@ pub struct MethodDecl {
     pub is_abstract: bool,
     pub is_final: bool,
     pub by_ref_return: bool,
+    pub ret_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

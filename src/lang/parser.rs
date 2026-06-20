@@ -602,9 +602,9 @@ impl Parser {
         let by_ref_return = self.eat(&Kind::Amp);
         let name = self.ident()?;
         let params = self.parse_params()?;
-        self.skip_return_type();
+        let ret_type = self.skip_return_type();
         let body = self.block()?;
-        Ok(Stmt::Func(FuncDecl { name, params, body, by_ref_return }))
+        Ok(Stmt::Func(FuncDecl { name, params, body, by_ref_return, ret_type }))
     }
 
     // ---- parameters -----------------------------------------------------
@@ -697,10 +697,11 @@ impl Parser {
         Some(t)
     }
 
-    fn skip_return_type(&mut self) {
+    fn skip_return_type(&mut self) -> Option<String> {
         if self.eat(&Kind::Colon) {
-            let _ = self.parse_type_opt();
+            return self.parse_type_opt();
         }
+        None
     }
 
     /// PHP 8.4 asymmetric visibility: a visibility keyword may be followed by
@@ -924,7 +925,7 @@ impl Parser {
                 let by_ref_return = self.eat(&Kind::Amp);
                 let mname = self.member_name()?;
                 let params = self.parse_params()?;
-                self.skip_return_type();
+                let ret_type = self.skip_return_type();
                 let body = if matches!(self.kind(), Kind::LBrace) {
                     Some(self.block()?)
                 } else {
@@ -940,6 +941,7 @@ impl Parser {
                     is_abstract,
                     is_final,
                     by_ref_return,
+                    ret_type,
                 });
                 continue;
             }
