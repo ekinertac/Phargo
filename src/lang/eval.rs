@@ -256,6 +256,42 @@ class ReflectionClass {
     public function newInstance(...$args) { $n = $this->name; return new $n(...$args); }
     public function newInstanceArgs($args = []) { $n = $this->name; return new $n(...$args); }
     public function newInstanceWithoutConstructor() { $n = $this->name; return new $n(); }
+    public function getStaticProperties() { return get_class_vars($this->name); }
+    public function getStaticPropertyValue($n, $default = null) { return $default; }
+    public function getReflectionConstants() { $r = []; foreach (phargo_class_constants($this->name) as $k => $v) { $r[] = new ReflectionClassConstant($this->name, $k); } return $r; }
+    public function getReflectionConstant($n) { return new ReflectionClassConstant($this->name, $n); }
+    public function isEnum() { return false; }
+    public function isTrait() { return false; }
+    public function isReadOnly() { return false; }
+    public function isAnonymous() { return false; }
+    public function isCloneable() { return true; }
+    public function isIterable() { return false; }
+    public function isInternal() { return false; }
+    public function isUserDefined() { return true; }
+    public function getModifiers() { return 0; }
+    public function getTraitNames() { return []; }
+    public function getTraits() { return []; }
+    public function getAttributes($name = null, $flags = 0) { return []; }
+    public function getDocComment() { return false; }
+    public function getFileName() { return false; }
+    public function getStartLine() { return false; }
+    public function getEndLine() { return false; }
+    public function getNamespaceName() { $p = strrpos($this->name, "\\"); return $p === false ? "" : substr($this->name, 0, $p); }
+    public function inNamespace() { return strpos($this->name, "\\") !== false; }
+}
+class ReflectionClassConstant {
+    public $class; public $name;
+    public function __construct($c, $n) { $this->class = is_object($c) ? get_class($c) : $c; $this->name = $n; }
+    public function getName() { return $this->name; }
+    public function getValue() { return constant($this->class . "::" . $this->name); }
+    public function getDeclaringClass() { return new ReflectionClass($this->class); }
+    public function isPublic() { return true; }
+    public function isPrivate() { return false; }
+    public function isProtected() { return false; }
+    public function isFinal() { return false; }
+    public function isEnumCase() { return false; }
+    public function getModifiers() { return 1; }
+    public function getAttributes($name = null, $flags = 0) { return []; }
 }
 class ReflectionObject extends ReflectionClass {}
 class ReflectionEnum extends ReflectionClass {
@@ -903,6 +939,36 @@ impl Eval {
             }
             guard += 1;
         }
+    }
+
+    /// After unserialize, call `__wakeup()` on every object in the graph that
+    /// defines it (depth-first), matching PHP's unserialize behavior.
+    fn apply_wakeup(&mut self, v: &Value, depth: usize) -> R<()> {
+        if depth > 256 {
+            return Ok(());
+        }
+        match v {
+            Value::Array(a) => {
+                let vals: Vec<Value> = a.entries.iter().map(|(_, x)| x.clone()).collect();
+                for x in vals {
+                    self.apply_wakeup(&x, depth + 1)?;
+                }
+            }
+            Value::Object(rc) => {
+                let (class, props) = {
+                    let b = rc.borrow();
+                    (b.class.clone(), b.props.iter().map(|(_, x)| x.clone()).collect::<Vec<_>>())
+                };
+                for x in props {
+                    self.apply_wakeup(&x, depth + 1)?;
+                }
+                if self.find_method(&class, "__wakeup").is_some() {
+                    self.call_method(v.clone(), "__wakeup", vec![])?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     pub fn run_with_path(program: &[Stmt], path: Option<PathBuf>) -> R<Vec<u8>> {
@@ -5017,7 +5083,9 @@ impl Eval {
             "unserialize" => {
                 let bytes = to_bytes(&a(0));
                 let mut pos = 0;
-                php_unserialize(&bytes, &mut pos, 0).unwrap_or(Value::Bool(false))
+                let v = php_unserialize(&bytes, &mut pos, 0).unwrap_or(Value::Bool(false));
+                self.apply_wakeup(&v, 0)?;
+                v
             }
             "filter_var" => {
                 let v = a(0);
