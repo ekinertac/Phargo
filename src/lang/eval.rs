@@ -311,8 +311,13 @@ class ReflectionParameter {
     public function hasType() { return $this->info["type"] !== null; }
     public function getType() { return $this->info["type"] === null ? null : new ReflectionNamedType($this->info["type"]); }
     public function allowsNull() { return $this->info["type"] === null || $this->info["type"][0] === "?"; }
-    public function isPassedByReference() { return false; }
-    public function isDefaultValueAvailable() { return $this->info["optional"]; }
+    public function isPassedByReference() { return $this->info["by_ref"] ?? false; }
+    public function canBePassedByValue() { return !($this->info["by_ref"] ?? false); }
+    public function isDefaultValueAvailable() { return $this->info["has_default"] ?? false; }
+    public function getPosition() { return $this->info["position"] ?? 0; }
+    public function getDefaultValue() { return $this->info["default"] ?? null; }
+    public function isDefaultValueConstant() { return false; }
+    public function getDefaultValueConstantName() { return null; }
 }
 class ReflectionProperty {
     public $class; public $name;
@@ -576,7 +581,10 @@ class DOMNode {
         foreach ($ks as $i => $k) { if ($k === $this) { return $ks[$i + $dir] ?? null; } }
         return null;
     }
-    public function appendChild($child) { $child->__parent = $this; $this->__kids[] = $child; return $child; }
+    public function appendChild($child) {
+        if ($child->nodeType == 11) { foreach ($child->__kids as $k) { $k->__parent = $this; $this->__kids[] = $k; } return $child; }
+        $child->__parent = $this; $this->__kids[] = $child; return $child;
+    }
     public function removeChild($child) { $n = []; foreach ($this->__kids as $k) { if ($k !== $child) { $n[] = $k; } } $this->__kids = $n; $child->__parent = null; return $child; }
     public function hasChildNodes() { return count($this->__kids) > 0; }
     public function hasAttributes() { return count($this->__attrs) > 0; }
@@ -636,6 +644,16 @@ class DOMElement extends DOMNode {
     public function removeAttributeNS($ns, $n) { $this->removeAttribute($n); }
     public function setIdAttribute($n, $isId) {}
 }
+class DOMDocumentFragment extends DOMNode {
+    public function __construct() { $this->nodeType = 11; $this->nodeName = "#document-fragment"; }
+    public function appendXML($data) {
+        $t = __dom_parse("<__f>" . $data . "</__f>");
+        if ($t === false) { return false; }
+        $doc = $this->ownerDocument ?? new DOMDocument();
+        foreach ($t["kids"] as $k) { $c = $doc->__build($k); $c->__parent = $this; $this->__kids[] = $c; }
+        return true;
+    }
+}
 class DOMText extends DOMNode {
     public $__nv;
     public function __construct($data = "") { $this->nodeType = 3; $this->nodeName = "#text"; $this->__nv = $data; }
@@ -692,6 +710,7 @@ class DOMDocument extends DOMNode {
         else { $c = new DOMText($n["text"]); $c->ownerDocument = $this; return $c; }
     }
     public function createElement($name, $value = null) { $e = new DOMElement($name, $value); $e->ownerDocument = $this; return $e; }
+    public function createDocumentFragment() { $f = new DOMDocumentFragment(); $f->ownerDocument = $this; return $f; }
     public function createElementNS($ns, $qname, $value = null) { return $this->createElement($qname, $value); }
     public function createAttributeNS($ns, $qname) { $a = new DOMAttr($qname); $a->ownerDocument = $this; return $a; }
     public function importNode($node, $deep = false) { $c = $node->cloneNode($deep); $c->ownerDocument = $this; return $c; }
@@ -4702,14 +4721,20 @@ impl Eval {
                 };
                 let mut arr = Arr::new();
                 if let Some(ps) = params {
-                    for p in ps {
+                    for (i, p) in ps.iter().enumerate() {
                         let mut info = Arr::new();
                         info.insert(Key::Str(b"name".to_vec()), Value::Str(p.name.as_bytes().to_vec()));
+                        info.insert(Key::Str(b"position".to_vec()), Value::Int(i as i64));
                         info.insert(
                             Key::Str(b"optional".to_vec()),
                             Value::Bool(p.default.is_some() || p.variadic),
                         );
+                        info.insert(
+                            Key::Str(b"has_default".to_vec()),
+                            Value::Bool(p.default.is_some()),
+                        );
                         info.insert(Key::Str(b"variadic".to_vec()), Value::Bool(p.variadic));
+                        info.insert(Key::Str(b"by_ref".to_vec()), Value::Bool(p.by_ref));
                         info.insert(
                             Key::Str(b"type".to_vec()),
                             match &p.type_hint {
@@ -4717,6 +4742,11 @@ impl Eval {
                                 None => Value::Null,
                             },
                         );
+                        let dv = match &p.default {
+                            Some(d) => self.eval(&d.clone()).unwrap_or(Value::Null),
+                            None => Value::Null,
+                        };
+                        info.insert(Key::Str(b"default".to_vec()), dv);
                         arr.push(Value::Array(info));
                     }
                 }
