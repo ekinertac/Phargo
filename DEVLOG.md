@@ -27,6 +27,32 @@ you would never think to write a test for.
 
 ---
 
+## 2026-06-20 — SimpleXML, almost for free
+
+**Pass rate: 2466 → 2490.**
+
+This rung was cheap because the hard part was already done. The DOM work built a
+real XML parser (`__dom_parse`) that returns a plain nested-array tree. SimpleXML
+is just a *different view* over that same tree, so `simplexml_load_string` is a
+one-liner that parses and wraps, and `SimpleXMLElement` is a prelude class that
+walks the array.
+
+The fiddly part of SimpleXML is its famous dual nature: `$xml->book` is
+simultaneously "the first book" (you can read `$xml->book->title`) and "all the
+books" (you can `foreach ($xml->book as $b)`). Modeled it by having `__get('book')`
+return an element that carries *both* the first match and the full sibling group,
+implementing `Iterator` over the group and the single-element accessors over the
+first. Attribute access (`$xml['id']`), `(string)$el` text extraction, `children()`,
+`attributes()`, and `asXML()` round it out.
+
+One real bug surfaced and got fixed along the way: indexing the *result of an
+expression* — `$xml->book[0]` — wasn't dispatching to `offsetGet`, because the
+index-read path only recognized ArrayAccess when the base was a bare `$var`. Now a
+property/method/call result that's an ArrayAccess object routes correctly. That
+fix helps any ArrayAccess-returning expression, not just SimpleXML.
+
+---
+
 ## 2026-06-20 — Real references, without rewriting the value model
 
 **Pass rate: 2451 → 2466, zero regressions.**

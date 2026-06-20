@@ -654,6 +654,91 @@ class DOMDocument extends DOMNode {
         return $s . "</" . $n->nodeName . ">";
     }
 }
+
+// ---- SimpleXML (built on the same __dom_parse tree) ----
+function simplexml_load_string($xml, $class = null, $opts = 0) {
+    $tree = __dom_parse($xml);
+    if ($tree === false) { return false; }
+    return new SimpleXMLElement($tree);
+}
+function simplexml_load_file($file, $class = null, $opts = 0) {
+    $xml = file_get_contents($file);
+    if ($xml === false) { return false; }
+    return simplexml_load_string($xml);
+}
+function __sxml_ser($n) {
+    if ($n["t"] == 3) { return __dom_escape_text($n["text"]); }
+    if ($n["t"] == 4) { return "<![CDATA[" . $n["text"] . "]]>"; }
+    if ($n["t"] == 8) { return ""; }
+    $s = "<" . $n["name"];
+    foreach ($n["attrs"] as $k => $v) { $s .= " " . $k . "=\"" . __dom_escape_attr($v) . "\""; }
+    if (empty($n["kids"])) { return $s . "/>"; }
+    $s .= ">";
+    foreach ($n["kids"] as $c) { $s .= __sxml_ser($c); }
+    return $s . "</" . $n["name"] . ">";
+}
+class SimpleXMLElement implements Iterator, ArrayAccess, Countable {
+    private $__node; private $__sibs; private $__p = 0;
+    public function __construct($node, $sibs = null) {
+        if (is_string($node)) { $node = __dom_parse($node); }
+        $this->__node = $node;
+        $this->__sibs = $sibs === null ? [$node] : $sibs;
+    }
+    public function getName() { return $this->__node["name"]; }
+    public function __get($name) {
+        $matches = [];
+        foreach ($this->__node["kids"] as $k) { if ($k["t"] == 1 && $k["name"] === $name) { $matches[] = $k; } }
+        if (count($matches) === 0) { return null; }
+        return new SimpleXMLElement($matches[0], $matches);
+    }
+    public function children($ns = null, $prefix = false) {
+        $r = [];
+        foreach ($this->__node["kids"] as $k) { if ($k["t"] == 1) { $r[] = new SimpleXMLElement($k); } }
+        return $r;
+    }
+    public function attributes($ns = null, $prefix = false) { return new SimpleXMLAttrs($this->__node["attrs"]); }
+    public function __toString() {
+        $s = "";
+        foreach ($this->__node["kids"] as $k) { if ($k["t"] == 3 || $k["t"] == 4) { $s .= $k["text"]; } }
+        return $s;
+    }
+    public function asXML($filename = null) {
+        $out = __sxml_ser($this->__node);
+        if ($filename !== null) { file_put_contents($filename, $out); return true; }
+        return $out;
+    }
+    public function saveXML($filename = null) { return $this->asXML($filename); }
+    public function count(): int { $n = 0; foreach ($this->__node["kids"] as $k) { if ($k["t"] == 1) { $n++; } } return $n; }
+    public function offsetExists($k): bool {
+        if (is_int($k)) { return $k >= 0 && $k < count($this->__sibs); }
+        return isset($this->__node["attrs"][$k]);
+    }
+    public function offsetGet($k): mixed {
+        if (is_int($k)) { return isset($this->__sibs[$k]) ? new SimpleXMLElement($this->__sibs[$k], $this->__sibs) : null; }
+        return $this->__node["attrs"][$k] ?? null;
+    }
+    public function offsetSet($k, $v): void {}
+    public function offsetUnset($k): void {}
+    public function rewind(): void { $this->__p = 0; }
+    public function valid(): bool { return $this->__p < count($this->__sibs); }
+    public function current(): mixed { return new SimpleXMLElement($this->__sibs[$this->__p]); }
+    public function key(): mixed { return $this->__node["name"]; }
+    public function next(): void { $this->__p = $this->__p + 1; }
+}
+class SimpleXMLAttrs implements Iterator, ArrayAccess, Countable {
+    private $__a; private $__keys; private $__p = 0;
+    public function __construct($attrs) { $this->__a = $attrs; $this->__keys = array_keys($attrs); }
+    public function offsetExists($k): bool { return isset($this->__a[$k]); }
+    public function offsetGet($k): mixed { return $this->__a[$k] ?? null; }
+    public function offsetSet($k, $v): void {}
+    public function offsetUnset($k): void {}
+    public function count(): int { return count($this->__a); }
+    public function rewind(): void { $this->__p = 0; $this->__keys = array_keys($this->__a); }
+    public function valid(): bool { return $this->__p < count($this->__keys); }
+    public function current(): mixed { return $this->__a[$this->__keys[$this->__p]]; }
+    public function key(): mixed { return $this->__keys[$this->__p]; }
+    public function next(): void { $this->__p = $this->__p + 1; }
+}
 "##;
 
 const STEP_LIMIT: u64 = 20_000_000;
@@ -1664,14 +1749,16 @@ impl Eval {
     fn read_index(&mut self, base: &Expr, idx: &Option<Box<Expr>>) -> R<Value> {
         // ArrayAccess: `$expr[$k]` where the base is an object → offsetGet($k).
         // (Single level; deeper chains fall through to the array path below.)
-        let base_obj = match base {
-            Expr::Var(name) => matches!(self.vars().get(name), Some(Value::Object(_))),
-            Expr::Prop(..) | Expr::Index(..) | Expr::MethodCall(..) | Expr::Call(..) | Expr::StaticCall(..) => {
-                false // resolved on demand below to avoid double-eval of arrays
-            }
-            _ => false,
-        };
-        if base_obj {
+        let base_var_obj =
+            matches!(base, Expr::Var(name) if matches!(self.vars().get(name).map(|v| v.deref()), Some(Value::Object(_))));
+        // A base that produces a value (property/method/call result) may be an
+        // ArrayAccess object (e.g. SimpleXML `$xml->book[0]`); eval it once and
+        // dispatch to offsetGet, otherwise index the produced value as an array.
+        let base_complex = matches!(
+            base,
+            Expr::Prop(..) | Expr::MethodCall(..) | Expr::Call(..) | Expr::StaticCall(..)
+        );
+        if base_var_obj || base_complex {
             let iv = match idx {
                 Some(i) => self.eval(i)?,
                 None => Value::Null,
@@ -1681,6 +1768,18 @@ impl Eval {
                 let class = rc.borrow().class.clone();
                 if self.find_method(&class, "offsetget").is_some() {
                     return self.call_method(obj.clone(), "offsetGet", vec![iv]);
+                }
+            }
+            if base_complex {
+                // not an ArrayAccess object — index the value as an array/string
+                if let Value::Array(a) = &obj {
+                    return Ok(a.get(&Arr::norm_key(&iv)).cloned().unwrap_or(Value::Null));
+                }
+                if let Value::Str(s) = &obj {
+                    let i = to_i64(&iv);
+                    if i >= 0 && (i as usize) < s.len() {
+                        return Ok(Value::Str(vec![s[i as usize]]));
+                    }
                 }
             }
             return Ok(Value::Null);
