@@ -916,6 +916,10 @@ impl Eval {
         e.consts.insert("STDIN".into(), stdin);
         e.consts.insert("STDOUT".into(), stdout);
         e.consts.insert("STDERR".into(), stderr);
+        // Superglobals exist (empty) so reads/writes work in any scope.
+        for sg in ["_SERVER", "_GET", "_POST", "_REQUEST", "_SESSION", "_COOKIE", "_ENV", "_FILES", "GLOBALS"] {
+            e.scopes[0].insert(sg.to_string(), Value::Array(Arr::new()));
+        }
         e.hoist(program);
         match e.exec_block(program) {
             Ok(_) => {
@@ -1356,7 +1360,13 @@ impl Eval {
                 }
                 Value::Array(a)
             }
-            Expr::Var(name) => self.vars().get(name).map(|v| v.deref()).unwrap_or(Value::Null),
+            Expr::Var(name) => {
+                if is_superglobal(name) {
+                    self.scopes[0].get(name).map(|v| v.deref()).unwrap_or(Value::Null)
+                } else {
+                    self.vars().get(name).map(|v| v.deref()).unwrap_or(Value::Null)
+                }
+            }
             Expr::ConstFetch(name) => self.const_fetch(name),
             Expr::MagicConst(name) => match name.to_ascii_uppercase().as_str() {
                 "__FILE__" => Value::Str(
@@ -1931,11 +1941,21 @@ impl Eval {
             _ => unreachable!(),
         };
         // Navigate by reference (keys already evaluated — no &mut self needed here).
-        let scope = self.scopes.last().unwrap();
+        // Superglobals resolve against the global scope.
+        let scope = if is_superglobal(&name) {
+            &self.scopes[0]
+        } else {
+            self.scopes.last().unwrap()
+        };
         let mut v = match scope.get(&name) {
             Some(v) => v,
             None => return Ok(Value::Null),
         };
+        // Deref a reference-backed variable before navigating.
+        if let Value::Ref(cell) = v {
+            let inner = cell.borrow().clone();
+            return Ok(read_index_value(&inner, &keys));
+        }
         for k in &keys {
             match v {
                 Value::Array(a) => {
@@ -1995,8 +2015,10 @@ impl Eval {
         }
         match target {
             Expr::Var(name) => {
-                // Write through if the variable currently aliases a reference cell.
-                if let Some(Value::Ref(cell)) = self.vars().get(name) {
+                if is_superglobal(name) {
+                    self.scopes[0].insert(name.clone(), val);
+                } else if let Some(Value::Ref(cell)) = self.vars().get(name) {
+                    // Write through if the variable currently aliases a reference cell.
                     let cell = cell.clone();
                     *cell.borrow_mut() = val;
                 } else {
@@ -2037,6 +2059,22 @@ impl Eval {
         // and nested `$var[a][b]` are handled here.
         match base {
             Expr::Var(name) => {
+                // Superglobals (`$_SESSION['k'] = …`) live in the global scope.
+                if is_superglobal(name) {
+                    let entry = self.scopes[0]
+                        .entry(name.clone())
+                        .or_insert_with(|| Value::Array(Arr::new()));
+                    if !matches!(entry, Value::Array(_)) {
+                        *entry = Value::Array(Arr::new());
+                    }
+                    if let Value::Array(a) = entry {
+                        match key {
+                            Some(k) => a.insert(k, val),
+                            None => a.push(val),
+                        }
+                    }
+                    return Ok(());
+                }
                 // Through a reference cell (`use (&$out); $out[] = …`): mutate the
                 // array inside the shared cell in place (no clone → no O(n^2)).
                 if let Some(Value::Ref(cell)) = self.vars().get(name) {
@@ -5563,6 +5601,17 @@ impl Eval {
                 }
                 Value::Null
             }
+            "session_start" | "session_regenerate_id" | "session_destroy" | "session_write_close"
+            | "session_commit" | "session_reset" | "session_abort" | "session_set_save_handler"
+            | "session_register_shutdown" | "session_unset" => Value::Bool(true),
+            "session_set_cookie_params" | "session_cache_limiter" | "session_cache_expire" => {
+                Value::Bool(true)
+            }
+            "session_id" | "session_create_id" => Value::Str(b"phargosession".to_vec()),
+            "session_name" => Value::Str(b"PHPSESSID".to_vec()),
+            "session_status" => Value::Int(1), // PHP_SESSION_NONE
+            "session_save_path" | "session_module_name" => Value::Str(Vec::new()),
+            "session_get_cookie_params" => Value::Array(Arr::new()),
             "date_default_timezone_get" => Value::Str(b"UTC".to_vec()),
             "debug_backtrace" => Value::Array(Arr::new()),
             "gc_collect_cycles" | "http_response_code" | "getmypid" | "hrtime" => Value::Int(0),
@@ -5721,6 +5770,30 @@ fn trim_bytes(s: &[u8], left: bool, right: bool) -> Vec<u8> {
         }
     }
     s[start..end].to_vec()
+}
+
+/// Navigate a value by a sequence of already-normalized keys (array/string).
+fn read_index_value(base: &Value, keys: &[Key]) -> Value {
+    let mut v = base;
+    for k in keys {
+        match v {
+            Value::Array(a) => match a.get(k) {
+                Some(x) => v = x,
+                None => return Value::Null,
+            },
+            Value::Str(s) => return string_char(s, k),
+            _ => return Value::Null,
+        }
+    }
+    v.clone()
+}
+
+/// PHP superglobals resolve to the global scope from any function scope.
+fn is_superglobal(name: &str) -> bool {
+    matches!(
+        name,
+        "GLOBALS" | "_SERVER" | "_GET" | "_POST" | "_REQUEST" | "_SESSION" | "_COOKIE" | "_ENV" | "_FILES"
+    )
 }
 
 /// Can this expression be written back to (a valid by-reference target)?

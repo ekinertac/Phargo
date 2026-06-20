@@ -27,6 +27,30 @@ you would never think to write a test for.
 
 ---
 
+## 2026-06-21 — Superglobals, and the scope that wasn't global
+
+**Pass rate: 2538 → 2571.**
+
+`$_SERVER`, `$_GET`, `$_SESSION` and friends didn't exist at all. Adding them is
+two parts: they must (1) exist as empty arrays so reads don't blow up, and (2)
+resolve to the *global* scope from inside any function — that's what makes them
+"super". So variable read, variable write, and array-element write all learned to
+route a superglobal name straight to `scopes[0]` regardless of the current frame.
+
+The bug that made it interesting: the first cut worked for `$_SESSION['x'] = …`
+but `$_SESSION['count']++` inside a function quietly did nothing. The increment's
+*read* path (`read_index`, the optimized by-reference array navigator) was still
+looking in the current scope, not the global one. So the write went to the
+superglobal but the read came back empty every time. Fixed the navigator to honor
+superglobal scope — and, while there, to deref reference-backed variables too, so
+`$ref[0]` reads correctly. Two scope/aliasing paths, same lesson: every place that
+touches a variable has to agree on *which* variable it is.
+
+Session functions came along for the ride as stubs (`session_start` and the dozen
+others), since session tests mostly just read and write `$_SESSION`.
+
+---
+
 ## 2026-06-20 — Reflection return types, and a cast that forgot to stringify
 
 **Pass rate: 2492 → 2504 (past 2500).**
