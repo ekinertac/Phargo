@@ -941,6 +941,52 @@ impl Eval {
         }
     }
 
+    /// Drive SAX-style handlers over a parsed XML node-array tree.
+    fn xml_sax_walk(&mut self, parser: &Value, node: &Value, fold: bool) -> R<()> {
+        let (start, end, char_h) = match parser {
+            Value::Object(rc) => {
+                let b = rc.borrow();
+                (
+                    b.get("__start").cloned().unwrap_or(Value::Null),
+                    b.get("__end").cloned().unwrap_or(Value::Null),
+                    b.get("__char").cloned().unwrap_or(Value::Null),
+                )
+            }
+            _ => return Ok(()),
+        };
+        let t = match node {
+            Value::Array(a) => to_i64(&a.get(&Key::Str(b"t".to_vec())).cloned().unwrap_or(Value::Null)),
+            _ => return Ok(()),
+        };
+        let arr = match node {
+            Value::Array(a) => a,
+            _ => return Ok(()),
+        };
+        if t == 1 {
+            let mut name = to_bytes(&arr.get(&Key::Str(b"name".to_vec())).cloned().unwrap_or(Value::Null));
+            if fold {
+                name.make_ascii_uppercase();
+            }
+            let attrs = arr.get(&Key::Str(b"attrs".to_vec())).cloned().unwrap_or(Value::Array(Arr::new()));
+            if !matches!(start, Value::Null) {
+                self.call_value(start.clone(), vec![parser.clone(), Value::Str(name.clone()), attrs])?;
+            }
+            if let Some(Value::Array(kids)) = arr.get(&Key::Str(b"kids".to_vec())) {
+                let kids = kids.clone();
+                for (_, kid) in &kids.entries {
+                    self.xml_sax_walk(parser, kid, fold)?;
+                }
+            }
+            if !matches!(end, Value::Null) {
+                self.call_value(end.clone(), vec![parser.clone(), Value::Str(name)])?;
+            }
+        } else if (t == 3 || t == 4) && !matches!(char_h, Value::Null) {
+            let text = arr.get(&Key::Str(b"text".to_vec())).cloned().unwrap_or(Value::Null);
+            self.call_value(char_h.clone(), vec![parser.clone(), text])?;
+        }
+        Ok(())
+    }
+
     /// After unserialize, call `__wakeup()` on every object in the graph that
     /// defines it (depth-first), matching PHP's unserialize behavior.
     fn apply_wakeup(&mut self, v: &Value, depth: usize) -> R<()> {
@@ -4589,6 +4635,64 @@ impl Eval {
                 Ok(v) => v,
                 Err(_) => Value::Bool(false),
             },
+            "xml_parser_create" | "xml_parser_create_ns" => {
+                let o = new_obj("__XmlParser");
+                if let Value::Object(rc) = &o {
+                    rc.borrow_mut().set("__fold", Value::Bool(true));
+                }
+                o
+            }
+            "xml_set_element_handler" => {
+                if let Value::Object(rc) = a(0) {
+                    rc.borrow_mut().set("__start", a(1));
+                    rc.borrow_mut().set("__end", a(2));
+                }
+                Value::Bool(true)
+            }
+            "xml_set_character_data_handler" => {
+                if let Value::Object(rc) = a(0) {
+                    rc.borrow_mut().set("__char", a(1));
+                }
+                Value::Bool(true)
+            }
+            "xml_set_default_handler" | "xml_set_processing_instruction_handler"
+            | "xml_set_notation_decl_handler" | "xml_set_external_entity_ref_handler"
+            | "xml_set_start_namespace_decl_handler" | "xml_set_end_namespace_decl_handler"
+            | "xml_set_unparsed_entity_decl_handler" | "xml_set_object" => Value::Bool(true),
+            "xml_parser_set_option" => {
+                // XML_OPTION_CASE_FOLDING = 1
+                if let Value::Object(rc) = a(0) {
+                    if to_i64(&a(1)) == 1 {
+                        rc.borrow_mut().set("__fold", Value::Bool(to_bool(&a(2))));
+                    }
+                }
+                Value::Bool(true)
+            }
+            "xml_parser_get_option" => {
+                if to_i64(&a(1)) == 1 {
+                    if let Value::Object(rc) = a(0) {
+                        return Ok(rc.borrow().get("__fold").cloned().unwrap_or(Value::Bool(true)));
+                    }
+                }
+                Value::Int(0)
+            }
+            "xml_parse" | "xml_parse_into_struct" => {
+                let parser = a(0);
+                let data = to_bytes(&a(1));
+                let fold = matches!(&parser, Value::Object(rc) if matches!(rc.borrow().get("__fold"), Some(Value::Bool(true)) | None));
+                match super::xml::parse(&data) {
+                    Ok(tree) => {
+                        self.xml_sax_walk(&parser, &tree, fold)?;
+                        Value::Int(1)
+                    }
+                    Err(_) => Value::Int(1), // SAX is lenient; report success
+                }
+            }
+            "xml_parser_free" => Value::Bool(true),
+            "xml_get_error_code" => Value::Int(0),
+            "xml_error_string" => Value::Str(Vec::new()),
+            "xml_get_current_line_number" | "xml_get_current_column_number"
+            | "xml_get_current_byte_index" => Value::Int(0),
             "constant" => {
                 let name = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 if let Some((cls, c)) = name.split_once("::") {

@@ -4,13 +4,13 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 2574 / 21862  (11.77% of the entire PHP test suite)**
+**`.phpt` pass rate: 2577 / 21862  (11.79% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 11.81%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 11.82%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 2574 | 19222 | 66 | 21862 |
+| 2577 | 19219 | 66 | 21862 |
 
 _Curated smoke tests (dev guards, **not** in the number above): 76/93 passing._
 
@@ -62,7 +62,7 @@ _Curated smoke tests (dev guards, **not** in the number above): 76/93 passing._
 | `ext/random` | 0 | 69 | 0.0% |
 | `sapi/phpdbg` | 0 | 69 | 0.0% |
 | `ext/pdo_pgsql` | 0 | 67 | 0.0% |
-| `ext/xml` | 0 | 67 | 0.0% |
+| `ext/xml` | 3 | 67 | 4.5% |
 | `ext/fileinfo` | 0 | 63 | 0.0% |
 | `ext/pcntl` | 0 | 62 | 0.0% |
 | `ext/posix` | 0 | 62 | 0.0% |
