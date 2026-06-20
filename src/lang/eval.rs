@@ -1333,7 +1333,7 @@ impl Eval {
                 }
                 let mname = self.prop_name_str(name)?;
                 let argv = self.eval_args(args)?;
-                self.call_method(o, &mname, argv)?
+                self.call_method_ref(o, &mname, argv, Some(args))?
             }
             Expr::StaticCall(class, name, args) => {
                 let cname = self.resolve_class_name(class)?;
@@ -1341,7 +1341,7 @@ impl Eval {
                 let argv = self.eval_args(args)?;
                 // `parent::`/`self::` keep the current $this if present
                 let this = self.vars().get("this").cloned();
-                self.call_static(&cname, &mname, argv, this)?
+                self.call_static(&cname, &mname, argv, this, Some(args))?
             }
             Expr::ClassConst(class, name) => {
                 if name == "class" {
@@ -1930,7 +1930,7 @@ impl Eval {
                 _ => {}
             }
             if let Some(f) = self.funcs.get(&name).cloned() {
-                return self.call_user(&f, argv);
+                return self.call_user(&f, argv, Some(args));
             }
             return self.builtin(&name, argv);
         }
@@ -2217,7 +2217,7 @@ impl Eval {
             Value::Str(s) => {
                 let name = String::from_utf8_lossy(&s).to_ascii_lowercase();
                 if let Some(f) = self.funcs.get(&name).cloned() {
-                    self.call_user(&f, args)
+                    self.call_user(&f, args, None)
                 } else {
                     self.builtin(&name, args)
                 }
@@ -2238,7 +2238,7 @@ impl Eval {
                     Value::Object(_) => self.call_method(recv, &mname, args),
                     Value::Str(s) => {
                         let cn = String::from_utf8_lossy(&s).into_owned();
-                        self.call_static(&cn, &mname, args, None)
+                        self.call_static(&cn, &mname, args, None, None)
                     }
                     _ => Ok(Value::Null),
                 }
@@ -2318,7 +2318,7 @@ impl Eval {
         Value::Object(o)
     }
 
-    fn call_user(&mut self, f: &FuncDecl, args: Vec<Value>) -> R<Value> {
+    fn call_user(&mut self, f: &FuncDecl, args: Vec<Value>, byref: Option<&[Arg]>) -> R<Value> {
         self.enter_call()?;
         let mut scope = HashMap::new();
         for (i, p) in f.params.iter().enumerate() {
@@ -2341,9 +2341,49 @@ impl Eval {
         }
         self.scopes.push(scope);
         let r = self.run_fn_body(&f.body);
+        let wb = self.capture_byref(&f.params, byref);
         self.scopes.pop();
         self.call_depth -= 1;
+        self.apply_byref(byref, wb)?;
         r
+    }
+
+    /// By-reference parameter write-back. The engine passes arguments by value;
+    /// for a `&$param` whose argument is a writable lvalue, we copy the parameter's
+    /// final value back into the caller's variable after the call returns. This
+    /// cascades correctly through recursion (each frame writes back to its caller).
+    /// Capture must run before the callee scope is popped; apply after.
+    fn capture_byref(&self, params: &[Param], byref: Option<&[Arg]>) -> Vec<(usize, Value)> {
+        let mut wb = Vec::new();
+        let args = match byref {
+            Some(a) => a,
+            None => return wb,
+        };
+        let scope = match self.scopes.last() {
+            Some(s) => s,
+            None => return wb,
+        };
+        for (i, p) in params.iter().enumerate() {
+            if p.by_ref && !p.variadic {
+                if let Some(arg) = args.get(i) {
+                    if !arg.spread && arg.name.is_none() && is_lvalue_expr(&arg.value) {
+                        if let Some(v) = scope.get(&p.name) {
+                            wb.push((i, v.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        wb
+    }
+
+    fn apply_byref(&mut self, byref: Option<&[Arg]>, wb: Vec<(usize, Value)>) -> R<()> {
+        if let Some(args) = byref {
+            for (i, v) in wb {
+                self.assign_to(&args[i].value, v)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2502,6 +2542,16 @@ impl Eval {
     }
 
     fn call_method(&mut self, recv: Value, method: &str, args: Vec<Value>) -> R<Value> {
+        self.call_method_ref(recv, method, args, None)
+    }
+
+    fn call_method_ref(
+        &mut self,
+        recv: Value,
+        method: &str,
+        args: Vec<Value>,
+        byref: Option<&[Arg]>,
+    ) -> R<Value> {
         let class = match &recv {
             Value::Object(rc) => rc.borrow().class.clone(),
             _ => return Ok(Value::Null),
@@ -2516,12 +2566,12 @@ impl Eval {
                         a.push(v);
                     }
                     let cargs = vec![Value::Str(method.as_bytes().to_vec()), Value::Array(a)];
-                    return self.invoke_method(recv, &dc, &self.find_method(&class, "__call").unwrap().1.clone(), cargs);
+                    return self.invoke_method(recv, &dc, &self.find_method(&class, "__call").unwrap().1.clone(), cargs, None);
                 }
                 return Err(RunError(format!("call to undefined method {class}::{method}()")));
             }
         };
-        self.invoke_method(recv, &decl_class, &m, args)
+        self.invoke_method(recv, &decl_class, &m, args, byref)
     }
 
     fn invoke_method(
@@ -2530,6 +2580,7 @@ impl Eval {
         decl_class: &str,
         m: &MethodDecl,
         args: Vec<Value>,
+        byref: Option<&[Arg]>,
     ) -> R<Value> {
         let body = match &m.body {
             Some(b) => b.clone(),
@@ -2559,9 +2610,11 @@ impl Eval {
         let prev_class = self.current_class.replace(decl_class.to_string());
         self.scopes.push(scope);
         let r = self.run_fn_body(&body);
+        let wb = self.capture_byref(&m.params, byref);
         self.scopes.pop();
         self.current_class = prev_class;
         self.call_depth -= 1;
+        self.apply_byref(byref, wb)?;
         r
     }
 
@@ -2571,6 +2624,7 @@ impl Eval {
         method: &str,
         args: Vec<Value>,
         this: Option<Value>,
+        byref: Option<&[Arg]>,
     ) -> R<Value> {
         // Enum built-in static methods: cases() / from() / tryFrom().
         if let Some(c) = self.find_class(class) {
@@ -2630,9 +2684,11 @@ impl Eval {
         let prev_class = self.current_class.replace(decl_class.clone());
         self.scopes.push(scope);
         let r = self.run_fn_body(&body);
+        let wb = self.capture_byref(&m.params, byref);
         self.scopes.pop();
         self.current_class = prev_class;
         self.call_depth -= 1;
+        self.apply_byref(byref, wb)?;
         r
     }
 
@@ -5276,6 +5332,14 @@ fn trim_bytes(s: &[u8], left: bool, right: bool) -> Vec<u8> {
         }
     }
     s[start..end].to_vec()
+}
+
+/// Can this expression be written back to (a valid by-reference target)?
+fn is_lvalue_expr(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Var(_) | Expr::Index(..) | Expr::Prop(..) | Expr::StaticProp(..) | Expr::VarVar(_)
+    )
 }
 
 /// Is this value a stream resource (a `__Stream` pseudo-object)?
