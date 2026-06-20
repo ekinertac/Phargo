@@ -27,6 +27,48 @@ you would never think to write a test for.
 
 ---
 
+## 2026-06-21 — The long tail, and knowing when you're in it
+
+**Pass rate: 2571 → 2581.**
+
+A cluster of smaller rungs after superglobals: a full `Reflection*` method
+build-out, an XML SAX parser (driven off the same `__dom_parse` tree), the
+`__serialize`/`__unserialize`/`__wakeup` magic methods, and the PHP 8.4
+`Dom\XMLDocument`/`Dom\HTMLDocument` factory API (which, conveniently, resolve by
+simple class name, so global prelude classes satisfy the namespaced form).
+
+But the numbers tell a story: +25, +9, +33, +3, +3, +0, +4. The `+33` (superglobals)
+was the last big *structural* win — a thing that was missing entirely. After that,
+every rung is **precision work**: the feature exists, but matching PHP byte-for-byte
+is the bar. `DateTime::__serialize` is the clearest example — I added it, and the
+score went *down* two, because PHP's serialized DateTime format has microsecond and
+timezone-type details mine didn't reproduce, so tests that had been passing on the
+default object serialization now failed on my "better" version. Reverted.
+
+A war story from this stretch worth keeping: I gave `Dom\XMLDocument` a `saveXml()`
+method that called `$this->saveXML()`. Instant stack overflow — PHP method names are
+case-insensitive, so `saveXml` *is* `saveXML`, and it called itself forever. The fix
+was to delete the override entirely and let the inherited (case-insensitive) method
+answer both spellings.
+
+The honest read: the project crossed from "missing whole features" into "matching
+exact behavior." The first regime is where the big gains live; the second is a
+grind of diminishing, uncertain returns. Good place to take stock.
+
+### Session arc (2026-06-14 → 06-21)
+
+From **2176 (9.98%)** to **2581 (11.84%)** of gradeable — **+405 tests**, crossing
+10% and 11%. Landed in this stretch: generators, the heap ceiling (after a
+generator OOM hard-restarted the dev machine), file streams, the PHP 8.5 pipe
+operator, real enums, directory iteration, CSV/SplFileObject, **real references**
+(`=&`/`use(&)`/by-ref), **DOMDocument + a from-scratch XML parser**, **SimpleXML**,
+Reflection (params + return types), superglobals + sessions, and a pile of
+correctness fixes the corpus surfaced along the way (the `(string)` cast that
+ignored `__toString` being the most satisfying). Every rung measured against real
+php-src tests, committed, and pushed.
+
+---
+
 ## 2026-06-21 — Superglobals, and the scope that wasn't global
 
 **Pass rate: 2538 → 2571.**
