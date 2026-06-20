@@ -4,13 +4,13 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 2504 / 21862  (11.45% of the entire PHP test suite)**
+**`.phpt` pass rate: 2529 / 21862  (11.57% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 11.49%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 11.60%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 2504 | 19292 | 66 | 21862 |
+| 2529 | 19267 | 66 | 21862 |
 
 _Curated smoke tests (dev guards, **not** in the number above): 76/93 passing._
 
@@ -18,10 +18,10 @@ _Curated smoke tests (dev guards, **not** in the number above): 76/93 passing._
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 944 | 5329 | 17.7% |
-| `ext/standard` | 561 | 3877 | 14.5% |
+| `Zend` | 948 | 5329 | 17.8% |
+| `ext/standard` | 576 | 3877 | 14.9% |
 | `ext/opcache` | 401 | 916 | 43.8% |
-| `core` | 169 | 868 | 19.5% |
+| `core` | 171 | 868 | 19.7% |
 | `ext/dom` | 31 | 868 | 3.6% |
 | `ext/spl` | 91 | 796 | 11.4% |
 | `ext/date` | 67 | 689 | 9.7% |
@@ -40,7 +40,7 @@ _Curated smoke tests (dev guards, **not** in the number above): 76/93 passing._
 | `ext/pcre` | 43 | 168 | 25.6% |
 | `ext/pdo_mysql` | 0 | 167 | 0.0% |
 | `ext/zend_test` | 4 | 159 | 2.5% |
-| `ext/zlib` | 8 | 157 | 5.1% |
+| `ext/zlib` | 10 | 157 | 6.4% |
 | `ext/simplexml` | 23 | 156 | 14.7% |
 | `sapi/fpm` | 0 | 141 | 0.0% |
 | `ext/ldap` | 0 | 140 | 0.0% |
@@ -82,7 +82,7 @@ _Curated smoke tests (dev guards, **not** in the number above): 76/93 passing._
 | `ext/enchant` | 0 | 33 | 0.0% |
 | `ext/libxml` | 0 | 32 | 0.0% |
 | `ext/pdo_dblib` | 0 | 31 | 0.0% |
-| `ext/bz2` | 0 | 27 | 0.0% |
+| `ext/bz2` | 2 | 27 | 7.4% |
 | `ext/readline` | 0 | 25 | 0.0% |
 | `sapi/cgi` | 4 | 24 | 16.7% |
 | `ext/gettext` | 0 | 19 | 0.0% |

@@ -50,6 +50,8 @@ pub struct Eval {
     ob_stack: Vec<usize>,
     /// Next stream resource id handed out by `fopen` (cosmetic, for var_dump/id).
     next_res_id: i64,
+    /// Callbacks registered via register_shutdown_function, run after main exits.
+    shutdown_fns: Vec<(Value, Vec<Value>)>,
     /// Enum cases are singletons: cache (class, case) -> the one shared instance
     /// so `Enum::from(x) === Enum::Case` holds (object identity).
     enum_cases: HashMap<(String, String), Value>,
@@ -836,6 +838,7 @@ impl Eval {
             included: HashSet::new(),
             ob_stack: Vec::new(),
             next_res_id: 1,
+            shutdown_fns: Vec::new(),
             enum_cases: HashMap::new(),
             gen_buf: None,
             gen_nodes: 0,
@@ -869,6 +872,20 @@ impl Eval {
 
     /// Like [`run`], but records the script's path so `__FILE__`/`__DIR__` and
     /// relative `include`/`require` resolve against it.
+    /// Run registered shutdown callbacks (best-effort; errors are swallowed,
+    /// matching PHP's lenient shutdown phase). Re-runs the queue in case a
+    /// callback registers more.
+    fn run_shutdown(&mut self) {
+        let mut guard = 0;
+        while !self.shutdown_fns.is_empty() && guard < 1000 {
+            let fns = std::mem::take(&mut self.shutdown_fns);
+            for (cb, extra) in fns {
+                let _ = self.call_value(cb, extra);
+            }
+            guard += 1;
+        }
+    }
+
     pub fn run_with_path(program: &[Stmt], path: Option<PathBuf>) -> R<Vec<u8>> {
         let mut e = Eval::new();
         e.cur_file = path;
@@ -882,10 +899,14 @@ impl Eval {
         e.consts.insert("STDERR".into(), stderr);
         e.hoist(program);
         match e.exec_block(program) {
-            Ok(_) => Ok(e.out),
+            Ok(_) => {
+                e.run_shutdown();
+                Ok(e.out)
+            }
             Err(err) => {
                 // `exit`/`die`: a normal halt, not an error.
                 if err.0 == "__phargo_exit__" {
+                    e.run_shutdown();
                     return Ok(e.out);
                 }
                 // An uncaught exception becomes a PHP fatal-error message in the
@@ -5459,8 +5480,58 @@ impl Eval {
                 Value::Null
             }
             "trigger_error" | "spl_autoload_register" | "spl_autoload_unregister"
-            | "date_default_timezone_set" | "assert" | "gc_enabled" | "headers_sent" => {
+            | "date_default_timezone_set" | "assert" | "gc_enabled" | "headers_sent"
+            | "stream_set_blocking" | "stream_set_timeout" | "stream_set_read_buffer"
+            | "stream_set_write_buffer" | "stream_wrapper_register" | "stream_wrapper_unregister"
+            | "stream_wrapper_restore" | "stream_filter_remove" => {
                 Value::Bool(true)
+            }
+            // stream filters: return a non-false handle (a marker object)
+            "stream_filter_append" | "stream_filter_prepend" => new_obj("__StreamFilter"),
+            "stream_context_create" | "stream_context_get_default" => new_obj("__StreamContext"),
+            "stream_context_set_option" | "stream_context_set_default" | "stream_context_set_params" => {
+                Value::Bool(true)
+            }
+            "stream_get_meta_data" => {
+                let mut m = Arr::new();
+                m.insert(Key::Str(b"timed_out".to_vec()), Value::Bool(false));
+                m.insert(Key::Str(b"blocked".to_vec()), Value::Bool(true));
+                m.insert(Key::Str(b"eof".to_vec()), Value::Bool(to_bool(&self.builtin("feof", vec![a(0)])?)));
+                m.insert(Key::Str(b"seekable".to_vec()), Value::Bool(true));
+                m.insert(Key::Str(b"stream_type".to_vec()), Value::Str(b"MEMORY".to_vec()));
+                m.insert(Key::Str(b"mode".to_vec()), Value::Str(b"r+".to_vec()));
+                m.insert(Key::Str(b"unread_bytes".to_vec()), Value::Int(0));
+                Value::Array(m)
+            }
+            "stream_get_line" => {
+                // stream_get_line($h, $length, $ending=""): read a line, strip ending.
+                let line = self.stream_gets(&a(0), None);
+                match line {
+                    Value::Str(mut l) => {
+                        let ending = to_bytes(&a(2));
+                        if !ending.is_empty() {
+                            if l.ends_with(&ending) {
+                                l.truncate(l.len() - ending.len());
+                            }
+                        } else {
+                            while matches!(l.last(), Some(b'\n') | Some(b'\r')) {
+                                l.pop();
+                            }
+                        }
+                        Value::Str(l)
+                    }
+                    _ => Value::Bool(false),
+                }
+            }
+            "register_shutdown_function" => {
+                if !matches!(a(0), Value::Null) {
+                    let mut extra = Vec::new();
+                    for i in 1..args.len() {
+                        extra.push(a(i));
+                    }
+                    self.shutdown_fns.push((a(0), extra));
+                }
+                Value::Null
             }
             "date_default_timezone_get" => Value::Str(b"UTC".to_vec()),
             "debug_backtrace" => Value::Array(Arr::new()),
