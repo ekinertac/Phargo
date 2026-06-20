@@ -788,6 +788,18 @@ class DOMDocument extends DOMNode {
         return $s . "</" . $n->nodeName . ">";
     }
 }
+// PHP 8.4 new DOM API (Dom\XMLDocument / Dom\HTMLDocument): resolved by simple
+// name, reusing the classic DOMDocument tree. Static factory constructors.
+class XMLDocument extends DOMDocument {
+    public static function createFromString($source, $options = 0, $overrideEncoding = null) { $d = new XMLDocument(); $d->loadXML($source); return $d; }
+    public static function createFromFile($path, $options = 0, $overrideEncoding = null) { $d = new XMLDocument(); $d->load($path); return $d; }
+    public static function createEmpty($version = "1.0", $encoding = "UTF-8") { $d = new XMLDocument(); $d->version = $version; $d->encoding = $encoding; return $d; }
+}
+class HTMLDocument extends DOMDocument {
+    public static function createFromString($source, $options = 0, $overrideEncoding = null) { $d = new HTMLDocument(); $d->loadXML($source); return $d; }
+    public static function createFromFile($path, $options = 0, $overrideEncoding = null) { $d = new HTMLDocument(); $d->load($path); return $d; }
+    public static function createEmpty($encoding = "UTF-8") { $d = new HTMLDocument(); $d->encoding = $encoding; return $d; }
+}
 
 // ---- SimpleXML (built on the same __dom_parse tree) ----
 function simplexml_load_string($xml, $class = null, $opts = 0) {
