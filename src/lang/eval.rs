@@ -788,6 +788,21 @@ impl Eval {
         self.scopes.last_mut().unwrap()
     }
 
+    /// Get (or create) the shared reference cell backing a local variable, so it
+    /// can be aliased (`$b = &$a`, `&$param`, `use (&$x)`). If the variable
+    /// already holds a `Ref`, its cell is reused; otherwise its current value is
+    /// moved into a fresh cell and the variable is rebound to a `Ref` to it.
+    fn get_ref_cell(&mut self, name: &str) -> Rc<RefCell<Value>> {
+        let scope = self.vars();
+        if let Some(Value::Ref(cell)) = scope.get(name) {
+            return cell.clone();
+        }
+        let cur = scope.get(name).cloned().unwrap_or(Value::Null);
+        let cell = Rc::new(RefCell::new(cur));
+        scope.insert(name.to_string(), Value::Ref(cell.clone()));
+        cell
+    }
+
     fn tick(&mut self) -> R<()> {
         self.steps += 1;
         if self.steps > STEP_LIMIT {
@@ -1146,7 +1161,7 @@ impl Eval {
                 }
                 Value::Array(a)
             }
-            Expr::Var(name) => self.vars().get(name).cloned().unwrap_or(Value::Null),
+            Expr::Var(name) => self.vars().get(name).map(|v| v.deref()).unwrap_or(Value::Null),
             Expr::ConstFetch(name) => self.const_fetch(name),
             Expr::MagicConst(name) => match name.to_ascii_uppercase().as_str() {
                 "__FILE__" => Value::Str(
@@ -1184,16 +1199,31 @@ impl Eval {
                 v
             }
             Expr::AssignRef(lhs, rhs) => {
-                // references not modeled yet — behave as a value assignment
-                let v = self.eval(rhs)?;
-                self.assign_to(lhs, v.clone())?;
-                v
+                // `$lhs = &$rhs`: both names alias one shared cell. Supported when
+                // rhs is a simple variable (the common case); otherwise fall back
+                // to a value copy.
+                match (&**lhs, &**rhs) {
+                    (Expr::Var(lname), Expr::Var(rname)) => {
+                        let cell = self.get_ref_cell(rname);
+                        let v = cell.borrow().clone();
+                        self.vars().insert(lname.clone(), Value::Ref(cell));
+                        v
+                    }
+                    _ => {
+                        let v = self.eval(rhs)?;
+                        self.assign_to(lhs, v.clone())?;
+                        v
+                    }
+                }
             }
             Expr::AssignOp(op, lhs, rhs) => {
                 // `$v .= expr` in place: append to the existing string instead of
                 // cloning it each time (avoids O(n^2) growth on `.=` loops).
                 if *op == BinOp::Concat {
-                    if let Expr::Var(name) = &**lhs {
+                    // Skip the in-place fast path for reference-backed vars (it would
+                    // overwrite the Ref); the general path below write-throughs.
+                    let is_ref = matches!(&**lhs, Expr::Var(n) if matches!(self.vars().get(n), Some(Value::Ref(_))));
+                    if let (Expr::Var(name), false) = (&**lhs, is_ref) {
                         let rv = self.eval(rhs)?;
                         let rb = self.stringify(&rv)?;
                         let slot = self.vars().entry(name.clone()).or_insert(Value::Str(Vec::new()));
@@ -1427,7 +1457,13 @@ impl Eval {
             Expr::Closure(c) => {
                 let mut captures = Vec::new();
                 for u in &c.uses {
-                    let v = self.vars().get(&u.name).cloned().unwrap_or(Value::Null);
+                    let v = if u.by_ref {
+                        // `use (&$x)`: capture a shared cell so the closure and the
+                        // defining scope see each other's writes.
+                        Value::Ref(self.get_ref_cell(&u.name))
+                    } else {
+                        self.vars().get(&u.name).map(|v| v.deref()).unwrap_or(Value::Null)
+                    };
                     captures.push((u.name.clone(), v));
                 }
                 let bound_this = if c.is_static {
@@ -1745,7 +1781,13 @@ impl Eval {
         }
         match target {
             Expr::Var(name) => {
-                self.vars().insert(name.clone(), val);
+                // Write through if the variable currently aliases a reference cell.
+                if let Some(Value::Ref(cell)) = self.vars().get(name) {
+                    let cell = cell.clone();
+                    *cell.borrow_mut() = val;
+                } else {
+                    self.vars().insert(name.clone(), val);
+                }
             }
             Expr::Index(base, idx) => {
                 // ensure base is an array, then set/append
@@ -1781,6 +1823,34 @@ impl Eval {
         // and nested `$var[a][b]` are handled here.
         match base {
             Expr::Var(name) => {
+                // Through a reference cell (`use (&$out); $out[] = …`): mutate the
+                // array inside the shared cell in place (no clone → no O(n^2)).
+                if let Some(Value::Ref(cell)) = self.vars().get(name) {
+                    let cell = cell.clone();
+                    let is_obj = matches!(&*cell.borrow(), Value::Object(_));
+                    if is_obj {
+                        let obj = cell.borrow().clone();
+                        if let Value::Object(rc) = &obj {
+                            let class = rc.borrow().class.clone();
+                            if self.find_method(&class, "offsetset").is_some() {
+                                let kv = key.as_ref().map(akey_to_value).unwrap_or(Value::Null);
+                                self.call_method(obj.clone(), "offsetSet", vec![kv, val])?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                    let mut b = cell.borrow_mut();
+                    if !matches!(&*b, Value::Array(_)) {
+                        *b = Value::Array(Arr::new());
+                    }
+                    if let Value::Array(a) = &mut *b {
+                        match key {
+                            Some(k) => a.insert(k, val),
+                            None => a.push(val),
+                        }
+                    }
+                    return Ok(());
+                }
                 // ArrayAccess: `$obj[$k] = v` / `$obj[] = v` → offsetSet($k, v)
                 if matches!(self.vars().get(name), Some(Value::Object(_))) {
                     let obj = self.vars().get(name).cloned().unwrap();
@@ -5606,6 +5676,7 @@ fn var_dump_seen(v: &Value, indent: usize, out: &mut String, seen: &mut Vec<usiz
             out.push_str(&format!("{pad}}}\n"));
         }
         Value::Closure(_) => out.push_str(&format!("{pad}object(Closure)#1 (0) {{\n{pad}}}\n")),
+        Value::Ref(c) => var_dump_seen(&c.borrow(), indent, out, seen),
     }
 }
 
@@ -5679,6 +5750,7 @@ fn var_export_seen(v: &Value, indent: usize, out: &mut String, seen: &mut Vec<us
             seen.pop();
         }
         Value::Closure(_) => out.push_str("NULL"),
+        Value::Ref(c) => var_export_seen(&c.borrow(), indent, out, seen),
     }
 }
 
@@ -5912,6 +5984,7 @@ fn php_serialize(v: &Value, out: &mut Vec<u8>, depth: usize) {
             out.push(b'}');
         }
         Value::Closure(_) => out.extend_from_slice(b"N;"),
+        Value::Ref(c) => php_serialize(&c.borrow(), out, depth),
     }
 }
 
@@ -6105,6 +6178,7 @@ fn json_encode(v: &Value, out: &mut Vec<u8>, depth: usize) {
             out.push(b'}');
         }
         Value::Closure(_) => out.extend_from_slice(b"null"),
+        Value::Ref(c) => json_encode(&c.borrow(), out, depth),
     }
 }
 

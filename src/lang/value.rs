@@ -21,6 +21,21 @@ pub enum Value {
     Array(Arr),
     Object(Rc<RefCell<Obj>>),
     Closure(Rc<ClosureVal>),
+    /// A PHP reference: a shared, mutable cell. Variables that alias the same
+    /// storage (`$b = &$a`, `&$param`, `use (&$x)`) hold `Ref` to one cell.
+    /// References live directly under variable names in scopes; reads deref and
+    /// writes write through. `deref()` collapses a (possibly chained) ref.
+    Ref(Rc<RefCell<Value>>),
+}
+
+impl Value {
+    /// Follow a reference to the underlying value (clone). Non-refs pass through.
+    pub fn deref(&self) -> Value {
+        match self {
+            Value::Ref(cell) => cell.borrow().deref(),
+            other => other.clone(),
+        }
+    }
 }
 
 /// A runtime closure: the function body plus its captured environment.
@@ -93,6 +108,9 @@ impl Arr {
 
     /// Normalize a value used as a key (int-like strings → ints; bools/floats → ints; null → "").
     pub fn norm_key(v: &Value) -> Key {
+        if let Value::Ref(c) = v {
+            return Arr::norm_key(&c.borrow());
+        }
         match v {
             Value::Int(n) => Key::Int(*n),
             Value::Bool(b) => Key::Int(*b as i64),
@@ -105,7 +123,7 @@ impl Arr {
                     Key::Str(s.clone())
                 }
             }
-            Value::Array(_) | Value::Object(_) | Value::Closure(_) => Key::Int(0),
+            Value::Array(_) | Value::Object(_) | Value::Closure(_) | Value::Ref(_) => Key::Int(0),
         }
     }
 
@@ -181,6 +199,9 @@ fn canonical_int_key(s: &[u8]) -> Option<i64> {
 // ---- coercions (PHP type juggling) -------------------------------------
 
 pub fn to_bool(v: &Value) -> bool {
+    if let Value::Ref(c) = v {
+        return to_bool(&c.borrow());
+    }
     match v {
         Value::Null => false,
         Value::Bool(b) => *b,
@@ -189,10 +210,14 @@ pub fn to_bool(v: &Value) -> bool {
         Value::Str(s) => !(s.is_empty() || s == b"0"),
         Value::Array(a) => !a.is_empty(),
         Value::Object(_) | Value::Closure(_) => true,
+        Value::Ref(c) => to_bool(&c.borrow()),
     }
 }
 
 pub fn to_i64(v: &Value) -> i64 {
+    if let Value::Ref(c) = v {
+        return to_i64(&c.borrow());
+    }
     match v {
         Value::Null => 0,
         Value::Bool(b) => *b as i64,
@@ -201,10 +226,14 @@ pub fn to_i64(v: &Value) -> i64 {
         Value::Str(s) => leading_number(s).as_i64(),
         Value::Array(a) => !a.is_empty() as i64,
         Value::Object(_) | Value::Closure(_) => 1,
+        Value::Ref(c) => to_i64(&c.borrow()),
     }
 }
 
 pub fn to_f64(v: &Value) -> f64 {
+    if let Value::Ref(c) = v {
+        return to_f64(&c.borrow());
+    }
     match v {
         Value::Null => 0.0,
         Value::Bool(b) => *b as i64 as f64,
@@ -213,10 +242,14 @@ pub fn to_f64(v: &Value) -> f64 {
         Value::Str(s) => leading_number(s).as_f64(),
         Value::Array(a) => !a.is_empty() as i64 as f64,
         Value::Object(_) | Value::Closure(_) => 1.0,
+        Value::Ref(c) => to_f64(&c.borrow()),
     }
 }
 
 pub fn to_bytes(v: &Value) -> Vec<u8> {
+    if let Value::Ref(c) = v {
+        return to_bytes(&c.borrow());
+    }
     match v {
         Value::Null => Vec::new(),
         Value::Bool(true) => b"1".to_vec(),
@@ -227,10 +260,14 @@ pub fn to_bytes(v: &Value) -> Vec<u8> {
         Value::Array(_) => b"Array".to_vec(),
         // __toString is handled by the evaluator's stringify(); this is the fallback.
         Value::Object(_) | Value::Closure(_) => Vec::new(),
+        Value::Ref(_) => Vec::new(),
     }
 }
 
 pub fn type_name(v: &Value) -> &'static str {
+    if let Value::Ref(c) = v {
+        return type_name(&c.borrow());
+    }
     match v {
         Value::Null => "NULL",
         Value::Bool(_) => "boolean",
@@ -240,6 +277,7 @@ pub fn type_name(v: &Value) -> &'static str {
         Value::Array(_) => "array",
         Value::Object(o) if o.borrow().class == "__Stream" => "resource",
         Value::Object(_) | Value::Closure(_) => "object",
+        Value::Ref(_) => "NULL",
     }
 }
 
@@ -340,6 +378,7 @@ pub fn to_num(v: &Value) -> Num {
         Value::Str(s) => leading_number(s),
         Value::Array(_) => Num::Int(0),
         Value::Object(_) | Value::Closure(_) => Num::Int(1),
+        Value::Ref(c) => to_num(&c.borrow()),
     }
 }
 
@@ -380,7 +419,7 @@ fn reformat_exp(x: f64) -> String {
 // ---- comparison & equality --------------------------------------------
 
 pub fn loose_eq(a: &Value, b: &Value) -> bool {
-    loose_eq_d(a, b, 0)
+    loose_eq_d(&a.deref(), &b.deref(), 0)
 }
 
 /// `depth` guards against cyclic object graphs (`$a->x = $a; $a == $b`) recursing
@@ -447,6 +486,9 @@ fn array_loose_eq(x: &Arr, y: &Arr, depth: usize) -> bool {
 
 pub fn strict_eq(a: &Value, b: &Value) -> bool {
     use Value::*;
+    if matches!(a, Ref(_)) || matches!(b, Ref(_)) {
+        return strict_eq(&a.deref(), &b.deref());
+    }
     match (a, b) {
         (Null, Null) => true,
         (Bool(x), Bool(y)) => x == y,
@@ -468,6 +510,9 @@ pub fn strict_eq(a: &Value, b: &Value) -> bool {
 pub fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     use Value::*;
+    if matches!(a, Ref(_)) || matches!(b, Ref(_)) {
+        return compare(&a.deref(), &b.deref());
+    }
     match (a, b) {
         (Str(x), Str(y)) => {
             if is_numeric_str(x) && is_numeric_str(y) {

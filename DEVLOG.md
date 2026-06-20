@@ -27,6 +27,42 @@ you would never think to write a test for.
 
 ---
 
+## 2026-06-20 — Real references, without rewriting the value model
+
+**Pass rate: 2451 → 2466, zero regressions.**
+
+The by-ref-param write-back from earlier was a workaround. The real fix —
+proper PHP references — landed here, and it turned out to be less scary than
+feared.
+
+The textbook approach is to make *every* variable a shared mutable cell. That's a
+deep rewrite. Instead: add one new value variant, `Value::Ref(Rc<RefCell<Value>>)`,
+and lean on the fact that **references only ever live directly under a variable
+name in a scope** — never inside arrays or object properties (PHP allows that too,
+but it's rare, and skipping it keeps the blast radius tiny). With that invariant:
+
+- **Reading** a variable derefs (one match).
+- **Writing** a variable writes *through* the cell if it's a ref, else replaces it.
+- The `&` sites — `$b = &$a`, `use (&$x)` — call one helper, `get_ref_cell`, which
+  turns the target variable into a ref-to-cell (if it isn't already) and hands back
+  the shared `Rc`. Both names now point at the same cell.
+
+The safety net that made this comfortable: a defensive deref at the top of every
+coercion and comparison function (`to_bool`, `to_i64`, `loose_eq`, …). So even if a
+`Ref` leaks somewhere I didn't anticipate, arithmetic and comparisons still do the
+right thing instead of treating the reference as a weird opaque value. References
+are rare, so the extra `matches!` check per call is free in practice.
+
+`use (&$sum)` accumulators — the thing half the `array_map`/`array_walk` callbacks
+in the world rely on — now work. So does `$out[] = …` through a captured array
+reference, mutating the array *in place* through the cell (no clone, so no O(n²)).
+
+The lesson: a localized invariant ("refs only live in scopes") can turn a
+terrifying rewrite into a contained, testable change. +15 undersells it — this is
+infrastructure a lot of future tests sit on.
+
+---
+
 ## 2026-06-20 — Making `&$ref` parameters actually mean something
 
 **Pass rate: 2435 → 2440.**
