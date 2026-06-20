@@ -27,6 +27,39 @@ you would never think to write a test for.
 
 ---
 
+## 2026-06-20 — Making `&$ref` parameters actually mean something
+
+**Pass rate: 2435 → 2440.**
+
+The DOM rung had exposed it: by-reference parameters didn't work. `function f(&$x)`
+was silently by-value, so any `&$out` accumulator quietly did nothing.
+
+A "proper" fix means real reference cells in the value model — every variable
+becomes a shared, aliasable box. That's a deep, invasive change to a tree-walker.
+So instead: **write-back**. The engine still passes by value, but for a `&$param`
+whose argument is a writable lvalue (a variable, an index, a property), the
+parameter's final value is copied back into the caller's variable *after* the call
+returns. The trick is timing — capture the value before the callee's scope is
+popped, apply it after, when the caller's scope is back on top.
+
+The satisfying part is that this **cascades through recursion for free**. In
+`collect($node, &$out)` calling itself, the inner call writes back to the outer
+frame's `$out`, then the outer frame writes back to *its* caller, all the way up.
+A recursive accumulator just works, even though there's not a real reference
+anywhere in the system — just a chain of well-timed copies.
+
+It's not complete (the `call_user_func`-style callable-value path is still
+by-value, since there are no argument expressions to write back to), but it covers
+functions, methods, static calls, and recursion. The modest +5 undersells it: it's
+a foundational correctness fix with zero regressions, and it's the prerequisite for
+`array_walk_recursive` and friends.
+
+A small irony worth noting for the eventual blog: I'd *worked around* this exact
+bug in the DOM code a day earlier (returning arrays instead of using `&$out`).
+Sometimes you fix the symptom to ship, then come back and fix the disease.
+
+---
+
 ## 2026-06-20 — DOMDocument, and teaching the engine to read minds (`__get`)
 
 **Pass rate: 2396 → 2435 (past 11%).**

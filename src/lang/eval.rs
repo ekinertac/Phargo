@@ -2247,6 +2247,28 @@ impl Eval {
         }
     }
 
+    /// Depth-first walk for `array_walk_recursive`: the callback fires on leaf
+    /// (non-array) values only. Read-only — element mutation via a by-ref callback
+    /// parameter isn't modeled here (the callable-value path is by-value).
+    fn walk_recursive(&mut self, arr: &Arr, cb: &Value, has_extra: bool, extra: &Value) -> R<()> {
+        for (k, v) in &arr.entries {
+            if let Value::Array(sub) = v {
+                self.walk_recursive(sub, cb, has_extra, extra)?;
+            } else {
+                let kv = match k {
+                    Key::Int(n) => Value::Int(*n),
+                    Key::Str(s) => Value::Str(s.clone()),
+                };
+                let mut cargs = vec![v.clone(), kv];
+                if has_extra {
+                    cargs.push(extra.clone());
+                }
+                self.call_value(cb.clone(), cargs)?;
+            }
+        }
+        Ok(())
+    }
+
     fn call_closure(&mut self, c: &ClosureVal, args: Vec<Value>) -> R<Value> {
         self.enter_call()?;
         let mut scope = HashMap::new();
@@ -3551,6 +3573,15 @@ impl Eval {
                         }
                         self.call_value(cb.clone(), cargs)?;
                     }
+                }
+                Value::Bool(true)
+            }
+            "array_walk_recursive" => {
+                let cb = a(1);
+                let has_extra = args.len() > 2;
+                let extra = a(2);
+                if let Value::Array(arr) = a(0) {
+                    self.walk_recursive(&arr, &cb, has_extra, &extra)?;
                 }
                 Value::Bool(true)
             }
