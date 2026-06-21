@@ -3077,6 +3077,29 @@ impl Eval {
         out
     }
 
+    /// The var_dump visibility annotation for a property: "" (public),
+    /// ":protected", or `:"DeclaringClass":private`. Empty if not a declared
+    /// property (dynamic props are public).
+    fn prop_annotation(&self, class: &str, prop: &str) -> String {
+        let annot = |vis: Visibility, cls: &str| match vis {
+            Visibility::Public => String::new(),
+            Visibility::Protected => ":protected".to_string(),
+            Visibility::Private => format!(":\"{}\":private", display_class(cls)),
+        };
+        for c in self.ancestry(class) {
+            if let Some(p) = c.props.iter().find(|p| p.name == prop) {
+                return annot(p.visibility, &c.name);
+            }
+            // constructor-promoted properties carry visibility on the param
+            if let Some(ctor) = c.methods.iter().find(|m| m.name.eq_ignore_ascii_case("__construct")) {
+                if let Some(pp) = ctor.params.iter().find(|p| p.name == prop && p.promote.is_some()) {
+                    return annot(pp.promote.unwrap(), &c.name);
+                }
+            }
+        }
+        String::new()
+    }
+
     fn is_subclass(&self, class: &str, target: &str) -> bool {
         let t = target.to_ascii_lowercase();
         for c in self.ancestry(class) {
@@ -3652,7 +3675,7 @@ impl Eval {
             "var_dump" => {
                 for v in &args {
                     let mut s = String::new();
-                    var_dump(v, 0, &mut s);
+                    var_dump(self, v, 0, &mut s);
                     self.out.extend_from_slice(s.as_bytes());
                 }
                 Value::Null
@@ -6389,13 +6412,13 @@ fn format_spec(conv: u8, spec: &str, arg: &Value) -> Vec<u8> {
 }
 
 // ---- var_dump / print_r formatting -------------------------------------
-fn var_dump(v: &Value, indent: usize, out: &mut String) {
-    var_dump_seen(v, indent, out, &mut Vec::new());
+fn var_dump(ev: &Eval, v: &Value, indent: usize, out: &mut String) {
+    var_dump_seen(ev, v, indent, out, &mut Vec::new());
 }
 
 /// `seen` holds the Rc addresses of objects on the current path, so circular
 /// object graphs print `*RECURSION*` instead of recursing into a memory bomb.
-fn var_dump_seen(v: &Value, indent: usize, out: &mut String, seen: &mut Vec<usize>) {
+fn var_dump_seen(ev: &Eval, v: &Value, indent: usize, out: &mut String, seen: &mut Vec<usize>) {
     // Depth cap: deeply nested structures otherwise produce quadratic-sized output
     // (indentation grows per level), a memory bomb on e.g. a 50k-deep object chain.
     if indent > 256 {
@@ -6422,7 +6445,7 @@ fn var_dump_seen(v: &Value, indent: usize, out: &mut String, seen: &mut Vec<usiz
                         out.push_str(&format!("{pad}  [\"{}\"]=>\n", String::from_utf8_lossy(s)))
                     }
                 }
-                var_dump_seen(val, indent + 1, out, seen);
+                var_dump_seen(ev, val, indent + 1, out, seen);
             }
             out.push_str(&format!("{pad}}}\n"));
         }
@@ -6441,14 +6464,14 @@ fn var_dump_seen(v: &Value, indent: usize, out: &mut String, seen: &mut Vec<usiz
             out.push_str(&format!("{pad}object({})#1 ({}) {{\n", display_class(&ob.class), ob.props.len()));
             seen.push(id);
             for (k, val) in &ob.props {
-                out.push_str(&format!("{pad}  [\"{k}\"]=>\n"));
-                var_dump_seen(val, indent + 1, out, seen);
+                out.push_str(&format!("{pad}  [\"{k}\"{}]=>\n", ev.prop_annotation(&ob.class, k)));
+                var_dump_seen(ev, val, indent + 1, out, seen);
             }
             seen.pop();
             out.push_str(&format!("{pad}}}\n"));
         }
         Value::Closure(_) => out.push_str(&format!("{pad}object(Closure)#1 (0) {{\n{pad}}}\n")),
-        Value::Ref(c) => var_dump_seen(&c.borrow(), indent, out, seen),
+        Value::Ref(c) => var_dump_seen(ev, &c.borrow(), indent, out, seen),
     }
 }
 
