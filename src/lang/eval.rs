@@ -52,6 +52,11 @@ pub struct Eval {
     next_res_id: i64,
     /// Callbacks registered via register_shutdown_function, run after main exits.
     shutdown_fns: Vec<(Value, Vec<Value>)>,
+    /// Per-call argument stack, for func_get_args()/func_num_args().
+    cur_args: Vec<Vec<Value>>,
+    /// xorshift RNG state for rand()/mt_rand() (deterministic; tests rarely depend
+    /// on exact values, and a fixed seed keeps runs reproducible).
+    rng_state: u64,
     /// Enum cases are singletons: cache (class, case) -> the one shared instance
     /// so `Enum::from(x) === Enum::Case` holds (object identity).
     enum_cases: HashMap<(String, String), Value>,
@@ -913,6 +918,8 @@ impl Eval {
             ob_stack: Vec::new(),
             next_res_id: 1,
             shutdown_fns: Vec::new(),
+            cur_args: Vec::new(),
+            rng_state: 0x2545_F491_4F6C_DD1D,
             enum_cases: HashMap::new(),
             gen_buf: None,
             gen_nodes: 0,
@@ -928,6 +935,16 @@ impl Eval {
             return Err(RunError("maximum function nesting level reached".into()));
         }
         Ok(())
+    }
+
+    /// xorshift64* — a cheap deterministic PRNG for rand()/mt_rand().
+    fn next_rand(&mut self) -> u64 {
+        let mut x = self.rng_state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng_state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
     /// Register the exception/error hierarchy (parsed from PRELUDE).
@@ -2807,6 +2824,7 @@ impl Eval {
 
     fn call_closure(&mut self, c: &ClosureVal, args: Vec<Value>) -> R<Value> {
         self.enter_call()?;
+        self.cur_args.push(args.clone());
         let mut scope = HashMap::new();
         for (k, v) in &c.captures {
             scope.insert(k.clone(), v.clone());
@@ -2830,6 +2848,7 @@ impl Eval {
                 r
             }
         };
+        self.cur_args.pop();
         self.call_depth -= 1;
         r
     }
@@ -2878,6 +2897,7 @@ impl Eval {
 
     fn call_user(&mut self, f: &FuncDecl, args: Vec<Value>, byref: Option<&[Arg]>) -> R<Value> {
         self.enter_call()?;
+        self.cur_args.push(args.clone());
         let mut scope = HashMap::new();
         for (i, p) in f.params.iter().enumerate() {
             if p.variadic {
@@ -2901,6 +2921,7 @@ impl Eval {
         let r = self.run_fn_body(&f.body);
         let wb = self.capture_byref(&f.params, byref);
         self.scopes.pop();
+        self.cur_args.pop();
         self.call_depth -= 1;
         self.apply_byref(byref, wb)?;
         r
@@ -3145,6 +3166,7 @@ impl Eval {
             None => return Ok(Value::Null),
         };
         self.enter_call()?;
+        self.cur_args.push(args.clone());
         let mut scope = HashMap::new();
         if !m.is_static {
             scope.insert("this".to_string(), recv.clone());
@@ -3171,6 +3193,7 @@ impl Eval {
         let wb = self.capture_byref(&m.params, byref);
         self.scopes.pop();
         self.current_class = prev_class;
+        self.cur_args.pop();
         self.call_depth -= 1;
         self.apply_byref(byref, wb)?;
         r
@@ -3231,6 +3254,7 @@ impl Eval {
             None => return Ok(Value::Null),
         };
         self.enter_call()?;
+        self.cur_args.push(args.clone());
         let mut scope = HashMap::new();
         // a non-static method reached via parent::/self:: keeps $this
         if !m.is_static {
@@ -3245,6 +3269,7 @@ impl Eval {
         let wb = self.capture_byref(&m.params, byref);
         self.scopes.pop();
         self.current_class = prev_class;
+        self.cur_args.pop();
         self.call_depth -= 1;
         self.apply_byref(byref, wb)?;
         r
@@ -3694,6 +3719,89 @@ impl Eval {
                     return Err(self.throw_error("DivisionByZeroError", "Division by zero"));
                 }
                 Value::Int(to_i64(&a(0)) / d)
+            }
+            "fdiv" => Value::Float(to_f64(&a(0)) / to_f64(&a(1))),
+            "class_alias" => {
+                let orig = String::from_utf8_lossy(&to_bytes(&a(0))).to_ascii_lowercase();
+                let alias = String::from_utf8_lossy(&to_bytes(&a(1))).into_owned();
+                if let Some(c) = self.classes.get(&orig).cloned() {
+                    self.classes.insert(alias.to_ascii_lowercase(), c);
+                    Value::Bool(true)
+                } else {
+                    Value::Bool(false)
+                }
+            }
+            "get_called_class" => match &self.current_class {
+                Some(c) => Value::Str(c.as_bytes().to_vec()),
+                None => Value::Bool(false),
+            },
+            "func_get_args" => {
+                let mut arr = Arr::new();
+                if let Some(cur) = self.cur_args.last() {
+                    for v in cur.clone() {
+                        arr.push(v);
+                    }
+                }
+                Value::Array(arr)
+            }
+            "func_num_args" => Value::Int(self.cur_args.last().map(|a| a.len()).unwrap_or(0) as i64),
+            "func_get_arg" => {
+                let i = to_i64(&a(0)).max(0) as usize;
+                self.cur_args.last().and_then(|a| a.get(i).cloned()).unwrap_or(Value::Bool(false))
+            }
+            "extract" => {
+                let mut n = 0;
+                if let Value::Array(arr) = a(0) {
+                    for (k, v) in arr.entries {
+                        if let Key::Str(s) = k {
+                            if let Ok(name) = std::str::from_utf8(&s) {
+                                if !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) {
+                                    self.vars().insert(name.to_string(), v);
+                                    n += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                Value::Int(n)
+            }
+            "rand" | "mt_rand" => {
+                if args.len() >= 2 {
+                    let lo = to_i64(&a(0));
+                    let hi = to_i64(&a(1));
+                    if hi <= lo {
+                        Value::Int(lo)
+                    } else {
+                        let span = (hi - lo + 1) as i64;
+                        Value::Int(lo + (self.next_rand() % span as u64) as i64)
+                    }
+                } else {
+                    Value::Int((self.next_rand() & 0x7fff_ffff) as i64)
+                }
+            }
+            "random_int" => {
+                let lo = to_i64(&a(0));
+                let hi = to_i64(&a(1));
+                if hi <= lo {
+                    Value::Int(lo)
+                } else {
+                    let span = (hi - lo + 1) as u64;
+                    Value::Int(lo + (self.next_rand() % span) as i64)
+                }
+            }
+            "srand" | "mt_srand" => {
+                self.rng_state = if args.is_empty() { 0x2545_F491_4F6C_DD1D } else { to_i64(&a(0)) as u64 };
+                Value::Null
+            }
+            "mt_getrandmax" | "getrandmax" => Value::Int(2_147_483_647),
+            "highlight_string" | "highlight_file" => {
+                let code = to_bytes(&a(0));
+                if to_bool(&a(1)) {
+                    Value::Str(code)
+                } else {
+                    self.out.extend_from_slice(&code);
+                    Value::Bool(true)
+                }
             }
             "strtoupper" => Value::Str(to_bytes(&a(0)).to_ascii_uppercase()),
             "strtolower" => Value::Str(to_bytes(&a(0)).to_ascii_lowercase()),

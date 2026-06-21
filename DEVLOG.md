@@ -27,6 +27,37 @@ you would never think to write a test for.
 
 ---
 
+## 2026-06-21 — Pushing on the Zend core, and a CRLF that hid behind everything
+
+**Pass rate: 2581 → 2638 — crossed 12%.**
+
+Decided to aim the climb at the **Zend** test directory — the core language engine
+itself, which (unlike extension stubs) is exactly what this project *is*. Built a
+Zend-focused analyzer that splits failures into parse-error / runtime-error /
+output-mismatch with samples. Two things jumped out.
+
+First, the cheap one: a pile of **basic core functions were simply missing** —
+`func_get_args`, `extract`, `fdiv`, `class_alias`, `get_called_class`, `rand`/
+`mt_rand`, `random_int`. Added them (func_get_args needed a per-call argument
+stack; rand got a small deterministic xorshift).
+
+Second, the one that had been hiding in plain sight for the *entire project*: the
+analyzer's mismatch samples showed every expected line ending in `\n\n` where our
+output had `\n`. That's not a doubling — it's **CRLF**. The `.phpt` corpus was
+checked out on Windows with `autocrlf`, so every `--EXPECT--` block has `\r\n`
+terminators, while our engine (correctly) emits `\n`. The scoreboard compared the
+two byte-for-byte, so **every multi-line test across the whole corpus had been
+failing on line endings alone.** PHP's own run-tests.php normalizes this; we
+weren't. One `replace("\r\n", "\n")` on the expected side, and the real number
+surfaced — straight past 12%.
+
+The lesson is almost too on-the-nose for a build-in-public log: we spent a dozen
+rungs grinding +3s against the long tail, when a single-line harness bug had been
+quietly suppressing a whole class of passes the entire time. Measure your
+measurement. The oracle is only as honest as your comparison with it.
+
+---
+
 ## 2026-06-21 — The long tail, and knowing when you're in it
 
 **Pass rate: 2571 → 2581.**

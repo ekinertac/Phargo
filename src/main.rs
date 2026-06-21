@@ -122,18 +122,26 @@ fn evaluate(t: &Phpt) -> Outcome {
         Ok(Ok(s)) => s,
         _ => return Outcome::Fail,
     };
+    // Normalize line endings: the corpus is checked out with CRLF on Windows, but
+    // PHP output (and run-tests.php's comparison) is LF — so compare LF-to-LF.
+    let actual = lf(&actual);
     if let Some(e) = &t.expect {
-        if actual.trim_end() == e.trim_end() {
+        if actual.trim_end() == lf(e).trim_end() {
             return Outcome::Pass;
         }
         return Outcome::Fail;
     }
     if let Some(p) = &t.expectf {
-        if expectf_matches(p, &actual) {
+        if expectf_matches(&lf(p), &actual) {
             return Outcome::Pass;
         }
     }
     Outcome::Fail
+}
+
+/// Normalize CRLF / lone CR to LF (the corpus has CRLF from Windows checkout).
+fn lf(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 // ---- --EXPECTF-- matcher (hand-rolled; no regex dependency) -----------------
