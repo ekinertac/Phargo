@@ -1765,7 +1765,7 @@ impl Eval {
             Expr::Isset(items) => {
                 let mut all = true;
                 for it in items {
-                    if matches!(self.eval(it)?, Value::Null) {
+                    if !self.isset_one(it)? {
                         all = false;
                         break;
                     }
@@ -2109,6 +2109,10 @@ impl Eval {
                 std::cmp::Ordering::Equal => 0,
                 std::cmp::Ordering::Greater => 1,
             }),
+            // bitwise on two strings is byte-wise (not numeric)
+            BitAnd if matches!((l, r), (Value::Str(_), Value::Str(_))) => str_bitwise(l, r, |a, b| a & b, false),
+            BitOr if matches!((l, r), (Value::Str(_), Value::Str(_))) => str_bitwise(l, r, |a, b| a | b, true),
+            BitXor if matches!((l, r), (Value::Str(_), Value::Str(_))) => str_bitwise(l, r, |a, b| a ^ b, false),
             BitAnd => Value::Int(to_i64(l) & to_i64(r)),
             BitOr => Value::Int(to_i64(l) | to_i64(r)),
             BitXor => Value::Int(to_i64(l) ^ to_i64(r)),
@@ -2393,6 +2397,18 @@ impl Eval {
             _ => {}
         }
         Ok(())
+    }
+
+    /// One operand of isset(): true if set & non-null. For ArrayAccess offsets,
+    /// PHP calls offsetExists (not offsetGet).
+    fn isset_one(&mut self, e: &Expr) -> R<bool> {
+        if let Expr::Index(base, Some(idx)) = e {
+            if let Some(obj) = self.arrayaccess_obj(base, "offsetexists") {
+                let raw = self.eval(idx)?;
+                return Ok(to_bool(&self.call_method(obj, "offsetExists", vec![raw])?));
+            }
+        }
+        Ok(!matches!(self.eval(e)?, Value::Null))
     }
 
     fn arrayaccess_obj(&mut self, base: &Expr, m: &str) -> Option<Value> {
@@ -6386,6 +6402,19 @@ fn parse_csv(s: &[u8], delim: u8, quote: u8) -> Value {
 
 fn first_byte_or(v: &[u8], d: u8) -> u8 {
     v.first().copied().unwrap_or(d)
+}
+
+/// Byte-wise bitwise op on two strings. `longer` = result spans the longer
+/// operand (for `|`); otherwise the shorter (for `&`/`^`).
+fn str_bitwise(l: &Value, r: &Value, op: fn(u8, u8) -> u8, longer: bool) -> Value {
+    let a = to_bytes(l);
+    let b = to_bytes(r);
+    let n = if longer { a.len().max(b.len()) } else { a.len().min(b.len()) };
+    let mut out = vec![0u8; n];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = op(a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+    }
+    Value::Str(out)
 }
 
 /// Binary-safe comparison returning PHP 8's -1 / 0 / 1.
