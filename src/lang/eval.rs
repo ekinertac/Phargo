@@ -54,6 +54,8 @@ pub struct Eval {
     shutdown_fns: Vec<(Value, Vec<Value>)>,
     /// Per-call argument stack, for func_get_args()/func_num_args().
     cur_args: Vec<Vec<Value>>,
+    /// Per-call function/method name stack, for __FUNCTION__/__METHOD__.
+    cur_fn: Vec<String>,
     /// xorshift RNG state for rand()/mt_rand() (deterministic; tests rarely depend
     /// on exact values, and a fixed seed keeps runs reproducible).
     rng_state: u64,
@@ -954,6 +956,7 @@ impl Eval {
             next_res_id: 1,
             shutdown_fns: Vec::new(),
             cur_args: Vec::new(),
+            cur_fn: Vec::new(),
             rng_state: 0x2545_F491_4F6C_DD1D,
             anon_names: HashMap::new(),
             enum_cases: HashMap::new(),
@@ -1672,7 +1675,21 @@ impl Eval {
                         .map(|d| d.to_string_lossy().as_bytes().to_vec())
                         .unwrap_or_default(),
                 ),
-                "__CLASS__" => Value::Str(self.current_class.clone().unwrap_or_default().into_bytes()),
+                "__CLASS__" => Value::Str(
+                    self.current_class.as_deref().map(display_class).unwrap_or_default().into_bytes(),
+                ),
+                "__FUNCTION__" => {
+                    Value::Str(self.cur_fn.last().cloned().unwrap_or_default().into_bytes())
+                }
+                "__METHOD__" => {
+                    let f = self.cur_fn.last().cloned().unwrap_or_default();
+                    let s = match &self.current_class {
+                        Some(c) if !f.is_empty() => format!("{}::{}", display_class(c), f),
+                        _ => f,
+                    };
+                    Value::Str(s.into_bytes())
+                }
+                "__NAMESPACE__" => Value::Str(Vec::new()),
                 _ => Value::Str(Vec::new()),
             },
             Expr::Unary(op, e) => {
@@ -2980,6 +2997,7 @@ impl Eval {
     fn call_closure(&mut self, c: &ClosureVal, args: Vec<Value>) -> R<Value> {
         self.enter_call()?;
         self.cur_args.push(args.clone());
+        self.cur_fn.push("{closure}".to_string());
         let mut scope = HashMap::new();
         for (k, v) in &c.captures {
             scope.insert(k.clone(), v.clone());
@@ -3004,6 +3022,7 @@ impl Eval {
             }
         };
         self.cur_args.pop();
+        self.cur_fn.pop();
         self.call_depth -= 1;
         r
     }
@@ -3053,6 +3072,7 @@ impl Eval {
     fn call_user(&mut self, f: &FuncDecl, args: Vec<Value>, byref: Option<&[Arg]>) -> R<Value> {
         self.enter_call()?;
         self.cur_args.push(args.clone());
+        self.cur_fn.push(f.name.clone());
         let mut scope = HashMap::new();
         for (i, p) in f.params.iter().enumerate() {
             if p.variadic {
@@ -3077,6 +3097,7 @@ impl Eval {
         let wb = self.capture_byref(&f.params, byref);
         self.scopes.pop();
         self.cur_args.pop();
+        self.cur_fn.pop();
         self.call_depth -= 1;
         self.apply_byref(byref, wb)?;
         r
@@ -3403,6 +3424,7 @@ impl Eval {
         };
         self.enter_call()?;
         self.cur_args.push(args.clone());
+        self.cur_fn.push(m.name.clone());
         let mut scope = HashMap::new();
         if !m.is_static {
             scope.insert("this".to_string(), recv.clone());
@@ -3430,6 +3452,7 @@ impl Eval {
         self.scopes.pop();
         self.current_class = prev_class;
         self.cur_args.pop();
+        self.cur_fn.pop();
         self.call_depth -= 1;
         self.apply_byref(byref, wb)?;
         r
@@ -3503,6 +3526,7 @@ impl Eval {
         };
         self.enter_call()?;
         self.cur_args.push(args.clone());
+        self.cur_fn.push(m.name.clone());
         let mut scope = HashMap::new();
         // a non-static method reached via parent::/self:: keeps $this
         if !m.is_static {
@@ -3518,6 +3542,7 @@ impl Eval {
         self.scopes.pop();
         self.current_class = prev_class;
         self.cur_args.pop();
+        self.cur_fn.pop();
         self.call_depth -= 1;
         self.apply_byref(byref, wb)?;
         r
