@@ -87,7 +87,7 @@ interface IteratorAggregate extends Traversable {}
 interface ArrayAccess {}
 interface Countable {}
 interface JsonSerializable {}
-class Exception {
+class Exception implements Throwable {
     protected $message = "";
     protected $code = 0;
     protected $previous = null;
@@ -104,7 +104,22 @@ class Exception {
     public function __toString() { return $this->message; }
 }
 class ErrorException extends Exception {}
-class Error extends Exception {}
+class Error implements Throwable {
+    protected $message = "";
+    protected $code = 0;
+    protected $previous = null;
+    public function __construct($message = "", $code = 0, $previous = null) {
+        $this->message = $message; $this->code = $code; $this->previous = $previous;
+    }
+    public function getMessage() { return $this->message; }
+    public function getCode() { return $this->code; }
+    public function getPrevious() { return $this->previous; }
+    public function getTrace() { return []; }
+    public function getTraceAsString() { return "#0 {main}"; }
+    public function getFile() { return ""; }
+    public function getLine() { return 0; }
+    public function __toString() { return $this->message; }
+}
 class TypeError extends Error {}
 class ValueError extends Error {}
 class ArgumentCountError extends TypeError {}
@@ -3220,6 +3235,52 @@ impl Eval {
         String::new()
     }
 
+    /// The topmost ancestor declaring `method` with non-private visibility — PHP's
+    /// "prototype" used for protected-access checks.
+    fn method_prototype(&self, class: &str, method: &str) -> String {
+        let mut proto = class.to_string();
+        for c in self.ancestry(class) {
+            if let Some(m) = c.methods.iter().find(|m| m.name.eq_ignore_ascii_case(method)) {
+                if m.visibility != Visibility::Private {
+                    proto = c.name.clone();
+                }
+            }
+        }
+        proto
+    }
+
+    fn same_hierarchy(&self, a: &str, b: &str) -> bool {
+        a.eq_ignore_ascii_case(b) || self.is_subclass(a, b) || self.is_subclass(b, a)
+    }
+
+    /// Check method visibility from the current scope. Returns the PHP error
+    /// message if the call is NOT allowed, else None. `called_class` is the class
+    /// as written at the call site (used in the message).
+    fn vis_error(&self, vis: Visibility, decl_class: &str, called_class: &str, method: &str) -> Option<String> {
+        let allowed = match vis {
+            Visibility::Public => true,
+            Visibility::Private => self
+                .current_class
+                .as_deref()
+                .map_or(false, |c| c.eq_ignore_ascii_case(decl_class)),
+            Visibility::Protected => {
+                let proto = self.method_prototype(decl_class, method);
+                self.current_class
+                    .as_deref()
+                    .map_or(false, |c| self.same_hierarchy(c, &proto))
+            }
+        };
+        if allowed {
+            return None;
+        }
+        let vis_word = if vis == Visibility::Private { "private" } else { "protected" };
+        let scope = match &self.current_class {
+            Some(c) => format!("scope {}", display_class(c)),
+            None => "global scope".to_string(),
+        };
+        Some(format!("Call to {vis_word} method {called_class}::{method}() from {scope}"))
+    }
+
     fn is_subclass(&self, class: &str, target: &str) -> bool {
         let t = target.to_ascii_lowercase();
         for c in self.ancestry(class) {
@@ -3313,6 +3374,18 @@ impl Eval {
                 return Err(RunError(format!("call to undefined method {class}::{method}()")));
             }
         };
+        // Visibility: an inaccessible method routes to __call if present, else errors.
+        if let Some(msg) = self.vis_error(m.visibility, &decl_class, &display_class(&class), method) {
+            if let Some((dc, cm)) = self.find_method(&class, "__call") {
+                let mut a = Arr::new();
+                for v in args {
+                    a.push(v);
+                }
+                let cargs = vec![Value::Str(method.as_bytes().to_vec()), Value::Array(a)];
+                return self.invoke_method(recv, &dc, &cm, cargs, None);
+            }
+            return Err(self.throw_error("Error", &msg));
+        }
         self.invoke_method(recv, &decl_class, &m, args, byref)
     }
 
@@ -3412,6 +3485,18 @@ impl Eval {
             Some(x) => x,
             None => return Err(RunError(format!("call to undefined method {class}::{method}()"))),
         };
+        // Visibility: an inaccessible static method routes to __callStatic, else errors.
+        if let Some(msg) = self.vis_error(m.visibility, &decl_class, &display_class(class), method) {
+            if let Some((dc, cm)) = self.find_method(class, "__callStatic") {
+                let mut a = Arr::new();
+                for v in args {
+                    a.push(v);
+                }
+                let cargs = vec![Value::Str(method.as_bytes().to_vec()), Value::Array(a)];
+                return self.invoke_method(Value::Null, &dc, &cm, cargs, None);
+            }
+            return Err(self.throw_error("Error", &msg));
+        }
         let body = match &m.body {
             Some(b) => b.clone(),
             None => return Ok(Value::Null),
