@@ -567,6 +567,23 @@ class SplObjectStorage implements Countable, Iterator, ArrayAccess {
     public function getInfo() { return $this->__v[$this->__k[$this->__p]] ?? null; }
     public function next(): void { $this->__p = $this->__p + 1; }
 }
+// WeakMap/WeakReference: modelled as strong references (no GC collection), which
+// is correct for everything except tests that specifically assert collection.
+class WeakMap implements ArrayAccess, Countable, IteratorAggregate {
+    private $__k = []; private $__v = [];
+    public function offsetExists($o): bool { return isset($this->__k[spl_object_id($o)]); }
+    public function offsetGet($o): mixed { return $this->__v[spl_object_id($o)] ?? null; }
+    public function offsetSet($o, $v): void { $id = spl_object_id($o); $this->__k[$id] = $o; $this->__v[$id] = $v; }
+    public function offsetUnset($o): void { $id = spl_object_id($o); unset($this->__k[$id]); unset($this->__v[$id]); }
+    public function count(): int { return count($this->__k); }
+    public function getIterator(): Iterator { $p = []; foreach ($this->__k as $id => $o) { $p[] = $this->__v[$id]; } return new ArrayIterator($p); }
+}
+class WeakReference {
+    private $__o = null;
+    private function __construct() {}
+    public static function create($o) { $r = new WeakReference(); $r->__o = $o; return $r; }
+    public function get() { return $this->__o; }
+}
 abstract class SplHeap implements Countable, Iterator {
     protected $__h = [];
     abstract protected function compare($a, $b): int;
@@ -1466,9 +1483,32 @@ impl Eval {
                 return Ok(Flow::Return(v));
             }
             Stmt::Unset(items) => {
-                for it in items {
-                    if let Expr::Var(name) = it {
-                        self.vars().remove(name);
+                for it in items.clone() {
+                    match &it {
+                        Expr::Var(name) => {
+                            if is_superglobal(name) {
+                                self.scopes[0].remove(name);
+                            } else {
+                                self.vars().remove(name);
+                            }
+                        }
+                        Expr::Index(base, Some(idx)) => {
+                            if let Some(obj) = self.arrayaccess_obj(base, "offsetunset") {
+                                let raw = self.eval(idx)?;
+                                self.call_method(obj, "offsetUnset", vec![raw])?;
+                            } else {
+                                let key = Arr::norm_key(&self.eval(idx)?);
+                                self.unset_index(base, &key)?;
+                            }
+                        }
+                        Expr::Prop(obj, name, _) => {
+                            let o = self.eval(obj)?;
+                            let pname = self.prop_name_str(name)?;
+                            if let Value::Object(rc) = o {
+                                rc.borrow_mut().props.retain(|(k, _)| k != &pname);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -2277,6 +2317,16 @@ impl Eval {
                 }
             }
             Expr::Index(base, idx) => {
+                // ArrayAccess with an explicit offset: dispatch offsetSet with the
+                // RAW offset (norm_key would mangle object offsets, e.g. WeakMap /
+                // SplObjectStorage keyed by object identity).
+                if let Some(i) = idx {
+                    if let Some(obj) = self.arrayaccess_obj(base, "offsetset") {
+                        let raw = self.eval(i)?;
+                        self.call_method(obj, "offsetSet", vec![raw, val])?;
+                        return Ok(());
+                    }
+                }
                 // ensure base is an array, then set/append
                 let key = match idx {
                     Some(i) => Some(Arr::norm_key(&self.eval(i)?)),
@@ -2303,6 +2353,60 @@ impl Eval {
             _ => {}
         }
         Ok(())
+    }
+
+    /// If `base` resolves (cheaply) to an object implementing ArrayAccess method
+    /// `m`, return that object. Used to keep raw (possibly object) offsets for
+    /// offsetGet/offsetSet instead of normalizing them to array keys.
+    /// `unset($base[$key])` for array elements: remove the key from the array
+    /// stored under `base` (a variable, superglobal, ref, or nested index/prop).
+    fn unset_index(&mut self, base: &Expr, key: &Key) -> R<()> {
+        match base {
+            Expr::Var(name) => {
+                let scope = if is_superglobal(name) { &mut self.scopes[0] } else { self.scopes.last_mut().unwrap() };
+                match scope.get_mut(name) {
+                    Some(Value::Array(a)) => { a.remove(key); }
+                    Some(Value::Ref(cell)) => {
+                        if let Value::Array(a) = &mut *cell.borrow_mut() { a.remove(key); }
+                    }
+                    _ => {}
+                }
+            }
+            Expr::Prop(obj, name, _) => {
+                let o = self.eval(obj)?;
+                let pname = self.prop_name_str(name)?;
+                if let Value::Object(rc) = o {
+                    if let Some(Value::Array(a)) = rc.borrow_mut().get_mut(&pname) {
+                        a.remove(key);
+                    }
+                }
+            }
+            Expr::Index(inner, Some(iidx)) => {
+                // nested $a[x][y]: read-modify-write the inner container
+                let ikey = Arr::norm_key(&self.eval(iidx)?);
+                let mut cur = self.eval(base).unwrap_or(Value::Null);
+                if let Value::Array(a) = &mut cur {
+                    a.remove(key);
+                    self.assign_index(inner, Some(ikey), cur)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn arrayaccess_obj(&mut self, base: &Expr, m: &str) -> Option<Value> {
+        let obj = match base {
+            Expr::Var(n) if !is_superglobal(n) => self.vars().get(n).map(|v| v.deref()),
+            Expr::Prop(..) | Expr::StaticProp(..) => self.eval(base).ok(),
+            _ => None,
+        }?;
+        if let Value::Object(rc) = &obj {
+            if self.find_method(&rc.borrow().class, m).is_some() {
+                return Some(obj.clone());
+            }
+        }
+        None
     }
 
     fn assign_index(&mut self, base: &Expr, key: Option<Key>, val: Value) -> R<()> {

@@ -27,6 +27,37 @@ you would never think to write a test for.
 
 ---
 
+## 2026-06-21 — Zend grind: floats, anon classes, and the unset that wasn't
+
+**Pass rate: 2638 → 2706 (Zend area crossed 1000 passing).**
+
+With the harness honest (post-CRLF), the Zend mismatch analyzer became a precise
+to-do list. A run of core-language fixes:
+
+- **var_dump float format** — PHP uses shortest-round-trip (serialize_precision
+  -1), so `float(2834756759.123123)`, not our `float(2.83…E+9)`.
+- **Anonymous classes** — `new class {…}` was never evaluated; it fell through to
+  `NULL`. Now registered under a unique internal name (distinct anon classes don't
+  collide; stable per declaration so `instanceof` works), displayed as
+  `class@anonymous`.
+- **var_dump visibility** — `["x":protected]`, `["x":"Class":private]`, resolved
+  from the class hierarchy including constructor-promoted params.
+- **`unset($arr[$key])` did nothing.** The `unset` statement only handled plain
+  `$var` — array-element unset, ArrayAccess `offsetUnset`, and property unset were
+  all silently no-ops. This is one of the most common operations in PHP, quietly
+  missing. Fixed for all three forms.
+- **Object-keyed ArrayAccess** — `$weakmap[$obj] = …` mangled the object offset to
+  `int(0)` via key normalization on the *write* path (read was fine). So WeakMap /
+  SplObjectStorage-by-`[]` collapsed every key to one slot. Now offsets reach
+  offsetSet/offsetUnset raw. Plus WeakMap/WeakReference prelude classes.
+
+Same recurring theme as the CRLF bug: the headline features (classes, closures,
+generators) were all there, but a handful of *boring fundamentals* — unset on an
+array element, float dump precision — were missing or wrong, each quietly failing
+a swathe of tests. The unglamorous stuff is where the mid-game points live.
+
+---
+
 ## 2026-06-21 — Pushing on the Zend core, and a CRLF that hid behind everything
 
 **Pass rate: 2581 → 2638 — crossed 12%.**
