@@ -1842,7 +1842,22 @@ impl Eval {
                         break;
                     }
                 }
-                result.ok_or_else(|| RunError("UnhandledMatchError".into()))?
+                match result {
+                    Some(v) => v,
+                    None => {
+                        let disp = match &s {
+                            Value::Str(b) => format!("'{}'", String::from_utf8_lossy(b)),
+                            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => {
+                                String::from_utf8_lossy(&to_bytes(&s)).into_owned()
+                            }
+                            _ => format!("of type {}", type_name(&s)),
+                        };
+                        return Err(self.throw_error(
+                            "UnhandledMatchError",
+                            &format!("Unhandled match case {disp}"),
+                        ));
+                    }
+                }
             }
             Expr::New(class, args) => {
                 let cname = self.resolve_class_name(class)?;
@@ -2199,6 +2214,13 @@ impl Eval {
     /// reference and cloning only the final element. (Naively evaluating `base`
     /// clones the whole container on every access — O(n^2) in array-heavy loops.)
     fn read_index(&mut self, base: &Expr, idx: &Option<Box<Expr>>) -> R<Value> {
+        // $GLOBALS['x'] is a live view of the global scope.
+        if let (Expr::Var(n), Some(i)) = (base, idx) {
+            if n == "GLOBALS" {
+                let key = String::from_utf8_lossy(&to_bytes(&self.eval(i)?)).into_owned();
+                return Ok(self.scopes[0].get(&key).map(|v| v.deref()).unwrap_or(Value::Null));
+            }
+        }
         // ArrayAccess: `$expr[$k]` where the base is an object → offsetGet($k).
         // (Single level; deeper chains fall through to the array path below.)
         let base_var_obj =
@@ -2353,6 +2375,14 @@ impl Eval {
                 }
             }
             Expr::Index(base, idx) => {
+                // $GLOBALS['x'] = v writes the global-scope variable x.
+                if let (Expr::Var(n), Some(i)) = (&**base, idx) {
+                    if n == "GLOBALS" {
+                        let key = String::from_utf8_lossy(&to_bytes(&self.eval(i)?)).into_owned();
+                        self.scopes[0].insert(key, val);
+                        return Ok(());
+                    }
+                }
                 // ArrayAccess with an explicit offset: dispatch offsetSet with the
                 // RAW offset (norm_key would mangle object offsets, e.g. WeakMap /
                 // SplObjectStorage keyed by object identity).
@@ -2651,6 +2681,29 @@ impl Eval {
                     if !args.is_empty() =>
                 {
                     return self.array_byref(&name, args, &argv);
+                }
+                "settype" if args.len() >= 2 => {
+                    let ty = to_bytes(argv.get(1).unwrap_or(&Value::Null)).to_ascii_lowercase();
+                    let cur = argv.first().cloned().unwrap_or(Value::Null);
+                    let nv = match ty.as_slice() {
+                        b"int" | b"integer" => Value::Int(to_i64(&cur)),
+                        b"float" | b"double" => Value::Float(to_f64(&cur)),
+                        b"string" => Value::Str(self.stringify(&cur)?),
+                        b"bool" | b"boolean" => Value::Bool(to_bool(&cur)),
+                        b"array" => match cur {
+                            Value::Array(_) => cur,
+                            Value::Null => Value::Array(Arr::new()),
+                            v => {
+                                let mut a = Arr::new();
+                                a.push(v);
+                                Value::Array(a)
+                            }
+                        },
+                        b"null" => Value::Null,
+                        _ => cur,
+                    };
+                    self.assign_to(&args[0].value, nv)?;
+                    return Ok(Value::Bool(true));
                 }
                 _ => {}
             }
@@ -5276,6 +5329,32 @@ impl Eval {
             "class_exists" | "interface_exists" | "trait_exists" | "enum_exists" => {
                 let n = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 Value::Bool(self.find_class(&n).is_some())
+            }
+            "get_declared_classes" | "get_declared_interfaces" | "get_declared_traits" => {
+                let want_kind = match name {
+                    "get_declared_interfaces" => ClassKind::Interface,
+                    "get_declared_traits" => ClassKind::Trait,
+                    _ => ClassKind::Class,
+                };
+                let mut arr = Arr::new();
+                let mut names: Vec<String> = self
+                    .classes
+                    .values()
+                    .filter(|c| {
+                        if name == "get_declared_classes" {
+                            matches!(c.kind, ClassKind::Class)
+                        } else {
+                            c.kind == want_kind
+                        }
+                    })
+                    .map(|c| c.name.clone())
+                    .filter(|n| !n.contains('#'))
+                    .collect();
+                names.sort();
+                for n in names {
+                    arr.push(Value::Str(n.into_bytes()));
+                }
+                Value::Array(arr)
             }
             "get_object_vars" => {
                 let mut o = Arr::new();
