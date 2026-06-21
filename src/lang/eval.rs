@@ -60,6 +60,9 @@ pub struct Eval {
     /// Enum cases are singletons: cache (class, case) -> the one shared instance
     /// so `Enum::from(x) === Enum::Case` holds (object identity).
     enum_cases: HashMap<(String, String), Value>,
+    /// Anonymous classes: map a `new class {…}` decl's address to its assigned
+    /// unique internal name (stable across re-evaluations, so instanceof works).
+    anon_names: HashMap<usize, String>,
     /// Active generator collection buffer (eager generators collect yields here).
     gen_buf: Option<Arr>,
     /// Total node count accumulated into the active generator buffer. Capped so
@@ -920,6 +923,7 @@ impl Eval {
             shutdown_fns: Vec::new(),
             cur_args: Vec::new(),
             rng_state: 0x2545_F491_4F6C_DD1D,
+            anon_names: HashMap::new(),
             enum_cases: HashMap::new(),
             gen_buf: None,
             gen_nodes: 0,
@@ -1770,6 +1774,22 @@ impl Eval {
             }
             Expr::New(class, args) => {
                 let cname = self.resolve_class_name(class)?;
+                let argv = self.eval_args(args)?;
+                self.instantiate(&cname, argv)?
+            }
+            Expr::NewAnon(decl, args) => {
+                let ptr = &**decl as *const ClassDecl as usize;
+                let cname = match self.anon_names.get(&ptr) {
+                    Some(n) => n.clone(),
+                    None => {
+                        let n = format!("class@anonymous#{}", self.anon_names.len());
+                        self.anon_names.insert(ptr, n.clone());
+                        let mut cd = (**decl).clone();
+                        cd.name = n.clone();
+                        self.classes.insert(n.to_ascii_lowercase(), Rc::new(cd));
+                        n
+                    }
+                };
                 let argv = self.eval_args(args)?;
                 self.instantiate(&cname, argv)?
             }
@@ -4983,9 +5003,9 @@ impl Eval {
             }
             // ---- class / object introspection ----
             "get_class" => match a(0) {
-                Value::Object(rc) => Value::Str(rc.borrow().class.clone().into_bytes()),
+                Value::Object(rc) => Value::Str(display_class(&rc.borrow().class).into_bytes()),
                 _ => match &self.current_class {
-                    Some(c) => Value::Str(c.clone().into_bytes()),
+                    Some(c) => Value::Str(display_class(c).into_bytes()),
                     None => Value::Bool(false),
                 },
             },
@@ -6170,6 +6190,15 @@ fn read_index_value(base: &Value, keys: &[Key]) -> Value {
     v.clone()
 }
 
+/// The user-visible class name: anonymous classes are registered under a unique
+/// internal name like `class@anonymous#3` but display as `class@anonymous`.
+fn display_class(name: &str) -> String {
+    match name.split_once('#') {
+        Some((base, _)) => base.to_string(),
+        None => name.to_string(),
+    }
+}
+
 /// PHP superglobals resolve to the global scope from any function scope.
 fn is_superglobal(name: &str) -> bool {
     matches!(
@@ -6378,7 +6407,7 @@ fn var_dump_seen(v: &Value, indent: usize, out: &mut String, seen: &mut Vec<usiz
         Value::Null => out.push_str(&format!("{pad}NULL\n")),
         Value::Bool(b) => out.push_str(&format!("{pad}bool({})\n", if *b { "true" } else { "false" })),
         Value::Int(n) => out.push_str(&format!("{pad}int({n})\n")),
-        Value::Float(f) => out.push_str(&format!("{pad}float({})\n", format_float(*f))),
+        Value::Float(f) => out.push_str(&format!("{pad}float({})\n", dump_float(*f))),
         Value::Str(s) => out.push_str(&format!(
             "{pad}string({}) \"{}\"\n",
             s.len(),
@@ -6409,7 +6438,7 @@ fn var_dump_seen(v: &Value, indent: usize, out: &mut String, seen: &mut Vec<usiz
                 out.push_str(&format!("{pad}resource({rid}) of type (stream)\n"));
                 return;
             }
-            out.push_str(&format!("{pad}object({})#1 ({}) {{\n", ob.class, ob.props.len()));
+            out.push_str(&format!("{pad}object({})#1 ({}) {{\n", display_class(&ob.class), ob.props.len()));
             seen.push(id);
             for (k, val) in &ob.props {
                 out.push_str(&format!("{pad}  [\"{k}\"]=>\n"));
@@ -6690,6 +6719,32 @@ fn ser_float(f: f64) -> String {
         if f < 0.0 { "-INF".into() } else { "INF".into() }
     } else {
         format!("{f}") // Rust's default is shortest round-trip
+    }
+}
+
+/// var_dump / var_export float format: PHP uses serialize_precision -1 (shortest
+/// round-trippable), with `E` notation for very large/small magnitudes.
+fn dump_float(f: f64) -> String {
+    if f.is_nan() {
+        return "NAN".into();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-INF".into() } else { "INF".into() };
+    }
+    if f == 0.0 {
+        return if f.is_sign_negative() { "-0".into() } else { "0".into() };
+    }
+    let a = f.abs();
+    if a >= 1e15 || a < 1e-4 {
+        let s = format!("{f:e}"); // e.g. "1e20", "2.5e-5"
+        if let Some((mant, exp)) = s.split_once('e') {
+            let mant = if mant.contains('.') { mant.to_string() } else { format!("{mant}.0") };
+            let n: i64 = exp.parse().unwrap_or(0);
+            return format!("{mant}E{}{}", if n >= 0 { "+" } else { "-" }, n.abs());
+        }
+        s
+    } else {
+        format!("{f}")
     }
 }
 

@@ -4,13 +4,13 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 2638 / 21862  (12.07% of the entire PHP test suite)**
+**`.phpt` pass rate: 2673 / 21862  (12.23% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 12.10%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21796): 12.26%. The 66 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 2638 | 19158 | 66 | 21862 |
+| 2673 | 19123 | 66 | 21862 |
 
 _Curated smoke tests (dev guards, **not** in the number above): 76/93 passing._
 
@@ -18,13 +18,13 @@ _Curated smoke tests (dev guards, **not** in the number above): 76/93 passing._
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 970 | 5329 | 18.2% |
-| `ext/standard` | 599 | 3877 | 15.5% |
-| `ext/opcache` | 405 | 916 | 44.2% |
+| `Zend` | 984 | 5329 | 18.5% |
+| `ext/standard` | 615 | 3877 | 15.9% |
+| `ext/opcache` | 407 | 916 | 44.4% |
 | `core` | 179 | 868 | 20.6% |
 | `ext/dom` | 41 | 868 | 4.7% |
 | `ext/spl` | 92 | 796 | 11.6% |
-| `ext/date` | 68 | 689 | 9.9% |
+| `ext/date` | 69 | 689 | 10.0% |
 | `ext/soap` | 0 | 593 | 0.0% |
 | `ext/phar` | 13 | 574 | 2.3% |
 | `ext/reflection` | 49 | 519 | 9.4% |
@@ -46,14 +46,14 @@ _Curated smoke tests (dev guards, **not** in the number above): 76/93 passing._
 | `ext/ldap` | 0 | 140 | 0.0% |
 | `ext/pdo` | 0 | 127 | 0.0% |
 | `ext/sockets` | 0 | 123 | 0.0% |
-| `ext/filter` | 18 | 120 | 15.0% |
+| `ext/filter` | 19 | 120 | 15.8% |
 | `ext/zip` | 2 | 118 | 1.7% |
 | `sapi/cli` | 1 | 114 | 0.9% |
 | `ext/ffi` | 0 | 105 | 0.0% |
 | `ext/pgsql` | 0 | 102 | 0.0% |
 | `ext/gmp` | 0 | 101 | 0.0% |
 | `ext/exif` | 5 | 99 | 5.1% |
-| `ext/json` | 14 | 98 | 14.3% |
+| `ext/json` | 15 | 98 | 15.3% |
 | `ext/sqlite3` | 0 | 97 | 0.0% |
 | `ext/pdo_sqlite` | 1 | 86 | 1.2% |
 | `ext/xsl` | 0 | 81 | 0.0% |

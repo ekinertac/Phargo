@@ -65,9 +65,11 @@ fn scan() {
                 continue;
             }
         };
+        let expect = expect.replace("\r\n", "\n").replace('\r', "\n");
         let res = std::panic::catch_unwind(|| phargo::run(&code));
         match res {
             Ok(Ok(out)) => {
+                let out = out.replace("\r\n", "\n").replace('\r', "\n");
                 if out.trim_end() == expect.trim_end() {
                     pass += 1;
                 } else {
