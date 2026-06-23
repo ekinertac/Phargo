@@ -936,6 +936,9 @@ const MAX_STR: usize = 64 * 1024 * 1024;
 const MAX_RANGE: usize = 8_000_000;
 /// Cap on total nodes in a single array value (memory-bomb guard).
 const MAX_ARRAY_NODES: usize = 4_000_000;
+/// Cap on total program output — stops runaway echo/var_dump loops (real tests
+/// compare a small EXPECT block, so 32 MB is far above any legitimate output).
+const MAX_OUTPUT: usize = 32 * 1024 * 1024;
 
 impl Eval {
     pub fn new() -> Self {
@@ -988,11 +991,17 @@ impl Eval {
 
     /// Register the exception/error hierarchy (parsed from PRELUDE).
     fn load_prelude(&mut self) {
-        if let Ok(toks) = super::lexer::Lexer::tokenize(PRELUDE) {
-            if let Ok(stmts) = super::parser::Parser::parse(toks) {
-                self.hoist(&stmts);
-            }
+        // The prelude is identical for every run, but the scoreboard creates a
+        // fresh Eval per test (~22k). Lexing+parsing this large prelude each time
+        // dominated runtime, so parse it once per thread and just re-hoist (which
+        // only clones ClassDecls into Rc) from the cached AST.
+        thread_local! {
+            static PRELUDE_AST: Vec<Stmt> = super::lexer::Lexer::tokenize(PRELUDE)
+                .ok()
+                .and_then(|toks| super::parser::Parser::parse(toks).ok())
+                .unwrap_or_default();
         }
+        PRELUDE_AST.with(|ast| self.hoist(ast));
     }
 
     /// Run a parsed program and return everything it printed.
@@ -1276,6 +1285,13 @@ impl Eval {
         self.steps += 1;
         if self.steps > STEP_LIMIT {
             return Err(RunError("step limit exceeded".into()));
+        }
+        // Runaway-output guard: a loop that echoes/var_dumps without bound (e.g.
+        // gh13178_4: var_dump in a never-terminating loop) would otherwise grind to
+        // the step limit producing gigabytes. Cap total output well above any real
+        // test (which compares a small EXPECT block).
+        if self.out.len() > MAX_OUTPUT {
+            return Err(RunError("output limit exceeded".into()));
         }
         Ok(())
     }
@@ -2223,8 +2239,14 @@ impl Eval {
         }
         // ArrayAccess: `$expr[$k]` where the base is an object → offsetGet($k).
         // (Single level; deeper chains fall through to the array path below.)
-        let base_var_obj =
-            matches!(base, Expr::Var(name) if matches!(self.vars().get(name).map(|v| v.deref()), Some(Value::Object(_))));
+        // Peek without cloning (deref-clone of a big array here is O(n) per read).
+        let base_var_obj = matches!(base, Expr::Var(name) if {
+            match self.vars().get(name) {
+                Some(Value::Object(_)) => true,
+                Some(Value::Ref(c)) => matches!(&*c.borrow(), Value::Object(_)),
+                _ => false,
+            }
+        });
         // A base that produces a value (property/method/call result) may be an
         // ArrayAccess object (e.g. SimpleXML `$xml->book[0]`); eval it once and
         // dispatch to offsetGet, otherwise index the produced value as an array.
@@ -2474,11 +2496,21 @@ impl Eval {
     }
 
     fn arrayaccess_obj(&mut self, base: &Expr, m: &str) -> Option<Value> {
+        // Peek WITHOUT cloning: for a variable, only clone the object Rc if the
+        // slot actually holds an object (cloning an array here would be O(n) per
+        // index assignment → O(n^2) in `$arr[$i]=…` loops).
         let obj = match base {
-            Expr::Var(n) if !is_superglobal(n) => self.vars().get(n).map(|v| v.deref()),
-            Expr::Prop(..) | Expr::StaticProp(..) => self.eval(base).ok(),
-            _ => None,
-        }?;
+            Expr::Var(n) if !is_superglobal(n) => match self.vars().get(n) {
+                Some(Value::Object(rc)) => Value::Object(rc.clone()),
+                Some(Value::Ref(cell)) => match &*cell.borrow() {
+                    Value::Object(rc) => Value::Object(rc.clone()),
+                    _ => return None,
+                },
+                _ => return None,
+            },
+            Expr::Prop(..) | Expr::StaticProp(..) => self.eval(base).ok()?,
+            _ => return None,
+        };
         if let Value::Object(rc) = &obj {
             if self.find_method(&rc.borrow().class, m).is_some() {
                 return Some(obj.clone());
@@ -2641,6 +2673,14 @@ impl Eval {
                 return Ok(Value::Str(n.last().as_bytes().to_vec()));
             }
             let name = n.last().to_ascii_lowercase();
+            // Array internal-pointer fns: dispatch BEFORE eval_args so a large
+            // array argument is never cloned into argv (O(n) per call → O(n^2)).
+            if matches!(name.as_str(), "reset" | "end" | "next" | "prev" | "current" | "pos" | "key" | "each")
+                && !args.is_empty()
+                && args[0].name.is_none()
+            {
+                return self.array_pointer(&name, args);
+            }
             let argv = self.eval_args(args)?;
             // include/require/eval need the lex->parse->exec machinery
             match name.as_str() {
@@ -2783,6 +2823,75 @@ impl Eval {
     }
 
     /// In-place array builtins: read `args[0]` as an array lvalue, mutate, assign back.
+    /// Array internal-pointer functions (reset/end/next/prev/current/key/each).
+    /// The pointer is mutated IN PLACE on the stored array when the argument is a
+    /// simple `$var` (cloning the whole array per call would be O(n^2) in loops).
+    fn array_pointer(&mut self, name: &str, args: &[Arg]) -> R<Value> {
+        // Fast path: mutate the array stored under a plain variable in place (no
+        // clone). Also covers reference-backed variables.
+        if let Expr::Var(vn) = &args[0].value {
+            if !is_superglobal(vn) {
+                match self.vars().get_mut(vn) {
+                    Some(Value::Array(a)) => return Ok(Self::array_pointer_inplace(name, a)),
+                    Some(Value::Ref(cell)) => {
+                        let cell = cell.clone();
+                        let mut b = cell.borrow_mut();
+                        if let Value::Array(a) = &mut *b {
+                            return Ok(Self::array_pointer_inplace(name, a));
+                        }
+                        return Ok(Value::Bool(false));
+                    }
+                    _ => return Ok(Value::Bool(false)),
+                }
+            }
+        }
+        // General path (property/index/superglobal base): read, mutate, write back.
+        let mut arr = match self.eval(&args[0].value)? {
+            Value::Array(a) => a,
+            _ => return Ok(Value::Bool(false)),
+        };
+        let mutate = matches!(name, "reset" | "end" | "next" | "prev" | "each");
+        let result = Self::array_pointer_inplace(name, &mut arr);
+        if mutate {
+            self.assign_to(&args[0].value, Value::Array(arr))?;
+        }
+        Ok(result)
+    }
+
+    fn array_pointer_inplace(name: &str, arr: &mut Arr) -> Value {
+        match name {
+            "reset" => arr.pos = 0,
+            "end" => arr.pos = arr.entries.len().saturating_sub(1),
+            "next" => arr.pos = arr.pos.saturating_add(1),
+            "prev" => arr.pos = if arr.pos == 0 { usize::MAX } else { arr.pos - 1 },
+            _ => {}
+        }
+        let cur = arr.entries.get(arr.pos);
+        match name {
+            "key" => match cur {
+                Some((k, _)) => akey_to_value(k),
+                None => Value::Null,
+            },
+            "each" => match cur {
+                Some((k, v)) => {
+                    let mut r = Arr::new();
+                    let kv = akey_to_value(k);
+                    r.insert(Key::Int(0), kv.clone());
+                    r.insert(Key::Str(b"key".to_vec()), kv);
+                    r.insert(Key::Int(1), v.clone());
+                    r.insert(Key::Str(b"value".to_vec()), v.clone());
+                    arr.pos += 1;
+                    Value::Array(r)
+                }
+                None => Value::Bool(false),
+            },
+            _ => match cur {
+                Some((_, v)) => v.clone(),
+                None => Value::Bool(false),
+            },
+        }
+    }
+
     fn array_byref(&mut self, name: &str, args: &[Arg], argv: &[Value]) -> R<Value> {
         let mut arr = match self.eval(&args[0].value)? {
             Value::Array(a) => a,

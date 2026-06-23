@@ -27,6 +27,46 @@ you would never think to write a test for.
 
 ---
 
+## 2026-06-23 — "What's taking so long?" — three O(n²) holes and a prelude re-parse
+
+**Pass rate: 2766 → 2810. Scoreboard runtime: ~11 min → ~7 min.**
+
+The user asked why scoreboard runs were dragging. Good question — and chasing it
+turned up four separate performance bugs, one of which had been silently making
+every run slower for several commits.
+
+- **The prelude was re-parsed 22,000 times.** The scoreboard makes a fresh engine
+  per test, and each one lexed + parsed the entire PHP prelude (Exception/SPL/DOM/
+  SimpleXML/Reflection/…, now thousands of lines) from scratch. Cached the parsed
+  prelude AST in a `thread_local` and just re-hoist from it.
+- **`arrayaccess_obj` cloned the whole array on every `$arr[$i] = …`.** Added a
+  session or two ago to support object-keyed ArrayAccess, it called `value.deref()`
+  to check "is this an ArrayAccess object?" — and `deref()` *clones*. So every
+  index assignment cloned the entire (growing) array: O(n²). `bug40261.phpt`
+  (100k-element arrays) went from **hanging** to **265 ms** once the check learned
+  to peek at the type without cloning. This was the main culprit behind the slow
+  runs.
+- **Array internal pointers (`reset`/`next`/`current`/…) cloned twice.** First
+  `eval_args` cloned the array into the argument list before dispatch; then the
+  writeback cloned it again. A 100k-element pointer-iteration loop went from
+  **>90 s** to **70 ms** by dispatching before `eval_args` and mutating the
+  pointer in place.
+- **No output cap.** A `while(true)` that `var_dump`s (gh13178_4) would grind to
+  the 20M step limit producing gigabytes. Added a 32 MB output ceiling — a runaway
+  echo/var_dump loop now fails fast, like our other resource guards.
+
+The throughline: `.deref()` and "evaluate the argument" both *look* free but clone
+the value, and inside a loop over a growing array that's quadratic. The fix in
+every case was the same instinct as the in-place `.=` and `$arr[]=` optimizations
+from way back — touch the stored value, don't copy it. Worth re-internalizing:
+in a tree-walker with value semantics, the question is always "did I just clone a
+container in a hot path?"
+
+(Functionally this batch also *added* the array-pointer family — reset/end/next/
+prev/current/key/each — which is why the pass count rose while the clock dropped.)
+
+---
+
 ## 2026-06-21 — Zend grind: floats, anon classes, and the unset that wasn't
 
 **Pass rate: 2638 → 2706 (Zend area crossed 1000 passing).**

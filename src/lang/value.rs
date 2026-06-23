@@ -93,6 +93,8 @@ pub struct Arr {
     pub entries: Vec<(Key, Value)>,
     index: HashMap<Key, usize>,
     next_int: i64,
+    /// Internal pointer for reset()/next()/current()/key()/end()/prev().
+    pub pos: usize,
 }
 
 impl Arr {
