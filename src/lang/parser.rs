@@ -661,34 +661,52 @@ impl Parser {
     }
 
     /// Parse an optional type hint (`?Foo`, `int|string`, `\A\B`, `Foo&Bar`),
-    /// returning its text. Stops before a `$var`, `&$var`, `...`, or `)`.
+    /// returning its text. Stops before a `$var`, `&$var`, `...`, `)`, or a bare
+    /// following identifier (e.g. the NAME in `const int NAME = …`). A type is a
+    /// sequence of name-segments joined by `|`/`&`; two bare identifiers in a row
+    /// end the type (the second begins the next grammar element).
     fn parse_type_opt(&mut self) -> Option<String> {
         let mut t = String::new();
         if matches!(self.kind(), Kind::Question) {
             self.bump();
             t.push('?');
         }
-        // a type starts with an identifier or `\`
         if !matches!(self.kind(), Kind::Ident(_) | Kind::Backslash) {
             return if t.is_empty() { None } else { Some(t) };
         }
         loop {
-            match self.kind().clone() {
-                Kind::Ident(s) => {
+            // one segment: leading `\`, then Name(\Name)*
+            let mut got = false;
+            while matches!(self.kind(), Kind::Backslash) {
+                t.push('\\');
+                self.bump();
+            }
+            loop {
+                if let Kind::Ident(s) = self.kind().clone() {
                     t.push_str(&s);
                     self.bump();
+                    got = true;
+                } else {
+                    break;
                 }
-                Kind::Backslash => {
+                if matches!(self.kind(), Kind::Backslash) {
                     t.push('\\');
                     self.bump();
+                } else {
+                    break;
                 }
+            }
+            if !got {
+                break;
+            }
+            // a `|` or `&` continues into another segment; anything else ends the type
+            match self.kind() {
                 Kind::Pipe => {
-                    // union — but not if followed by `$`/variadic (that'd be a by-ref oddity)
                     t.push('|');
                     self.bump();
                 }
                 Kind::Amp if matches!(self.at(1), Kind::Ident(_) | Kind::Backslash) => {
-                    t.push('&'); // intersection type
+                    t.push('&');
                     self.bump();
                 }
                 _ => break,
@@ -903,8 +921,12 @@ impl Parser {
             // const
             if self.at_kw("const") {
                 self.bump();
-                // optional type before the name
-                if matches!(self.kind(), Kind::Ident(_)) && !matches!(self.at(1), Kind::Assign) {
+                // PHP 8.3 typed constants: `const TYPE NAME = …`. A type is present
+                // unless it's `NAME =` (untyped) — i.e. a `?`/`\` lead, or an
+                // identifier NOT immediately followed by `=`.
+                let typed = matches!(self.kind(), Kind::Question | Kind::Backslash)
+                    || (matches!(self.kind(), Kind::Ident(_)) && !matches!(self.at(1), Kind::Assign));
+                if typed {
                     let _ = self.parse_type_opt();
                 }
                 loop {

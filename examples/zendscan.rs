@@ -44,9 +44,11 @@ fn scan() {
     let mut files = Vec::new();
     collect(&dir, &mut files);
 
-    let filter = std::env::args().nth(1); // optional: "mismatch" | "error" | "MISS:<substr>"
+    let filter = std::env::args().nth(1); // optional: "mismatch" | "error" | "MISS:<substr>" | "ERRFILE:<substr>"
+    let errfile = filter.as_deref().and_then(|s| s.strip_prefix("ERRFILE:")).map(String::from);
     let mut err_tally: HashMap<String, usize> = HashMap::new();
     let mut miss_samples: Vec<(String, String, String)> = Vec::new(); // file, expect-head, got-head
+    let mut errfile_hits: Vec<(String, String)> = Vec::new();
     let (mut pass, mut parse_err, mut run_err, mut mismatch, mut ungradeable) = (0, 0, 0, 0, 0);
 
     for f in &files {
@@ -91,6 +93,12 @@ fn scan() {
                 } else {
                     run_err += 1;
                 }
+                if let Some(needle) = &errfile {
+                    if m.contains(needle.as_str()) && errfile_hits.len() < 25 {
+                        let name = f.strip_prefix(root).unwrap_or(f).to_string_lossy().into_owned();
+                        errfile_hits.push((name, code.replace(['\n', '\r'], " ").chars().take(160).collect()));
+                    }
+                }
                 *err_tally.entry(normalize(&m)).or_insert(0) += 1;
             }
             Err(_) => {
@@ -118,6 +126,12 @@ fn scan() {
                 if e.contains(needle) || g.contains(needle) {
                     println!("{f}\n  EXP: {e}\n  GOT: {g}");
                 }
+            }
+        }
+        Some(s) if s.starts_with("ERRFILE:") => {
+            println!("\n--- files erroring with substring ---");
+            for (f, code) in &errfile_hits {
+                println!("{f}\n  {code}");
             }
         }
         _ => {
