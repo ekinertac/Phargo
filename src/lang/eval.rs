@@ -3538,6 +3538,34 @@ impl Eval {
         args: Vec<Value>,
         byref: Option<&[Arg]>,
     ) -> R<Value> {
+        // Closure instance methods: $c->bindTo($this[, $scope]), $c->call($this, ...).
+        if let Value::Closure(c) = &recv {
+            match method.to_ascii_lowercase().as_str() {
+                "bindto" => {
+                    let nv = ClosureVal {
+                        kind: c.kind.clone_rc(),
+                        captures: c.captures.clone(),
+                        bound_this: match args.first() {
+                            Some(Value::Null) | None => None,
+                            Some(v) => Some(v.clone()),
+                        },
+                    };
+                    return Ok(Value::Closure(Rc::new(nv)));
+                }
+                "call" => {
+                    let this = args.first().cloned();
+                    let rest: Vec<Value> = args.iter().skip(1).cloned().collect();
+                    let bound = Rc::new(ClosureVal {
+                        kind: c.kind.clone_rc(),
+                        captures: c.captures.clone(),
+                        bound_this: this,
+                    });
+                    return self.call_closure(&bound, rest);
+                }
+                "__invoke" => return self.call_closure(c, args),
+                _ => return Ok(Value::Null),
+            }
+        }
         let class = match &recv {
             Value::Object(rc) => rc.borrow().class.clone(),
             _ => return Ok(Value::Null),
@@ -3628,6 +3656,33 @@ impl Eval {
         this: Option<Value>,
         byref: Option<&[Arg]>,
     ) -> R<Value> {
+        // Closure static methods: Closure::bind($c, $this[, $scope]),
+        // Closure::fromCallable($callable).
+        if class.eq_ignore_ascii_case("Closure") {
+            match method.to_ascii_lowercase().as_str() {
+                "bind" => {
+                    if let Some(Value::Closure(c)) = args.first() {
+                        let nv = ClosureVal {
+                            kind: c.kind.clone_rc(),
+                            captures: c.captures.clone(),
+                            bound_this: match args.get(1) {
+                                Some(Value::Null) | None => None,
+                                Some(v) => Some(v.clone()),
+                            },
+                        };
+                        return Ok(Value::Closure(Rc::new(nv)));
+                    }
+                    return Ok(Value::Null);
+                }
+                "fromcallable" => {
+                    let cv = args.into_iter().next().unwrap_or(Value::Null);
+                    // already a closure → return as-is; else keep the callable value
+                    // (string name / [obj,m] array) — call_value handles invocation.
+                    return Ok(cv);
+                }
+                _ => {}
+            }
+        }
         // Enum built-in static methods: cases() / from() / tryFrom().
         if let Some(c) = self.find_class(class) {
             if c.kind == ClassKind::Enum {

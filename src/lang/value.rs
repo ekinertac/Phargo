@@ -52,6 +52,16 @@ pub enum ClosureKind {
     Arrow(Rc<ast::ArrowFn>),
 }
 
+impl ClosureKind {
+    /// Cheap clone sharing the underlying Rc'd AST.
+    pub fn clone_rc(&self) -> ClosureKind {
+        match self {
+            ClosureKind::Full(f) => ClosureKind::Full(f.clone()),
+            ClosureKind::Arrow(f) => ClosureKind::Arrow(f.clone()),
+        }
+    }
+}
+
 /// A PHP object instance: a class name plus insertion-ordered properties.
 /// Objects are reference types, so `Value::Object` is an `Rc<RefCell<…>>`.
 #[derive(Debug)]
