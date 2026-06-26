@@ -106,6 +106,57 @@ fn classify(out_res: &Result<Result<String, phargo::EngineError>, ()>, expect: &
     }
 }
 
+/// Characterize a near-match: find the first differing byte and the trailing
+/// difference, return (signature, sample). The signature abstracts digits so
+/// like-shaped diffs cluster (e.g. trailing-newline, "int(N)" off-by, ".0" tail).
+fn diff_close(got: &str, expect: &str, file: &str) -> (String, String) {
+    let g = got.trim_end();
+    let e = expect.trim_end();
+    // trailing-whitespace-only difference (before trim they differ)
+    if g == e {
+        return ("trailing-whitespace-only".into(), format!("{file}\n  (whitespace/newline only)"));
+    }
+    let gb = g.as_bytes();
+    let eb = e.as_bytes();
+    let mut i = 0;
+    while i < gb.len() && i < eb.len() && gb[i] == eb[i] {
+        i += 1;
+    }
+    // common suffix
+    let mut j = 0;
+    while j < (gb.len() - i) && j < (eb.len() - i) && gb[gb.len() - 1 - j] == eb[eb.len() - 1 - j] {
+        j += 1;
+    }
+    // Work on byte slices (lossy-stringified) to stay UTF-8-safe.
+    let g_mid = String::from_utf8_lossy(&gb[i..gb.len() - j]).into_owned();
+    let e_mid = String::from_utf8_lossy(&eb[i..eb.len() - j]).into_owned();
+    let ctx_start = i.saturating_sub(12);
+    let ctx = String::from_utf8_lossy(&eb[ctx_start..i]).into_owned();
+    let sig = format!("EXP[{}] <- GOT[{}]  near: …{}", abstract_digits(&e_mid), abstract_digits(&g_mid), abstract_digits(&ctx));
+    let sample = format!(
+        "{file}\n  ctx …{}|  EXP={:?}  GOT={:?}",
+        ctx.escape_default(),
+        e_mid,
+        g_mid
+    );
+    (sig, sample)
+}
+
+fn abstract_digits(s: &str) -> String {
+    let mut out = String::new();
+    let mut last_digit = false;
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            if !last_digit { out.push('#'); }
+            last_digit = true;
+        } else {
+            out.push(c);
+            last_digit = false;
+        }
+    }
+    out.chars().take(40).collect()
+}
+
 fn normalize(m: &str) -> String {
     let mut out = String::new();
     let mut tick = false;
@@ -132,11 +183,15 @@ fn run() {
     let mut files = Vec::new();
     collect(&dir, &mut files);
 
+    let mode = std::env::args().nth(1); // "close" → dump close-mismatch diffs
+
     // area -> category -> count
     let mut by_area: HashMap<String, HashMap<&'static str, usize>> = HashMap::new();
     // category -> bucket -> count (with area split for the report)
     let mut buckets: HashMap<&'static str, HashMap<String, usize>> = HashMap::new();
     let mut cat_total: HashMap<&'static str, usize> = HashMap::new();
+    let mut close_diffs: HashMap<String, usize> = HashMap::new(); // diff signature -> count
+    let mut close_samples: Vec<String> = Vec::new();
     let mut gradeable = 0usize;
 
     for f in &files {
@@ -152,6 +207,28 @@ fn run() {
         if cat != "PASS" {
             *buckets.entry(cat).or_default().entry(bucket).or_insert(0) += 1;
         }
+        if mode.as_deref() == Some("close") && cat == "MISMATCH_CLOSE" {
+            if let Ok(Ok(got)) = &res {
+                let (sig, sample) = diff_close(&lf(got), &lf(&expect), f.strip_prefix(root).unwrap_or(f).to_string_lossy().as_ref());
+                let first = !close_diffs.contains_key(&sig);
+                *close_diffs.entry(sig.clone()).or_insert(0) += 1;
+                // one sample per distinct signature (spread across clusters)
+                if first && close_samples.len() < 60 {
+                    close_samples.push(format!("[{sig}]\n{sample}"));
+                }
+            }
+        }
+    }
+
+    if mode.as_deref() == Some("close") {
+        println!("=== MISMATCH_CLOSE diff signatures (total {}) ===", cat_total.get("MISMATCH_CLOSE").unwrap_or(&0));
+        let mut v: Vec<_> = close_diffs.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        for (k, n) in v.into_iter().take(30) { println!("{:>5}  {k}", n); }
+        println!("\n=== samples (EXP vs GOT, first divergence) ===");
+        for s in &close_samples { println!("{s}"); }
+        println!("\ndone");
+        return;
     }
 
     println!("=== GRADEABLE TESTS: {gradeable} ===\n");
