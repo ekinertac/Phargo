@@ -62,15 +62,42 @@ impl ClosureKind {
     }
 }
 
+thread_local! {
+    /// Monotonic object-id counter (PHP assigns sequential handles at creation).
+    /// Reset per run via `reset_object_ids()`.
+    static NEXT_OBJ_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+/// Reset the object-id counter — call at the start of each run so the scoreboard
+/// (which reuses the worker thread across tests) numbers each test from #1.
+pub fn reset_object_ids() {
+    NEXT_OBJ_ID.with(|c| c.set(1));
+}
+
+fn next_object_id() -> u64 {
+    NEXT_OBJ_ID.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        id
+    })
+}
+
 /// A PHP object instance: a class name plus insertion-ordered properties.
 /// Objects are reference types, so `Value::Object` is an `Rc<RefCell<…>>`.
 #[derive(Debug)]
 pub struct Obj {
     pub class: String,
     pub props: Vec<(String, Value)>,
+    /// Sequential instance id (the `#N` shown by var_dump), assigned at creation.
+    pub id: u64,
 }
 
 impl Obj {
+    /// Create an empty instance of `class`, assigning the next sequential id.
+    pub fn new(class: impl Into<String>) -> Obj {
+        Obj { class: class.into(), props: Vec::new(), id: next_object_id() }
+    }
+
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.props.iter().find(|(k, _)| k == name).map(|(_, v)| v)
     }
@@ -87,7 +114,7 @@ impl Obj {
 }
 
 pub fn new_obj(class: &str) -> Value {
-    Value::Object(Rc::new(RefCell::new(Obj { class: class.to_string(), props: Vec::new() })))
+    Value::Object(Rc::new(RefCell::new(Obj::new(class))))
 }
 
 /// Array key: PHP normalizes integer-like string keys to ints.

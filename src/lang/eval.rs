@@ -1199,6 +1199,9 @@ impl Eval {
         for sg in ["_SERVER", "_GET", "_POST", "_REQUEST", "_SESSION", "_COOKIE", "_ENV", "_FILES", "GLOBALS"] {
             e.scopes[0].insert(sg.to_string(), Value::Array(Arr::new()));
         }
+        // Internal setup (prelude classes, std streams) is done; number the user
+        // program's objects from #1, as PHP does.
+        super::value::reset_object_ids();
         e.hoist(program);
         match e.exec_block(program) {
             Ok(_) => {
@@ -2205,7 +2208,7 @@ impl Eval {
             CastType::Object => match v {
                 Value::Object(_) | Value::Closure(_) => v,
                 Value::Array(a) => {
-                    let mut o = Obj { class: "stdClass".into(), props: Vec::new() };
+                    let mut o = Obj::new("stdClass");
                     for (k, val) in a.entries {
                         let name = match k {
                             Key::Int(n) => n.to_string(),
@@ -2217,7 +2220,7 @@ impl Eval {
                 }
                 Value::Null => new_obj("stdClass"),
                 other => {
-                    let o = Rc::new(RefCell::new(Obj { class: "stdClass".into(), props: Vec::new() }));
+                    let o = Rc::new(RefCell::new(Obj::new("stdClass")));
                     o.borrow_mut().set("scalar", other);
                     Value::Object(o)
                 }
@@ -3220,7 +3223,7 @@ impl Eval {
         for (k, _) in &buf.entries {
             karr.push(akey_to_value(k));
         }
-        let o = Rc::new(RefCell::new(Obj { class: "Generator".into(), props: Vec::new() }));
+        let o = Rc::new(RefCell::new(Obj::new("Generator")));
         {
             let mut b = o.borrow_mut();
             b.set("__d", Value::Array(buf));
@@ -3503,7 +3506,7 @@ impl Eval {
             Some(d) => d,
             None => return Err(RunError(format!("class {class} not found"))),
         };
-        let obj = Rc::new(RefCell::new(Obj { class: decl.name.clone(), props: Vec::new() }));
+        let obj = Rc::new(RefCell::new(Obj::new(decl.name.clone())));
         // initialize declared (instance) properties from the whole hierarchy,
         // base-most first so overrides win.
         let chain = self.ancestry(class);
@@ -3838,7 +3841,7 @@ impl Eval {
                         return Ok(v.clone());
                     }
                     // model an enum case as an object with `name` (+ `value`)
-                    let obj = Rc::new(RefCell::new(Obj { class: c.name.clone(), props: Vec::new() }));
+                    let obj = Rc::new(RefCell::new(Obj::new(c.name.clone())));
                     obj.borrow_mut().set("name", Value::Str(name.as_bytes().to_vec()));
                     if let Some(ec) = c.cases.iter().find(|e| e.name == name) {
                         if let Some(v) = &ec.value.clone() {
@@ -4076,7 +4079,8 @@ impl Eval {
             },
             "spl_object_id" | "spl_object_hash" => match a(0) {
                 Value::Object(rc) => {
-                    let id = Rc::as_ptr(&rc) as *const () as usize as i64;
+                    // Use the sequential instance id so it matches var_dump's #N.
+                    let id = rc.borrow().id as i64;
                     if name == "spl_object_hash" {
                         Value::Str(format!("{id:032x}").into_bytes())
                     } else {
@@ -6947,7 +6951,7 @@ fn var_dump_seen(ev: &Eval, v: &Value, indent: usize, out: &mut String, seen: &m
                 out.push_str(&format!("{pad}resource({rid}) of type (stream)\n"));
                 return;
             }
-            out.push_str(&format!("{pad}object({})#1 ({}) {{\n", display_class(&ob.class), ob.props.len()));
+            out.push_str(&format!("{pad}object({})#{} ({}) {{\n", display_class(&ob.class), ob.id, ob.props.len()));
             seen.push(id);
             for (k, val) in &ob.props {
                 out.push_str(&format!("{pad}  [\"{k}\"{}]=>\n", ev.prop_annotation(&ob.class, k)));
@@ -7345,7 +7349,7 @@ fn php_unserialize(b: &[u8], pos: &mut usize, depth: usize) -> Option<Value> {
                 return None;
             }
             *pos += 1; // {
-            let obj = Rc::new(RefCell::new(Obj { class, props: Vec::new() }));
+            let obj = Rc::new(RefCell::new(Obj::new(class)));
             for _ in 0..n {
                 let k = php_unserialize(b, pos, depth + 1)?;
                 let v = php_unserialize(b, pos, depth + 1)?;
@@ -7609,7 +7613,7 @@ fn finish_obj(arr: Arr, assoc: bool) -> Option<Value> {
     if assoc {
         Some(Value::Array(arr))
     } else {
-        let o = Rc::new(RefCell::new(Obj { class: "stdClass".into(), props: Vec::new() }));
+        let o = Rc::new(RefCell::new(Obj::new("stdClass")));
         for (k, v) in arr.entries {
             let name = match k {
                 Key::Int(n) => n.to_string(),
