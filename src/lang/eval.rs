@@ -4618,6 +4618,29 @@ impl Eval {
             "levenshtein" => {
                 Value::Int(levenshtein(&to_bytes(&a(0)), &to_bytes(&a(1))) as i64)
             }
+            "strip_tags" => {
+                // Remove `<...>` tags (and `<?...?>`/comments). `allowed` (2nd arg,
+                // string like "<a><b>" or array of names) preserves those tags.
+                let s = to_bytes(&a(0));
+                let allowed: Vec<Vec<u8>> = match a(1) {
+                    Value::Str(spec) => {
+                        let lower = spec.to_ascii_lowercase();
+                        let mut v = Vec::new();
+                        let mut cur = Vec::new();
+                        for &b in &lower {
+                            match b {
+                                b'<' => cur.clear(),
+                                b'>' => { if !cur.is_empty() { v.push(std::mem::take(&mut cur)); } }
+                                _ => cur.push(b),
+                            }
+                        }
+                        v
+                    }
+                    Value::Array(arr) => arr.entries.iter().map(|(_, v)| to_bytes(v).to_ascii_lowercase()).collect(),
+                    _ => Vec::new(),
+                };
+                Value::Str(strip_tags(&s, &allowed))
+            }
             "wordwrap" => {
                 let s = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 let width = if args.len() > 1 { to_i64(&a(1)).max(1) as usize } else { 75 };
@@ -5043,6 +5066,37 @@ impl Eval {
                 }
                 Value::Array(out)
             }
+            "array_merge_recursive" => {
+                let mut out = Arr::new();
+                for v in &args {
+                    if let Value::Array(arr) = v {
+                        merge_recursive(&mut out, arr);
+                    }
+                }
+                Value::Array(out)
+            }
+            "array_chunk" => {
+                let size = to_i64(&a(1)).max(1) as usize;
+                let preserve = to_bool(&a(2));
+                let mut out = Arr::new();
+                if let Value::Array(arr) = a(0) {
+                    let mut chunk = Arr::new();
+                    for (k, v) in arr.entries {
+                        if preserve {
+                            chunk.insert(k, v);
+                        } else {
+                            chunk.push(v);
+                        }
+                        if chunk.len() == size {
+                            out.push(Value::Array(std::mem::take(&mut chunk)));
+                        }
+                    }
+                    if !chunk.is_empty() {
+                        out.push(Value::Array(chunk));
+                    }
+                }
+                Value::Array(out)
+            }
             "array_reverse" => {
                 let preserve = to_bool(&a(1));
                 let mut out = Arr::new();
@@ -5323,6 +5377,23 @@ impl Eval {
                 let n = s.len();
                 self.out.extend_from_slice(&s);
                 Value::Int(n as i64)
+            }
+            "vsprintf" | "vprintf" => {
+                // format + an array of args → flatten to a sprintf arg list
+                let mut sa = vec![a(0)];
+                if let Value::Array(arr) = a(1) {
+                    for (_, v) in arr.entries {
+                        sa.push(v);
+                    }
+                }
+                let s = self.sprintf(&sa);
+                if name == "vprintf" {
+                    let n = s.len();
+                    self.out.extend_from_slice(&s);
+                    Value::Int(n as i64)
+                } else {
+                    Value::Str(s)
+                }
             }
             "define" => {
                 if let Value::Str(n) = a(0) {
@@ -6654,6 +6725,7 @@ fn is_known_builtin(n: &str) -> bool {
         n,
         "strlen" | "count" | "var_dump" | "print_r" | "implode" | "explode" | "sprintf"
             | "printf" | "in_array" | "array_keys" | "array_values" | "array_merge" | "range"
+            | "vsprintf" | "vprintf" | "array_chunk" | "array_merge_recursive" | "strip_tags"
     )
 }
 
@@ -6772,6 +6844,86 @@ fn str_bitwise(l: &Value, r: &Value, op: fn(u8, u8) -> u8, longer: bool) -> Valu
         *slot = op(a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
     }
     Value::Str(out)
+}
+
+/// array_merge_recursive: integer keys append; string keys merge, and when both
+/// sides hold a value under the same string key, they combine into an array.
+fn merge_recursive(out: &mut Arr, src: &Arr) {
+    for (k, v) in &src.entries {
+        match k {
+            Key::Int(_) => out.push(v.clone()),
+            Key::Str(_) => {
+                if let Some(existing) = out.get(k).cloned() {
+                    let combined = match (existing, v.clone()) {
+                        (Value::Array(mut a), Value::Array(b)) => {
+                            merge_recursive(&mut a, &b);
+                            Value::Array(a)
+                        }
+                        (Value::Array(mut a), other) => {
+                            a.push(other);
+                            Value::Array(a)
+                        }
+                        (first, Value::Array(b)) => {
+                            let mut a = Arr::new();
+                            a.push(first);
+                            merge_recursive(&mut a, &b);
+                            Value::Array(a)
+                        }
+                        (first, second) => {
+                            let mut a = Arr::new();
+                            a.push(first);
+                            a.push(second);
+                            Value::Array(a)
+                        }
+                    };
+                    out.insert(k.clone(), combined);
+                } else {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Remove markup tags from `s`, keeping any in `allowed` (lowercased tag names).
+/// Also strips `<?…?>` and `<!--…-->`.
+fn strip_tags(s: &[u8], allowed: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    let n = s.len();
+    while i < n {
+        if s[i] == b'<' {
+            // PHP/ASP/comment blocks: drop entirely
+            if s[i + 1..].starts_with(b"?") {
+                i = find_bytes(s, b"?>", i).map(|p| p + 2).unwrap_or(n);
+                continue;
+            }
+            if s[i + 1..].starts_with(b"!--") {
+                i = find_bytes(s, b"-->", i).map(|p| p + 3).unwrap_or(n);
+                continue;
+            }
+            // a tag: <name ...> or </name>
+            let end = match find_bytes(s, b">", i) {
+                Some(e) => e,
+                None => { out.push(s[i]); i += 1; continue; }
+            };
+            let inner = &s[i + 1..end];
+            let name_start = if inner.first() == Some(&b'/') { 1 } else { 0 };
+            let name: Vec<u8> = inner[name_start..]
+                .iter()
+                .take_while(|b| b.is_ascii_alphanumeric())
+                .map(|b| b.to_ascii_lowercase())
+                .collect();
+            if allowed.iter().any(|a| a == &name) {
+                out.extend_from_slice(&s[i..=end]);
+            }
+            i = end + 1;
+        } else {
+            out.push(s[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Binary-safe comparison returning PHP 8's -1 / 0 / 1.
