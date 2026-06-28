@@ -2725,6 +2725,9 @@ impl Eval {
                 {
                     return self.array_byref(&name, args, &argv);
                 }
+                "array_multisort" if !args.is_empty() => {
+                    return self.array_multisort(args, &argv);
+                }
                 "settype" if args.len() >= 2 => {
                     let ty = to_bytes(argv.get(1).unwrap_or(&Value::Null)).to_ascii_lowercase();
                     let cur = argv.first().cloned().unwrap_or(Value::Null);
@@ -2893,6 +2896,56 @@ impl Eval {
                 None => Value::Bool(false),
             },
         }
+    }
+
+    /// array_multisort($a1[, dir][, flags], $a2, …): sort the arrays in parallel
+    /// by the first column, then successive columns as tie-breakers. Integer
+    /// arguments between arrays are SORT_ASC(4)/SORT_DESC(3)/flags — we honor the
+    /// direction. Each array argument is written back (by reference).
+    fn array_multisort(&mut self, args: &[Arg], argv: &[Value]) -> R<Value> {
+        // Collect (arg-index, entries, descending) for each array column.
+        struct Col { arg_idx: usize, vals: Vec<Value>, desc: bool }
+        let mut cols: Vec<Col> = Vec::new();
+        let mut i = 0;
+        while i < argv.len() {
+            if let Value::Array(a) = &argv[i] {
+                let vals: Vec<Value> = a.entries.iter().map(|(_, v)| v.clone()).collect();
+                let mut desc = false;
+                // following ints are direction/flags for THIS column
+                let mut j = i + 1;
+                while j < argv.len() && matches!(argv[j], Value::Int(_)) {
+                    if to_i64(&argv[j]) == 3 { desc = true; } // SORT_DESC
+                    j += 1;
+                }
+                cols.push(Col { arg_idx: i, vals, desc });
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        if cols.is_empty() {
+            return Ok(Value::Bool(false));
+        }
+        let n = cols[0].vals.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&x, &y| {
+            for c in &cols {
+                if x >= c.vals.len() || y >= c.vals.len() { continue; }
+                let mut o = compare(&c.vals[x], &c.vals[y]);
+                if c.desc { o = o.reverse(); }
+                if o != std::cmp::Ordering::Equal { return o; }
+            }
+            std::cmp::Ordering::Equal
+        });
+        // Reorder each array by `order`, reindexed 0..n, and write back.
+        for c in &cols {
+            let mut out = Arr::new();
+            for &k in &order {
+                if let Some(v) = c.vals.get(k) { out.push(v.clone()); }
+            }
+            self.assign_to(&args[c.arg_idx].value, Value::Array(out))?;
+        }
+        Ok(Value::Bool(true))
     }
 
     fn array_byref(&mut self, name: &str, args: &[Arg], argv: &[Value]) -> R<Value> {
@@ -4617,6 +4670,133 @@ impl Eval {
             }
             "levenshtein" => {
                 Value::Int(levenshtein(&to_bytes(&a(0)), &to_bytes(&a(1))) as i64)
+            }
+            "htmlspecialchars" | "htmlentities" => {
+                // ASCII entity-encode; flags default ENT_QUOTES|ENT_HTML401 (PHP 8.1+).
+                let s = to_bytes(&a(0));
+                let flags = if args.len() > 1 { to_i64(&a(1)) } else { 11 };
+                let dq = flags & 2 != 0;
+                let sq = flags & 1 != 0;
+                let mut out = Vec::with_capacity(s.len());
+                for &b in &s {
+                    match b {
+                        b'&' => out.extend_from_slice(b"&amp;"),
+                        b'<' => out.extend_from_slice(b"&lt;"),
+                        b'>' => out.extend_from_slice(b"&gt;"),
+                        b'"' if dq => out.extend_from_slice(b"&quot;"),
+                        b'\'' if sq => out.extend_from_slice(b"&#039;"),
+                        _ => out.push(b),
+                    }
+                }
+                Value::Str(out)
+            }
+            "htmlspecialchars_decode" | "html_entity_decode" => {
+                let s = to_bytes(&a(0));
+                Value::Str(decode_html_entities(&s))
+            }
+            "urlencode" | "rawurlencode" => {
+                let s = to_bytes(&a(0));
+                let raw = name == "rawurlencode";
+                let mut out = Vec::with_capacity(s.len());
+                for &b in &s {
+                    if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
+                        || (raw && b == b'~')
+                    {
+                        out.push(b);
+                    } else if b == b' ' && !raw {
+                        out.push(b'+');
+                    } else {
+                        out.extend_from_slice(format!("%{b:02X}").as_bytes());
+                    }
+                }
+                Value::Str(out)
+            }
+            "urldecode" | "rawurldecode" => {
+                let s = to_bytes(&a(0));
+                let plus = name == "urldecode";
+                let mut out = Vec::with_capacity(s.len());
+                let mut i = 0;
+                while i < s.len() {
+                    match s[i] {
+                        b'%' if i + 2 < s.len() => {
+                            let hi = (s[i + 1] as char).to_digit(16);
+                            let lo = (s[i + 2] as char).to_digit(16);
+                            if let (Some(h), Some(l)) = (hi, lo) {
+                                out.push((h * 16 + l) as u8);
+                                i += 3;
+                                continue;
+                            }
+                            out.push(s[i]);
+                            i += 1;
+                        }
+                        b'+' if plus => { out.push(b' '); i += 1; }
+                        b => { out.push(b); i += 1; }
+                    }
+                }
+                Value::Str(out)
+            }
+            "http_build_query" => {
+                let mut parts: Vec<u8> = Vec::new();
+                if let Value::Array(arr) = a(0) {
+                    for (k, v) in &arr.entries {
+                        if !parts.is_empty() { parts.push(b'&'); }
+                        let key = match k { Key::Int(n) => n.to_string().into_bytes(), Key::Str(s) => s.clone() };
+                        parts.extend_from_slice(&urlencode_form(&key));
+                        parts.push(b'=');
+                        parts.extend_from_slice(&urlencode_form(&to_bytes(v)));
+                    }
+                }
+                Value::Str(parts)
+            }
+            "mb_substitute_character" => {
+                if args.is_empty() { Value::Str(b"none".to_vec()) } else { Value::Bool(true) }
+            }
+            "str_rot13" => {
+                let mut s = to_bytes(&a(0));
+                for b in s.iter_mut() {
+                    match *b {
+                        b'a'..=b'z' => *b = b'a' + (*b - b'a' + 13) % 26,
+                        b'A'..=b'Z' => *b = b'A' + (*b - b'A' + 13) % 26,
+                        _ => {}
+                    }
+                }
+                Value::Str(s)
+            }
+            "pack" => {
+                let fmt = to_bytes(&a(0));
+                Value::Str(pack_values(&fmt, &args[1.min(args.len())..]))
+            }
+            "unpack" => {
+                let fmt = to_bytes(&a(0));
+                let data = to_bytes(&a(1));
+                unpack_values(&fmt, &data)
+            }
+            "escapeshellarg" => {
+                // POSIX single-quote escaping: wrap in '...', and '\'' for inner quotes.
+                let s = to_bytes(&a(0));
+                let mut out = vec![b'\''];
+                for &b in &s {
+                    if b == b'\'' {
+                        out.extend_from_slice(b"'\\''");
+                    } else {
+                        out.push(b);
+                    }
+                }
+                out.push(b'\'');
+                Value::Str(out)
+            }
+            "escapeshellcmd" => {
+                let s = to_bytes(&a(0));
+                let mut out = Vec::with_capacity(s.len());
+                for &b in &s {
+                    if matches!(b, b'&' | b';' | b'`' | b'|' | b'*' | b'?' | b'~' | b'<' | b'>'
+                        | b'^' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'$' | b'\\'
+                        | 0x0a | 0xff | b'"' | b'\'' | b'#') {
+                        out.push(b'\\');
+                    }
+                    out.push(b);
+                }
+                Value::Str(out)
             }
             "strip_tags" => {
                 // Remove `<...>` tags (and `<?...?>`/comments). `allowed` (2nd arg,
@@ -6726,6 +6906,10 @@ fn is_known_builtin(n: &str) -> bool {
         "strlen" | "count" | "var_dump" | "print_r" | "implode" | "explode" | "sprintf"
             | "printf" | "in_array" | "array_keys" | "array_values" | "array_merge" | "range"
             | "vsprintf" | "vprintf" | "array_chunk" | "array_merge_recursive" | "strip_tags"
+            | "pack" | "unpack" | "str_rot13" | "escapeshellarg" | "escapeshellcmd"
+            | "array_multisort" | "htmlspecialchars" | "htmlentities" | "html_entity_decode"
+            | "htmlspecialchars_decode" | "urlencode" | "urldecode" | "rawurlencode"
+            | "rawurldecode" | "http_build_query"
     )
 }
 
@@ -6883,6 +7067,220 @@ fn merge_recursive(out: &mut Arr, src: &Arr) {
             }
         }
     }
+}
+
+fn urlencode_form(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    for &b in s {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
+            out.push(b);
+        } else if b == b' ' {
+            out.push(b'+');
+        } else {
+            out.extend_from_slice(format!("%{b:02X}").as_bytes());
+        }
+    }
+    out
+}
+
+/// Decode the predefined HTML entities + numeric (`&#NN;` / `&#xNN;`) references.
+fn decode_html_entities(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] == b'&' {
+            if let Some(semi) = s[i + 1..].iter().position(|&b| b == b';').map(|p| i + 1 + p) {
+                let ent = &s[i + 1..semi];
+                let rep: Option<Vec<u8>> = match ent {
+                    b"amp" => Some(b"&".to_vec()),
+                    b"lt" => Some(b"<".to_vec()),
+                    b"gt" => Some(b">".to_vec()),
+                    b"quot" => Some(b"\"".to_vec()),
+                    b"apos" | b"#039" | b"#39" => Some(b"'".to_vec()),
+                    b"nbsp" => Some(vec![0xc2, 0xa0]),
+                    _ if ent.starts_with(b"#x") || ent.starts_with(b"#X") => std::str::from_utf8(&ent[2..])
+                        .ok()
+                        .and_then(|h| u32::from_str_radix(h, 16).ok())
+                        .and_then(char::from_u32)
+                        .map(|c| c.to_string().into_bytes()),
+                    _ if ent.starts_with(b"#") => std::str::from_utf8(&ent[1..])
+                        .ok()
+                        .and_then(|d| d.parse::<u32>().ok())
+                        .and_then(char::from_u32)
+                        .map(|c| c.to_string().into_bytes()),
+                    _ => None,
+                };
+                if let Some(r) = rep {
+                    out.extend_from_slice(&r);
+                    i = semi + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(s[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Read a format-code count: a number, `*`, or 1 (default). Returns (count, is_star).
+fn pack_count(fmt: &[u8], i: &mut usize) -> (usize, bool) {
+    if *i < fmt.len() && fmt[*i] == b'*' {
+        *i += 1;
+        return (0, true);
+    }
+    let start = *i;
+    while *i < fmt.len() && fmt[*i].is_ascii_digit() {
+        *i += 1;
+    }
+    if *i > start {
+        (std::str::from_utf8(&fmt[start..*i]).unwrap().parse().unwrap_or(1), false)
+    } else {
+        (1, false)
+    }
+}
+
+/// `pack(format, ...values)` — a useful subset of the format codes.
+fn pack_values(fmt: &[u8], vals: &[Value]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut vi = 0;
+    let mut i = 0;
+    while i < fmt.len() {
+        let code = fmt[i];
+        i += 1;
+        let (cnt, star) = pack_count(fmt, &mut i);
+        match code {
+            b'a' | b'A' | b'Z' => {
+                let s = vals.get(vi).map(to_bytes).unwrap_or_default();
+                vi += 1;
+                let pad = if code == b'A' { b' ' } else { 0u8 };
+                let len = if star { s.len() + if code == b'Z' { 1 } else { 0 } } else { cnt };
+                for k in 0..len {
+                    out.push(*s.get(k).unwrap_or(&pad));
+                }
+            }
+            b'H' | b'h' => {
+                let s = vals.get(vi).map(to_bytes).unwrap_or_default();
+                vi += 1;
+                let n = if star { s.len() } else { cnt };
+                let mut byte = 0u8;
+                for k in 0..n {
+                    let nib = (s.get(k).copied().unwrap_or(b'0') as char).to_digit(16).unwrap_or(0) as u8;
+                    if k % 2 == 0 {
+                        byte = if code == b'H' { nib << 4 } else { nib };
+                    } else {
+                        byte |= if code == b'H' { nib } else { nib << 4 };
+                        out.push(byte);
+                        byte = 0;
+                    }
+                }
+                if n % 2 == 1 { out.push(byte); }
+            }
+            _ => {
+                let reps = if star { vals.len().saturating_sub(vi) } else { cnt };
+                for _ in 0..reps {
+                    let v = to_i64(vals.get(vi).unwrap_or(&Value::Null));
+                    vi += 1;
+                    match code {
+                        b'c' | b'C' => out.push(v as u8),
+                        b's' | b'S' | b'v' => out.extend_from_slice(&(v as u16).to_le_bytes()),
+                        b'n' => out.extend_from_slice(&(v as u16).to_be_bytes()),
+                        b'l' | b'L' | b'V' => out.extend_from_slice(&(v as u32).to_le_bytes()),
+                        b'N' => out.extend_from_slice(&(v as u32).to_be_bytes()),
+                        b'q' | b'Q' | b'P' => out.extend_from_slice(&v.to_le_bytes()),
+                        b'J' => out.extend_from_slice(&v.to_be_bytes()),
+                        b'f' | b'g' => out.extend_from_slice(&(to_f64(vals.get(vi - 1).unwrap_or(&Value::Null)) as f32).to_le_bytes()),
+                        b'd' | b'e' => out.extend_from_slice(&to_f64(vals.get(vi - 1).unwrap_or(&Value::Null)).to_le_bytes()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `unpack(format, data)` — returns an array keyed by the per-group names.
+fn unpack_values(fmt: &[u8], data: &[u8]) -> Value {
+    let mut arr = Arr::new();
+    let mut pos = 0usize;
+    for group in fmt.split(|&b| b == b'/') {
+        if group.is_empty() { continue; }
+        let code = group[0];
+        let mut gi = 1;
+        let (mut cnt, star) = pack_count(group, &mut gi);
+        let name = String::from_utf8_lossy(&group[gi..]).into_owned();
+        let read_int = |pos: &mut usize, n: usize, be: bool, signed: bool| -> i64 {
+            if *pos + n > data.len() { return 0; }
+            let mut bytes = [0u8; 8];
+            for k in 0..n { bytes[k] = data[*pos + k]; }
+            *pos += n;
+            let raw = if be {
+                let mut v = 0u64;
+                for k in 0..n { v = (v << 8) | bytes[k] as u64; }
+                v
+            } else {
+                u64::from_le_bytes(bytes)
+            };
+            if signed && n < 8 {
+                let shift = 64 - n * 8;
+                ((raw << shift) as i64) >> shift
+            } else {
+                raw as i64
+            }
+        };
+        let push = |arr: &mut Arr, name: &str, idx: usize, multi: bool, v: Value| {
+            let key = if name.is_empty() {
+                Key::Int((idx + 1) as i64)
+            } else if multi {
+                Key::Str(format!("{name}{}", idx + 1).into_bytes())
+            } else {
+                Key::Str(name.as_bytes().to_vec())
+            };
+            arr.insert(key, v);
+        };
+        match code {
+            b'a' | b'A' | b'Z' => {
+                let n = if star { data.len() - pos } else { cnt };
+                let end = (pos + n).min(data.len());
+                let mut s = data[pos..end].to_vec();
+                pos = end;
+                if code == b'A' { while matches!(s.last(), Some(b' ') | Some(0)) { s.pop(); } }
+                if code == b'Z' { if let Some(z) = s.iter().position(|&b| b == 0) { s.truncate(z); } }
+                let key = if name.is_empty() { Key::Int(1) } else { Key::Str(name.into_bytes()) };
+                arr.insert(key, Value::Str(s));
+            }
+            b'H' | b'h' => {
+                let nib = if star { (data.len() - pos) * 2 } else { cnt };
+                let mut hex = String::new();
+                for k in 0..nib {
+                    let byte = data.get(pos + k / 2).copied().unwrap_or(0);
+                    let n = if (k % 2 == 0) == (code == b'H') { byte >> 4 } else { byte & 0xf };
+                    hex.push(std::char::from_digit(n as u32, 16).unwrap());
+                }
+                pos += nib.div_ceil(2);
+                let key = if name.is_empty() { Key::Int(1) } else { Key::Str(name.into_bytes()) };
+                arr.insert(key, Value::Str(hex.into_bytes()));
+            }
+            _ => {
+                let (n, be, signed) = match code {
+                    b'c' => (1, false, true), b'C' => (1, false, false),
+                    b's' => (2, false, true), b'S' | b'v' => (2, false, false), b'n' => (2, true, false),
+                    b'l' => (4, false, true), b'L' | b'V' => (4, false, false), b'N' => (4, true, false),
+                    b'q' => (8, false, true), b'Q' | b'P' => (8, false, false), b'J' => (8, true, false),
+                    _ => (0, false, false),
+                };
+                if n == 0 { continue; }
+                if star { cnt = (data.len() - pos) / n; }
+                let multi = cnt > 1;
+                for idx in 0..cnt {
+                    let v = read_int(&mut pos, n, be, signed);
+                    push(&mut arr, &name, idx, multi, Value::Int(v));
+                }
+            }
+        }
+    }
+    Value::Array(arr)
 }
 
 /// Remove markup tags from `s`, keeping any in `allowed` (lowercased tag names).
