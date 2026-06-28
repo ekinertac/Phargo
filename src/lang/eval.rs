@@ -388,13 +388,27 @@ class ReflectionParameter {
     public function getDefaultValueConstantName() { return null; }
 }
 class ReflectionProperty {
-    public $class; public $name;
-    public function __construct($c, $n) { $this->class = is_object($c) ? get_class($c) : $c; $this->name = $n; }
+    public $class; public $name; private $__info;
+    public function __construct($c, $n) { $this->class = is_object($c) ? get_class($c) : $c; $this->name = $n; $this->__info = phargo_prop_info($this->class, $n); }
     public function getName() { return $this->name; }
     public function getValue($obj = null) { $n = $this->name; return $obj->$n; }
     public function setValue($obj, $v) { $n = $this->name; $obj->$n = $v; }
-    public function isPublic() { return true; }
-    public function isStatic() { return false; }
+    public function getDeclaringClass() { return new ReflectionClass($this->class); }
+    public function hasType() { return $this->__info !== null && $this->__info["type"] !== null; }
+    public function getType() { return ($this->__info === null || $this->__info["type"] === null) ? null : new ReflectionNamedType($this->__info["type"]); }
+    public function getModifiers() { return 1; }
+    public function isPublic() { return $this->__info === null || $this->__info["visibility"] === 0; }
+    public function isPrivate() { return $this->__info !== null && $this->__info["visibility"] === 1; }
+    public function isProtected() { return $this->__info !== null && $this->__info["visibility"] === 2; }
+    public function isStatic() { return $this->__info !== null && $this->__info["static"]; }
+    public function isReadOnly() { return $this->__info !== null && $this->__info["readonly"]; }
+    public function isPromoted() { return $this->__info !== null && $this->__info["promoted"]; }
+    public function isReadable() { return true; }
+    public function isWritable() { return $this->__info === null || !$this->__info["readonly"]; }
+    public function isDefault() { return true; }
+    public function isInitialized($obj = null) { $n = $this->name; return $obj === null ? true : isset($obj->$n); }
+    public function getAttributes($name = null, $flags = 0) { return []; }
+    public function getDocComment() { return false; }
     public function setAccessible($a) {}
 }
 class ReflectionFunction {
@@ -6058,6 +6072,42 @@ impl Eval {
                 };
                 match rt {
                     Some(t) => Value::Str(t.into_bytes()),
+                    None => Value::Null,
+                }
+            }
+            "phargo_prop_info" => {
+                // {type, visibility(0/1/2), readonly, static, promoted} for a class
+                // property (declared or constructor-promoted), or null if unknown.
+                let cls = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let pname = String::from_utf8_lossy(&to_bytes(&a(1))).into_owned();
+                let mut found: Option<(Option<String>, Visibility, bool, bool, bool)> = None;
+                for c in self.ancestry(&cls) {
+                    if let Some(p) = c.props.iter().find(|p| p.name == pname) {
+                        found = Some((p.type_hint.clone(), p.visibility, p.readonly, p.is_static, false));
+                        break;
+                    }
+                    if let Some(ctor) = c.methods.iter().find(|m| m.name.eq_ignore_ascii_case("__construct")) {
+                        if let Some(pp) = ctor.params.iter().find(|p| p.name == pname && p.promote.is_some()) {
+                            found = Some((pp.type_hint.clone(), pp.promote.unwrap(), pp.readonly, false, true));
+                            break;
+                        }
+                    }
+                }
+                match found {
+                    Some((ty, vis, ro, st, promoted)) => {
+                        let mut info = Arr::new();
+                        info.insert(Key::Str(b"type".to_vec()), match ty {
+                            Some(t) => Value::Str(t.into_bytes()),
+                            None => Value::Null,
+                        });
+                        info.insert(Key::Str(b"visibility".to_vec()), Value::Int(match vis {
+                            Visibility::Public => 0, Visibility::Protected => 2, Visibility::Private => 1,
+                        }));
+                        info.insert(Key::Str(b"readonly".to_vec()), Value::Bool(ro));
+                        info.insert(Key::Str(b"static".to_vec()), Value::Bool(st));
+                        info.insert(Key::Str(b"promoted".to_vec()), Value::Bool(promoted));
+                        Value::Array(info)
+                    }
                     None => Value::Null,
                 }
             }
