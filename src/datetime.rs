@@ -216,39 +216,244 @@ pub(crate) fn make_ts(h: i64, mi: i64, s: i64, mon: i64, day: i64, year: i64) ->
 }
 
 /// A small `strtotime`: `@<ts>`, `now`, and `YYYY-MM-DD[ HH:MM:SS]` / `YYYY/MM/DD`.
+fn month_from_name(s: &str) -> Option<i64> {
+    let l = s.to_ascii_lowercase();
+    let names = [
+        "january", "february", "march", "april", "may", "june", "july", "august",
+        "september", "october", "november", "december",
+    ];
+    for (i, n) in names.iter().enumerate() {
+        if l == *n || (l.len() >= 3 && n.starts_with(&l[..3.min(l.len())]) && l.len() <= n.len() && n.starts_with(&l)) {
+            return Some(i as i64 + 1);
+        }
+    }
+    None
+}
+
+fn weekday_from_name(s: &str) -> Option<i64> {
+    // 0 = Sunday … 6 = Saturday
+    let l = s.to_ascii_lowercase();
+    let names = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+    for (i, n) in names.iter().enumerate() {
+        if n.starts_with(&l) && l.len() >= 3 {
+            return Some(i as i64);
+        }
+    }
+    None
+}
+
+/// Parse `HH:MM[:SS][am|pm]` from a token list; returns (h, m, s) if it looks like a time.
+fn parse_time(tok: &str) -> Option<(i64, i64, i64)> {
+    let (body, ampm) = {
+        let lower = tok.to_ascii_lowercase();
+        if let Some(b) = lower.strip_suffix("am") {
+            (b.trim().to_string(), Some(false))
+        } else if let Some(b) = lower.strip_suffix("pm") {
+            (b.trim().to_string(), Some(true))
+        } else {
+            (lower, None)
+        }
+    };
+    let parts: Vec<&str> = body.split(':').collect();
+    if parts.is_empty() || parts[0].is_empty() || !parts[0].chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if parts.len() < 2 && ampm.is_none() {
+        return None; // a bare number isn't a time
+    }
+    let mut h: i64 = parts[0].parse().ok()?;
+    let mi: i64 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+    let se: i64 = parts.get(2).and_then(|p| p.split('.').next().unwrap_or("0").parse().ok()).unwrap_or(0);
+    if let Some(pm) = ampm {
+        if pm && h < 12 { h += 12; }
+        if !pm && h == 12 { h = 0; }
+    }
+    Some((h, mi, se))
+}
+
 pub(crate) fn php_strtotime(s: &str, base: i64) -> Option<i64> {
     let t = s.trim();
-    if t.eq_ignore_ascii_case("now") || t.is_empty() {
+    if t.is_empty() || t.eq_ignore_ascii_case("now") {
         return Some(base);
     }
     if let Some(rest) = t.strip_prefix('@') {
         return rest.trim().parse::<i64>().ok();
     }
-    // YYYY-MM-DD or YYYY/MM/DD optionally followed by time
-    let (date_part, time_part) = match t.split_once([' ', 'T']) {
-        Some((d, tm)) => (d, Some(tm)),
+    let lower = t.to_ascii_lowercase();
+
+    // ---- whole-string keywords ----
+    let (by, bm, bd) = civil_from_days(base.div_euclid(86400));
+    let midnight = make_ts(0, 0, 0, bm, bd, by);
+    match lower.as_str() {
+        "today" | "midnight" => return Some(midnight),
+        "noon" => return Some(midnight + 12 * 3600),
+        "tomorrow" => return Some(midnight + 86400),
+        "yesterday" => return Some(midnight - 86400),
+        _ => {}
+    }
+
+    // ---- ISO / numeric absolute: Y-m-d or m/d/Y, optional time ----
+    if let Some(ts) = parse_absolute(t) {
+        return Some(ts);
+    }
+
+    // ---- time-only (applies to the base date) ----
+    if let Some((h, mi, se)) = parse_time(t) {
+        return Some(midnight + h * 3600 + mi * 60 + se);
+    }
+
+    // ---- textual / relative, token by token ----
+    parse_relative_or_textual(&lower, base, midnight)
+}
+
+/// Absolute `YYYY-MM-DD`, `M/D/Y`, `DD-Mon-YYYY`, optionally with a time after a
+/// space or `T`.
+fn parse_absolute(t: &str) -> Option<i64> {
+    let (date_part, time_part) = match t.split_once(['T', ' ']) {
+        Some((d, tm)) => (d, Some(tm.trim())),
         None => (t, None),
     };
-    let ds: Vec<&str> = date_part.split(['-', '/']).collect();
-    if ds.len() == 3 {
-        let y = ds[0].parse::<i64>().ok()?;
-        let mo = ds[1].parse::<i64>().ok()?;
-        let d = ds[2].parse::<i64>().ok()?;
-        let (mut h, mut mi, mut se) = (0i64, 0i64, 0i64);
-        if let Some(tp) = time_part {
-            let ts: Vec<&str> = tp.trim().split(':').collect();
-            if !ts.is_empty() {
-                h = ts[0].parse().unwrap_or(0);
+    let (h, mi, se) = match time_part {
+        Some(tp) if !tp.is_empty() => parse_time(tp.split_whitespace().next().unwrap_or("")).unwrap_or((0, 0, 0)),
+        _ => (0, 0, 0),
+    };
+    // dashes → Y-m-d (or D-Mon-Y); slashes → m/d/Y (US)
+    if date_part.contains('-') {
+        let p: Vec<&str> = date_part.split('-').collect();
+        if p.len() == 3 {
+            if let Some(mon) = month_from_name(p[1]) {
+                // D-Mon-Y
+                let d = p[0].parse().ok()?;
+                let y = norm_year(p[2].parse().ok()?);
+                return Some(make_ts(h, mi, se, mon, d, y));
             }
-            if ts.len() > 1 {
-                mi = ts[1].parse().unwrap_or(0);
-            }
-            if ts.len() > 2 {
-                se = ts[2].split('.').next().unwrap_or("0").parse().unwrap_or(0);
-            }
+            let y = p[0].parse::<i64>().ok()?;
+            let mo = p[1].parse::<i64>().ok()?;
+            let d = p[2].parse::<i64>().ok()?;
+            return Some(make_ts(h, mi, se, mo, d, y));
         }
-        return Some(make_ts(h, mi, se, mo, d, y));
+    } else if date_part.contains('/') {
+        let p: Vec<&str> = date_part.split('/').collect();
+        if p.len() == 3 {
+            let mo = p[0].parse::<i64>().ok()?;
+            let d = p[1].parse::<i64>().ok()?;
+            let y = norm_year(p[2].parse::<i64>().ok()?);
+            return Some(make_ts(h, mi, se, mo, d, y));
+        }
     }
     None
+}
+
+fn norm_year(y: i64) -> i64 {
+    if y < 70 { 2000 + y } else if y < 100 { 1900 + y } else { y }
+}
+
+/// Relative offsets (`+1 day`, `2 weeks ago`, `next monday`) and textual dates
+/// (`1 January 2020`, `Jan 1 2020`, `January 1, 2020`).
+fn parse_relative_or_textual(lower: &str, base: i64, midnight: i64) -> Option<i64> {
+    let toks: Vec<String> = lower
+        .replace(',', " ")
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+    if toks.is_empty() {
+        return None;
+    }
+
+    // textual date: find a month-name token and surrounding day/year numbers
+    let mut month = None;
+    let mut nums: Vec<i64> = Vec::new();
+    for w in &toks {
+        if let Some(m) = month_from_name(w) {
+            month = Some(m);
+        } else if let Ok(n) = w.trim_end_matches(|c: char| !c.is_ascii_digit()).parse::<i64>() {
+            if w.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                nums.push(n);
+            }
+        }
+    }
+    if let Some(mon) = month {
+        // day = a number ≤ 31, year = a number > 31 (or the remaining one)
+        let day = nums.iter().copied().find(|&n| (1..=31).contains(&n)).unwrap_or(1);
+        let year = nums.iter().copied().find(|&n| n > 31).unwrap_or_else(|| {
+            let (y, _, _) = civil_from_days(base.div_euclid(86400));
+            y
+        });
+        return Some(make_ts(0, 0, 0, mon, day, norm_year(year)));
+    }
+
+    // weekday navigation: "next monday" / "last friday" / "monday"
+    for (i, w) in toks.iter().enumerate() {
+        if let Some(target) = weekday_from_name(w) {
+            let dir = match toks.get(i.wrapping_sub(1)).map(|s| s.as_str()) {
+                Some("last") | Some("previous") => -1,
+                _ => 1,
+            };
+            let cur_dow = (base.div_euclid(86400) + 4).rem_euclid(7); // 1970-01-01 = Thursday(4)
+            let mut delta = (target - cur_dow).rem_euclid(7);
+            if dir > 0 && delta == 0 { delta = 7; }
+            if dir < 0 { delta = -((cur_dow - target).rem_euclid(7)); if delta == 0 { delta = -7; } }
+            return Some(midnight + delta * 86400);
+        }
+    }
+
+    // relative offsets: "[+|-]N unit [ago]" possibly repeated
+    let mut ts = base;
+    let mut matched = false;
+    let mut i = 0;
+    while i < toks.len() {
+        let (sign, numstr) = {
+            let w = &toks[i];
+            if let Some(r) = w.strip_prefix('+') {
+                (1i64, r.to_string())
+            } else if let Some(r) = w.strip_prefix('-') {
+                (-1i64, r.to_string())
+            } else {
+                (1i64, w.clone())
+            }
+        };
+        if let Ok(mut n) = numstr.parse::<i64>() {
+            n *= sign;
+            if let Some(unit) = toks.get(i + 1) {
+                let ago = toks.get(i + 2).map(|s| s == "ago").unwrap_or(false);
+                if ago { n = -n; }
+                if apply_unit(&mut ts, n, unit) {
+                    matched = true;
+                    i += if ago { 3 } else { 2 };
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    if matched { Some(ts) } else { None }
+}
+
+fn apply_unit(ts: &mut i64, n: i64, unit: &str) -> bool {
+    let u = unit.trim_end_matches('s');
+    match u {
+        "sec" | "second" => *ts += n,
+        "min" | "minute" => *ts += n * 60,
+        "hour" => *ts += n * 3600,
+        "day" => *ts += n * 86400,
+        "week" => *ts += n * 7 * 86400,
+        "fortnight" => *ts += n * 14 * 86400,
+        "month" | "year" => {
+            let days = ts.div_euclid(86400);
+            let secs = ts.rem_euclid(86400);
+            let (mut y, mut m, d) = civil_from_days(days);
+            if u == "year" {
+                y += n;
+            } else {
+                let total = (y * 12 + (m - 1)) + n;
+                y = total.div_euclid(12);
+                m = total.rem_euclid(12) + 1;
+            }
+            let dd = d.min(days_in_month(y, m));
+            *ts = make_ts(0, 0, 0, m, dd, y) + secs;
+        }
+        _ => return false,
+    }
+    true
 }
 
