@@ -36,6 +36,14 @@ pub struct Eval {
     static_props: HashMap<(String, String), Value>,
     /// Class of the currently executing method, for `self`/`parent`/`static`.
     current_class: Option<String>,
+    /// Late-static-binding scope: the class the current method was *called on*
+    /// (runtime class of $this, or the class named in a static call). `static::`
+    /// and get_called_class() resolve here; forwarding calls (self::/parent::/
+    /// static::) inherit it, explicit `C::m()` calls rebind it.
+    called_class: Option<String>,
+    /// error_reporting() level (default E_ALL; we don't emit notices, but tests
+    /// read the value back).
+    error_level: i64,
     /// In-flight thrown exception (set by `throw`, cleared by a matching `catch`).
     thrown: Option<Value>,
     /// Current function/method call nesting — guards against stack overflow.
@@ -1071,6 +1079,8 @@ impl Eval {
             consts: HashMap::new(),
             static_props: HashMap::new(),
             current_class: None,
+            called_class: None,
+            error_level: 30719,
             thrown: None,
             call_depth: 0,
             eval_depth: 0,
@@ -1909,7 +1919,16 @@ impl Eval {
                     self.vars().get(name).map(|v| v.deref()).unwrap_or(Value::Null)
                 }
             }
-            Expr::ConstFetch(name) => self.const_fetch(name),
+            Expr::ConstFetch(name) => match self.const_fetch(name) {
+                Some(v) => v,
+                // PHP 8: an unknown bareword is an Error, not a string
+                None => {
+                    return Err(self.throw_error(
+                        "Error",
+                        &format!("Undefined constant \"{}\"", name.last()),
+                    ))
+                }
+            },
             Expr::MagicConst(name) => match name.to_ascii_uppercase().as_str() {
                 "__FILE__" => Value::Str(
                     self.cur_file
@@ -2206,7 +2225,9 @@ impl Eval {
                 };
                 // `parent::`/`self::` keep the current $this if present
                 let this = self.vars().get("this").cloned();
-                self.call_static(&cname, &mname, argv, this, Some(args))?
+                let forwarding = matches!(&**class, Expr::ConstFetch(n)
+                    if matches!(n.last().to_ascii_lowercase().as_str(), "self" | "parent" | "static"));
+                self.call_static_fw(&cname, &mname, argv, this, Some(args), forwarding)?
             }
             Expr::ClassConst(class, name) => {
                 if name == "class" {
@@ -2642,15 +2663,12 @@ impl Eval {
         }
     }
 
-    fn const_fetch(&self, name: &Name) -> Value {
+    fn const_fetch(&self, name: &Name) -> Option<Value> {
         let n = name.last();
         if let Some(v) = self.consts.get(n) {
-            return v.clone();
+            return Some(v.clone());
         }
-        php_const(n).unwrap_or_else(|| {
-            // unknown bareword → its own name as a string (PHP 7 behavior-ish)
-            Value::Str(n.as_bytes().to_vec())
-        })
+        php_const(n)
     }
 
     // ---- assignment targets --------------------------------------------
@@ -3663,9 +3681,15 @@ impl Eval {
             Expr::ConstFetch(n) => {
                 let last = n.last();
                 match last.to_ascii_lowercase().as_str() {
-                    "self" | "static" => Ok(self
+                    "self" => Ok(self
                         .current_class
                         .clone()
+                        .unwrap_or_else(|| last.to_string())),
+                    // late static binding: the class the method was called on
+                    "static" => Ok(self
+                        .called_class
+                        .clone()
+                        .or_else(|| self.current_class.clone())
                         .unwrap_or_else(|| last.to_string())),
                     "parent" => {
                         let cur = self.current_class.clone().unwrap_or_default();
@@ -4072,11 +4096,20 @@ impl Eval {
             }
         }
         let prev_class = self.current_class.replace(decl_class.to_string());
+        // LSB scope: the runtime class of the receiver
+        let prev_called = std::mem::replace(
+            &mut self.called_class,
+            Some(match &recv {
+                Value::Object(rc) => rc.borrow().class.clone(),
+                _ => decl_class.to_string(),
+            }),
+        );
         self.scopes.push(scope);
         let r = self.run_fn_body(&body);
         let wb = self.capture_byref(&m.params, byref);
         self.scopes.pop();
         self.current_class = prev_class;
+        self.called_class = prev_called;
         self.cur_args.pop();
         self.cur_fn.pop();
         self.call_depth -= 1;
@@ -4091,6 +4124,21 @@ impl Eval {
         args: Vec<Value>,
         this: Option<Value>,
         byref: Option<&[Arg]>,
+    ) -> R<Value> {
+        self.call_static_fw(class, method, args, this, byref, false)
+    }
+
+    /// `forwarding`: the call was written `self::`/`parent::`/`static::` — the
+    /// late-static-binding scope of the caller is preserved. An explicit
+    /// `ClassName::m()` rebinds it to that class.
+    fn call_static_fw(
+        &mut self,
+        class: &str,
+        method: &str,
+        args: Vec<Value>,
+        this: Option<Value>,
+        byref: Option<&[Arg]>,
+        forwarding: bool,
     ) -> R<Value> {
         // Closure static methods: Closure::bind($c, $this[, $scope]),
         // Closure::fromCallable($callable).
@@ -4189,11 +4237,22 @@ impl Eval {
         }
         self.bind_params(&mut scope, &m.params, &args)?;
         let prev_class = self.current_class.replace(decl_class.clone());
+        // LSB scope: forwarding calls keep the caller's; explicit C::m() rebinds.
+        // (Canonicalize through find_class so case matches the declaration.)
+        let called = if forwarding {
+            self.called_class.clone()
+        } else {
+            None
+        }
+        .or_else(|| self.find_class(class).map(|c| c.name.clone()))
+        .or_else(|| Some(class.to_string()));
+        let prev_called = std::mem::replace(&mut self.called_class, called);
         self.scopes.push(scope);
         let r = self.run_fn_body(&body);
         let wb = self.capture_byref(&m.params, byref);
         self.scopes.pop();
         self.current_class = prev_class;
+        self.called_class = prev_called;
         self.cur_args.pop();
         self.cur_fn.pop();
         self.call_depth -= 1;
@@ -4291,15 +4350,27 @@ impl Eval {
                 }
             }
         }
+        // A const initializer referencing `self::`/other consts evaluates in the
+        // class that DECLARED it (`parent::myDynConst` where the initializer says
+        // `self::myConst` must use the parent's), so scope current_class to the
+        // declaring class while evaluating.
+        let mut eval_in = |ev: &mut Self, expr: Expr, decl: String| -> R<Value> {
+            let prev = ev.current_class.replace(decl);
+            let r = ev.eval(&expr);
+            ev.current_class = prev;
+            r
+        };
         for c in self.ancestry(class) {
             if let Some(cc) = c.consts.iter().find(|x| x.name == name) {
-                return self.eval(&cc.value.clone());
+                let (expr, decl) = (cc.value.clone(), c.name.clone());
+                return eval_in(self, expr, decl);
             }
             // interface constants
             for i in &c.interfaces {
                 if let Some(ic) = self.find_class(i.last()) {
                     if let Some(cc) = ic.consts.iter().find(|x| x.name == name) {
-                        return self.eval(&cc.value.clone());
+                        let (expr, decl) = (cc.value.clone(), ic.name.clone());
+                        return eval_in(self, expr, decl);
                     }
                 }
             }
@@ -4661,7 +4732,7 @@ impl Eval {
                     Value::Bool(false)
                 }
             }
-            "get_called_class" => match &self.current_class {
+            "get_called_class" => match &self.called_class.clone().or_else(|| self.current_class.clone()) {
                 Some(c) => Value::Str(c.as_bytes().to_vec()),
                 None => Value::Bool(false),
             },
@@ -7135,7 +7206,13 @@ impl Eval {
                 Value::Bool(false)
             }
             "ini_get" | "ini_set" => Value::Bool(false),
-            "error_reporting" => Value::Int(0),
+            "error_reporting" => {
+                let old = self.error_level;
+                if !args.is_empty() {
+                    self.error_level = to_i64(&a(0));
+                }
+                Value::Int(old)
+            }
             "set_error_handler" | "restore_error_handler" | "set_exception_handler"
             | "restore_exception_handler" | "error_clear_last" | "debug_print_backtrace"
             | "gc_enable" | "gc_disable" | "header" | "clearstatcache" | "usleep" | "sleep" => {
@@ -8164,7 +8241,32 @@ fn php_const(n: &str) -> Option<Value> {
         "E_RECOVERABLE_ERROR" => Int(4096),
         "E_DEPRECATED" => Int(8192),
         "E_USER_DEPRECATED" => Int(16384),
-        "E_ALL" => Int(32767),
+        // PHP 8.4 removed E_STRICT (2048) from E_ALL
+        "E_ALL" => Int(30719),
+        // locale categories (glibc numbering, PHP-on-Linux)
+        "LC_CTYPE" => Int(0),
+        "LC_NUMERIC" => Int(1),
+        "LC_TIME" => Int(2),
+        "LC_COLLATE" => Int(3),
+        "LC_MONETARY" => Int(4),
+        "LC_MESSAGES" => Int(5),
+        "LC_ALL" => Int(6),
+        // extract() flags
+        "EXTR_OVERWRITE" => Int(0),
+        "EXTR_SKIP" => Int(1),
+        "EXTR_PREFIX_SAME" => Int(2),
+        "EXTR_PREFIX_ALL" => Int(3),
+        "EXTR_PREFIX_INVALID" => Int(4),
+        "EXTR_PREFIX_IF_EXISTS" => Int(5),
+        "EXTR_IF_EXISTS" => Int(6),
+        "EXTR_REFS" => Int(256),
+        // http_build_query() encoding
+        "PHP_QUERY_RFC1738" => Int(1),
+        "PHP_QUERY_RFC3986" => Int(2),
+        // stream filter chains
+        "STREAM_FILTER_READ" => Int(1),
+        "STREAM_FILTER_WRITE" => Int(2),
+        "STREAM_FILTER_ALL" => Int(3),
         // sort flags
         "SORT_REGULAR" => Int(0),
         "SORT_NUMERIC" => Int(1),

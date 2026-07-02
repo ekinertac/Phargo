@@ -27,6 +27,33 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-02 (later) — `static::` was a synonym for `self::`
+
+**Pass rate: 3029 → 3051.**
+
+Second rung of the day, same method: the close-mismatch sampler pointed at core
+semantics, not extensions.
+
+- **Late static binding didn't exist.** `static::`, `new static`, and
+  `get_called_class()` all resolved to the *defining* class — `static::` was
+  literally `self::`. The engine now tracks a separate LSB scope: the runtime
+  class of `$this` on instance calls, the named class on `C::m()` calls, and —
+  the subtle part — *inherited* through forwarding calls (`self::`/`parent::`/
+  `static::`), exactly PHP's forwarding-vs-non-forwarding distinction.
+- **Class-const initializers evaluated in the caller's class.** `parent::myDynConst`
+  whose initializer says `self::myConst` picked up the *child's* override. Const
+  expressions now evaluate scoped to their declaring class.
+- **Undefined constants now throw** (`Error: Undefined constant "x"`) instead of
+  the PHP-7-ish bareword-to-string fallback. This one needed care: turning it on
+  cold broke tests that were passing *because* of the fallback — the corpus used
+  constants we'd never defined (`LC_ALL`, `EXTR_*`, `PHP_QUERY_*`,
+  `STREAM_FILTER_*`). Filled those in first, then flipped the switch; measured
+  before/after failure sets per directory to prove net-positive.
+- `error_reporting()` now stores/returns a real level, and `E_ALL` matches
+  PHP 8.4's post-E_STRICT value (30719).
+
+---
+
 ## 2026-07-02 — Named arguments were silently positional; foreach-by-ref gets real cells
 
 **Pass rate: 3007 → 3029.**
