@@ -66,6 +66,9 @@ pub struct Eval {
     /// declare(strict_types=1): scalar params/returns must match exactly
     /// (int→float widening excepted) instead of weak-mode coercion.
     strict_types: bool,
+    /// Per-class: does the hierarchy declare any typed/readonly instance prop?
+    /// (Fast path: property writes skip declaration lookup entirely when false.)
+    typed_props_cache: HashMap<String, bool>,
     /// `static $x = …` storage inside functions/methods, keyed by
     /// (function key, var name). Values persist across calls.
     static_vars: HashMap<(String, String), Value>,
@@ -1306,6 +1309,7 @@ impl Eval {
             next_res_id: 1,
             shutdown_fns: Vec::new(),
             strict_types: false,
+            typed_props_cache: HashMap::new(),
             static_vars: HashMap::new(),
             autoloaders: Vec::new(),
             autoload_active: HashSet::new(),
@@ -3066,6 +3070,12 @@ impl Eval {
                 let o = self.eval(obj)?;
                 let pname = self.prop_name_str(name)?;
                 if let Value::Object(rc) = o {
+                    let class = rc.borrow().class.clone();
+                    let val = if self.class_has_typed_props(&class) {
+                        self.check_prop_write(&class, &pname, val)?
+                    } else {
+                        val
+                    };
                     rc.borrow_mut().set(&pname, val);
                 }
             }
@@ -4661,6 +4671,67 @@ impl Eval {
         self.apply_byref(byref, wb)?;
         let rt = m.ret_type.clone();
         r.and_then(|v| self.check_return(v, &rt, &mfname))
+    }
+
+    /// Cached: any typed or readonly instance property anywhere in the hierarchy?
+    fn class_has_typed_props(&mut self, class: &str) -> bool {
+        let key = class.to_ascii_lowercase();
+        if let Some(&b) = self.typed_props_cache.get(&key) {
+            return b;
+        }
+        let b = self
+            .ancestry(class)
+            .iter()
+            .any(|c| c.props.iter().any(|p| !p.is_static && (p.type_hint.is_some() || p.readonly)));
+        self.typed_props_cache.insert(key, b);
+        b
+    }
+
+    /// Enforce declared property type + readonly on a write. Returns the
+    /// (possibly coerced) value, or throws PHP's TypeError/Error.
+    fn check_prop_write(&mut self, class: &str, pname: &str, val: Value) -> R<Value> {
+        // find the declaring class's PropDecl for pname (non-static)
+        let mut decl: Option<(String, Option<String>, bool)> = None;
+        for c in self.ancestry(class) {
+            if let Some(p) = c.props.iter().find(|p| !p.is_static && p.name == pname) {
+                decl = Some((c.name.clone(), p.type_hint.clone(), p.readonly));
+                break;
+            }
+        }
+        let Some((decl_class, hint, readonly)) = decl else { return Ok(val) };
+        if readonly {
+            // approximation: writes are allowed only from inside the declaring
+            // class (init-once isn't representable — props default-initialize)
+            let inside = self
+                .current_class
+                .as_deref()
+                .map(|c| c.eq_ignore_ascii_case(&decl_class))
+                .unwrap_or(false);
+            if !inside {
+                return Err(self.throw_error(
+                    "Error",
+                    &format!(
+                        "Cannot modify readonly property {}::${}",
+                        display_class(&decl_class),
+                        pname
+                    ),
+                ));
+            }
+        }
+        let Some(hint) = hint else { return Ok(val) };
+        let given = self.given_type(&val);
+        match self.coerce_typed(&hint, val) {
+            Ok(v) => Ok(v),
+            Err(_) => Err(self.throw_error(
+                "TypeError",
+                &format!(
+                    "Cannot assign {given} to property {}::${} of type {}",
+                    display_class(&decl_class),
+                    pname,
+                    hint
+                ),
+            )),
+        }
     }
 
     /// Does `v` satisfy the single (non-union) declared type `t`?

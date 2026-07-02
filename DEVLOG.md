@@ -27,6 +27,26 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-04 — Typed and readonly properties
+
+**Pass rate: 3344 → 3364.**
+
+The property half of the type system: writes to declared typed properties now
+weak-coerce or throw PHP's exact `Cannot assign string to property P::$n of
+type int`, and readonly properties reject writes from outside their declaring
+class (`Cannot modify readonly property P::$r`). Because property writes are
+hot-path, classes whose hierarchy declares no typed/readonly props skip the
+whole check via a per-class cache — the untyped 95% of corpus code pays one
+cached hash lookup.
+
+One honest approximation: PHP's readonly is *initialize-once*; our props
+default-initialize at instantiation, so "uninitialized" isn't representable
+and we approximate with "writable only inside the declaring class". That
+traded one ext/standard test for +19 in Zend. Recorded here so future-us
+knows where the bodies are buried.
+
+---
+
 ## 2026-07-03 (late night) — The type system bites back: TypeError enforcement + static vars
 
 **Pass rate: 3302 → 3344.**
