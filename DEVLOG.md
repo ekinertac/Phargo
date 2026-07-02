@@ -27,6 +27,21 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-04 — Arithmetic learns to throw
+
+**Pass rate: 3364 → 3387.**
+
+The last slice of the error-semantics vein: arithmetic/bitwise operators on
+array operands now throw PHP 8's `TypeError: Unsupported operand types:
+array + int` (with `array + array` union preserved), `/` and `%` by zero
+throw `DivisionByZeroError` (previously returned false, PHP-5-style), and
+negative shift counts throw `ArithmeticError` — with oversized shifts fixed
+to PHP's semantics along the way (`<<` past 63 gives 0, `>>` saturates to the
+sign bit; Rust's `wrapping_shl` had been silently wrapping the count).
+Zend +16, opcache +7.
+
+---
+
 ## 2026-07-04 — Typed and readonly properties
 
 **Pass rate: 3344 → 3364.**

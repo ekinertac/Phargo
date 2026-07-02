@@ -2337,7 +2337,7 @@ impl Eval {
                 }
                 let cur = self.eval(lhs)?;
                 let rv = self.eval(rhs)?;
-                let nv = self.apply_bin(*op, &cur, &rv);
+                let nv = self.apply_bin(*op, &cur, &rv)?;
                 self.assign_to(lhs, nv.clone())?;
                 nv
             }
@@ -2734,12 +2734,34 @@ impl Eval {
         }
         let lv = self.eval(l)?;
         let rv = self.eval(r)?;
-        Ok(self.apply_bin(op, &lv, &rv))
+        self.apply_bin(op, &lv, &rv)
     }
 
-    fn apply_bin(&self, op: BinOp, l: &Value, r: &Value) -> Value {
+    fn apply_bin(&mut self, op: BinOp, l: &Value, r: &Value) -> R<Value> {
         use BinOp::*;
-        match op {
+        // PHP 8: arrays (and non-Stringable objects) are unsupported operands for
+        // arithmetic/bitwise ops — TypeError, except array + array (union).
+        let arith = matches!(op, Add | Sub | Mul | Div | Mod | Pow | BitAnd | BitOr | BitXor | Shl | Shr);
+        if arith {
+            let bad = |v: &Value| matches!(v, Value::Array(_));
+            let union_ok = matches!(op, Add) && bad(l) && bad(r);
+            if !union_ok && (bad(l) || bad(r)) {
+                let sym = match op {
+                    Add => "+", Sub => "-", Mul => "*", Div => "/", Mod => "%",
+                    Pow => "**", BitAnd => "&", BitOr => "|", BitXor => "^",
+                    Shl => "<<", Shr => ">>",
+                    _ => "?",
+                };
+                let msg = format!(
+                    "Unsupported operand types: {} {} {}",
+                    self.given_type(l),
+                    sym,
+                    self.given_type(r)
+                );
+                return Err(self.throw_error("TypeError", &msg));
+            }
+        }
+        Ok(match op {
             Add => {
                 if let (Value::Array(a), Value::Array(b)) = (l, r) {
                     let mut out = a.clone();
@@ -2748,7 +2770,7 @@ impl Eval {
                             out.insert(k.clone(), v.clone());
                         }
                     }
-                    return Value::Array(out);
+                    return Ok(Value::Array(out));
                 }
                 num_arith(l, r, |a, b| a.wrapping_add(b), |a, b| a + b)
             }
@@ -2757,7 +2779,7 @@ impl Eval {
             Div => {
                 let rf = to_f64(r);
                 if rf == 0.0 {
-                    return Value::Bool(false); // div-by-zero (legacy-ish); real PHP throws
+                    return Err(self.throw_error("DivisionByZeroError", "Division by zero"));
                 }
                 match (to_num(l), to_num(r)) {
                     (Num::Int(a), Num::Int(b)) if b != 0 && a % b == 0 => Value::Int(a / b),
@@ -2767,10 +2789,9 @@ impl Eval {
             Mod => {
                 let b = to_i64(r);
                 if b == 0 {
-                    Value::Bool(false)
-                } else {
-                    Value::Int(to_i64(l).wrapping_rem(b))
+                    return Err(self.throw_error("DivisionByZeroError", "Modulo by zero"));
                 }
+                Value::Int(to_i64(l).wrapping_rem(b))
             }
             Pow => {
                 match (to_num(l), to_num(r)) {
@@ -2811,12 +2832,25 @@ impl Eval {
             BitAnd => Value::Int(to_i64(l) & to_i64(r)),
             BitOr => Value::Int(to_i64(l) | to_i64(r)),
             BitXor => Value::Int(to_i64(l) ^ to_i64(r)),
-            Shl => Value::Int(to_i64(l).wrapping_shl(to_i64(r) as u32)),
-            Shr => Value::Int(to_i64(l).wrapping_shr(to_i64(r) as u32)),
+            Shl => {
+                let sh = to_i64(r);
+                if sh < 0 {
+                    return Err(self.throw_error("ArithmeticError", "Bit shift by negative number"));
+                }
+                Value::Int(if sh >= 64 { 0 } else { to_i64(l).wrapping_shl(sh as u32) })
+            }
+            Shr => {
+                let sh = to_i64(r);
+                if sh < 0 {
+                    return Err(self.throw_error("ArithmeticError", "Bit shift by negative number"));
+                }
+                // arithmetic shift saturates to the sign bit past 63
+                Value::Int(if sh >= 64 { to_i64(l) >> 63 } else { to_i64(l) >> sh })
+            }
             Xor => Value::Bool(to_bool(l) ^ to_bool(r)),
             // logicals handled in `binary`
             And | Or | Coalesce => Value::Null,
-        }
+        })
     }
 
     fn cast(&self, ct: CastType, v: Value) -> Value {
@@ -5389,7 +5423,7 @@ impl Eval {
                 Value::Float((to_f64(&a(0)) * m).round() / m)
             }
             "sqrt" => Value::Float(to_f64(&a(0)).sqrt()),
-            "pow" => self.apply_bin(BinOp::Pow, &a(0), &a(1)),
+            "pow" => self.apply_bin(BinOp::Pow, &a(0), &a(1))?,
             "intdiv" => {
                 let d = to_i64(&a(1));
                 if d == 0 {
