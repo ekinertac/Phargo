@@ -100,9 +100,16 @@ the shipping number on the same suite. Then deleted the legacy engine (`lib.rs`
   path; check `git status --porcelain` before every add.
 - **`git add -A` once swept in a corpus-generated junk file.** Always inspect first.
 
-## Current state (2026-07-03 night)
+## Current state (2026-07-04)
 
-- **3302 / 21970 gradeable (15.0%).** Seven batches on 07-02/03 took 3007 → 3302.
+- **3387 / 21970 gradeable (15.4%).** Ten batches on 07-02→04 took 3007 → 3387
+  (+380). Batches 8–10 were the error-semantics vein: parameter/return type
+  enforcement (weak + strict_types, PHP-exact TypeError messages), typed +
+  readonly properties (readonly approximated as class-scoped writability —
+  init-once isn't representable; see DEVLOG), array-operand TypeErrors,
+  DivisionByZeroError, negative-shift ArithmeticError. Also: function
+  `static` vars were a parsed no-op (third missing keyword after clone and
+  $$x) — now persistent Ref cells keyed by declaring class + function.
 - **Realistic ceiling ~40–45%** — the rest is out-of-scope C extensions.
 - Landed this session: named args; foreach-by-ref (real Ref cells in elements,
   live-append iteration with cursor+cap guard); LSB; undefined-const Error;
@@ -122,18 +129,21 @@ the shipping number on the same suite. Then deleted the legacy engine (`lib.rs`
 
 ## Next targets (by leverage, achievable only)
 
-1. **Parameter/return type enforcement + TypeError messages** — the biggest
-   remaining cluster (MISMATCH_FATAL has ~1300 `throw:Error` tests, many being
-   "expected fatal, engine continued"). Regression-heavy; needs its own
-   analysis pass first (measure which error messages dominate).
-2. **Tokenizer ext** (`token_get_all`/`PhpToken`, ~55 tests) — needs a raw
-   whitespace-preserving scan + PHP's exact numeric token-ID table. A full
-   session, mechanical once designed.
-3. **DOM `loadHTML` + saveHTML** (~27+ tests) — needs lenient HTML parse mode
-   over the existing XML tree + HTML serializer.
-4. **ReflectionClass::newLazyGhost/newLazyProxy** (~55 tests, PHP 8.4 lazy
-   objects).
-5. Keep re-running `suiteanalyze -- close` after each batch — it found named
+1. **Line numbers in errors/exceptions** — our fatals say `in file:0` /
+   `on line 0`. EXPECTF `%d` tolerates it, but every plain-EXPECT fatal test
+   with a real line number fails. Threading line info from lexer→AST→throw
+   sites is a cross-cutting rung with big multiplier (all error tests).
+2. **Tokenizer ext** (`token_get_all`/`PhpToken`, ~55 tests) — raw
+   whitespace-preserving scan + PHP's numeric token-ID table. A full session,
+   mechanical once designed.
+3. **DOM `loadHTML` + saveHTML** (~27+ tests) — lenient HTML parse mode over
+   the existing XML tree + HTML serializer.
+4. **ReflectionClass::newLazyGhost/newLazyProxy** (~55 tests, PHP 8.4).
+5. **Warnings/notices infrastructure** — many EXPECT tests include
+   `Warning: ...` lines we never emit (undefined var/index notices, etc.).
+   Like type enforcement, "too permissive" fails tests. Needs the same
+   careful measure-first approach.
+6. Keep re-running `suiteanalyze -- close` after each batch — it found named
    args, LSB, clone, and $$x.
 
 **Avoid:** the Uri/Url 8.5 API (needs IDN/punycode + exact var_dump of internal
