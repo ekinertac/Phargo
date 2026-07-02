@@ -307,20 +307,30 @@ impl Parser {
                 "declare" => {
                     self.bump();
                     self.expect(&Kind::LParen)?;
+                    // scan the directive list for strict_types=1 while skipping
+                    let mut strict_types = false;
+                    let mut saw_strict = false;
                     let mut depth = 1;
                     while depth > 0 && !self.is_eof() {
                         match self.bump() {
                             Kind::LParen => depth += 1,
                             Kind::RParen => depth -= 1,
+                            Kind::Ident(s) if s == "strict_types" => saw_strict = true,
+                            Kind::Int(n) if saw_strict => {
+                                strict_types = n == 1;
+                                saw_strict = false;
+                            }
                             _ => {}
                         }
                     }
                     if matches!(self.kind(), Kind::LBrace) {
-                        let body = self.block()?;
-                        return Ok(Stmt::Block(body));
+                        let mut body = self.block()?;
+                        let mut out = vec![Stmt::Declare { strict_types }];
+                        out.append(&mut body);
+                        return Ok(Stmt::Block(out));
                     }
                     self.semi()?;
-                    return Ok(Stmt::Declare);
+                    return Ok(Stmt::Declare { strict_types });
                 }
                 _ => {}
             }

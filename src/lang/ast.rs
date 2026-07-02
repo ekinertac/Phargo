@@ -242,7 +242,8 @@ pub enum Stmt {
     },
     Namespace { name: Option<Name>, body: Option<Vec<Stmt>> },
     Use(Vec<UseItem>),
-    Declare,
+    /// declare(...) — only strict_types is meaningful to the evaluator.
+    Declare { strict_types: bool },
 }
 
 #[derive(Debug, Clone, PartialEq)]

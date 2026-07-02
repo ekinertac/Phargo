@@ -27,6 +27,34 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-03 (late night) — The type system bites back: TypeError enforcement + static vars
+
+**Pass rate: 3302 → 3344.**
+
+The biggest remaining named cluster ("must be of type" appears in 573 corpus
+files) finally got its engine support: **declared parameter and return types
+are enforced**. Weak mode does PHP 8's scalar juggling (numeric strings
+coerce, int widens to float, Stringable objects satisfy `string`);
+`declare(strict_types=1)` — which the parser used to skip entirely, now
+captured into the AST — switches to exact-match-only with the int→float
+exception. Union types, nullables, class/interface hierarchy checks, and
+PHP's exact message shape: `f(): Argument #1 ($x) must be of type int, string
+given, called in %s on line %d`. Return types ride the same machinery
+(`Return value must be of type X, Y returned`), with a deliberate soft spot:
+a Null return never throws, because we can't distinguish `return null` from
+falling off the end, and false TypeErrors are worse than missed ones.
+
+Also unearthed while wiring `declare`: **`static $x = 0;` in functions was a
+parsed no-op** — the third silently-missing keyword this session, after
+`clone` and `$$x`. Statics now live in per-function cells (a Ref into
+persistent storage), shared across inherited copies of a method like PHP.
+
+Zend +29, core +10 — and the by-now-standard result that turning on
+*enforcement* gains tests rather than losing them: the corpus expects PHP to
+throw, and an engine that's too permissive fails those expectations.
+
+---
+
 ## 2026-07-03 (night) — Autoloading exists now; 15% crossed
 
 **Pass rate: 3281 → 3302 — 15.0% of gradeable.**

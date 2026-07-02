@@ -63,6 +63,12 @@ pub struct Eval {
     next_res_id: i64,
     /// Callbacks registered via register_shutdown_function, run after main exits.
     shutdown_fns: Vec<(Value, Vec<Value>)>,
+    /// declare(strict_types=1): scalar params/returns must match exactly
+    /// (int→float widening excepted) instead of weak-mode coercion.
+    strict_types: bool,
+    /// `static $x = …` storage inside functions/methods, keyed by
+    /// (function key, var name). Values persist across calls.
+    static_vars: HashMap<(String, String), Value>,
     /// Autoloaders registered via spl_autoload_register, tried in order when a
     /// class is first touched and unknown.
     autoloaders: Vec<Value>,
@@ -1299,6 +1305,8 @@ impl Eval {
             ob_stack: Vec::new(),
             next_res_id: 1,
             shutdown_fns: Vec::new(),
+            strict_types: false,
+            static_vars: HashMap::new(),
             autoloaders: Vec::new(),
             autoload_active: HashSet::new(),
             cur_args: Vec::new(),
@@ -1934,11 +1942,40 @@ impl Eval {
                 }
                 return Ok(result);
             }
+            // `static $x = init;` — persistent per-function storage. The scope
+            // var becomes a Ref to a cell kept in static_vars, so writes persist
+            // across calls. Keyed by declaring class + function name (inherited
+            // methods share the same static, as PHP does).
+            Stmt::StaticVar(vars) => {
+                let fnkey = format!(
+                    "{}::{}",
+                    self.current_class.clone().unwrap_or_default(),
+                    self.cur_fn.last().cloned().unwrap_or_default()
+                );
+                for (name, init) in vars {
+                    let key = (fnkey.clone(), name.clone());
+                    let cell = match self.static_vars.get(&key) {
+                        Some(Value::Ref(c)) => c.clone(),
+                        _ => {
+                            let iv = match init {
+                                Some(e) => self.eval(e)?,
+                                None => Value::Null,
+                            };
+                            let c = Rc::new(RefCell::new(iv));
+                            self.static_vars.insert(key, Value::Ref(c.clone()));
+                            c
+                        }
+                    };
+                    self.vars().insert(name.clone(), Value::Ref(cell));
+                }
+            }
             // not yet implemented in this increment — parsed but skipped
-            Stmt::StaticVar(_)
-            | Stmt::Namespace { .. }
+            Stmt::Namespace { .. }
             | Stmt::Use(_)
-            | Stmt::Declare => {}
+            | Stmt::Declare { strict_types: false } => {}
+            Stmt::Declare { strict_types: true } => {
+                self.strict_types = true;
+            }
         }
         Ok(Flow::Normal)
     }
@@ -3871,14 +3908,14 @@ impl Eval {
         }
         let r = match &c.kind {
             ClosureKind::Full(f) => {
-                self.bind_params(&mut scope, &f.params, &args)?;
+                self.bind_params(&mut scope, &f.params, &args, "{closure}")?;
                 self.scopes.push(scope);
                 let r = self.run_fn_body(&f.body);
                 self.scopes.pop();
                 r
             }
             ClosureKind::Arrow(f) => {
-                self.bind_params(&mut scope, &f.params, &args)?;
+                self.bind_params(&mut scope, &f.params, &args, "{closure}")?;
                 self.scopes.push(scope);
                 let r = self.eval(&f.body);
                 self.scopes.pop();
@@ -3938,30 +3975,12 @@ impl Eval {
         self.cur_args.push(args.clone());
         self.cur_fn.push(f.name.clone());
         let mut scope = HashMap::new();
-        for (i, p) in f.params.iter().enumerate() {
-            if p.variadic {
-                let mut rest = Arr::new();
-                for v in args.iter().skip(i) {
-                    rest.push(v.clone());
-                }
-                scope.insert(p.name.clone(), Value::Array(rest));
-                break;
-            }
-            let v = match args.get(i) {
-                Some(Value::Ref(c)) => {
-                    if p.by_ref {
-                        Value::Ref(c.clone())
-                    } else {
-                        c.borrow().deref()
-                    }
-                }
-                Some(v) => v.clone(),
-                None => match &p.default {
-                    Some(d) => self.eval(d)?,
-                    None => Value::Null,
-                },
-            };
-            scope.insert(p.name.clone(), v);
+        let bind = self.bind_params(&mut scope, &f.params, &args, &f.name);
+        if let Err(e) = bind {
+            self.cur_args.pop();
+            self.cur_fn.pop();
+            self.call_depth -= 1;
+            return Err(e);
         }
         self.scopes.push(scope);
         let r = self.run_fn_body(&f.body);
@@ -3971,7 +3990,9 @@ impl Eval {
         self.cur_fn.pop();
         self.call_depth -= 1;
         self.apply_byref(byref, wb)?;
-        r
+        let fname = f.name.clone();
+        let rt = f.ret_type.clone();
+        r.and_then(|v| self.check_return(v, &rt, &fname))
     }
 
     /// By-reference parameter write-back. The engine passes arguments by value;
@@ -4454,7 +4475,8 @@ impl Eval {
         if !m.is_static {
             scope.insert("this".to_string(), recv.clone());
         }
-        self.bind_params(&mut scope, &m.params, &args)?;
+        let mfname = format!("{}::{}", display_class(decl_class), m.name);
+        self.bind_params(&mut scope, &m.params, &args, &mfname)?;
         // constructor property promotion
         if m.name.eq_ignore_ascii_case("__construct") {
             if let Value::Object(rc) = &recv {
@@ -4489,7 +4511,8 @@ impl Eval {
         self.cur_fn.pop();
         self.call_depth -= 1;
         self.apply_byref(byref, wb)?;
-        r
+        let rt = m.ret_type.clone();
+        r.and_then(|v| self.check_return(v, &rt, &mfname))
     }
 
     fn call_static(
@@ -4613,7 +4636,8 @@ impl Eval {
                 scope.insert("this".to_string(), t);
             }
         }
-        self.bind_params(&mut scope, &m.params, &args)?;
+        let mfname = format!("{}::{}", display_class(&decl_class), m.name);
+        self.bind_params(&mut scope, &m.params, &args, &mfname)?;
         let prev_class = self.current_class.replace(decl_class.clone());
         // LSB scope: forwarding calls keep the caller's; explicit C::m() rebinds.
         // (Canonicalize through find_class so case matches the declaration.)
@@ -4635,7 +4659,198 @@ impl Eval {
         self.cur_fn.pop();
         self.call_depth -= 1;
         self.apply_byref(byref, wb)?;
-        r
+        let rt = m.ret_type.clone();
+        r.and_then(|v| self.check_return(v, &rt, &mfname))
+    }
+
+    /// Does `v` satisfy the single (non-union) declared type `t`?
+    fn type_matches_one(&self, t: &str, v: &Value) -> bool {
+        match t.to_ascii_lowercase().as_str() {
+            "mixed" => true,
+            "int" => matches!(v, Value::Int(_)),
+            "float" => matches!(v, Value::Float(_) | Value::Int(_)), // int→float widening
+            "string" => matches!(v, Value::Str(_)),
+            "bool" | "true" | "false" => matches!(v, Value::Bool(_)),
+            "array" => matches!(v, Value::Array(_)),
+            "null" => matches!(v, Value::Null),
+            "object" => matches!(v, Value::Object(_) | Value::Closure(_)),
+            "callable" => matches!(v, Value::Closure(_) | Value::Str(_) | Value::Array(_)),
+            "iterable" => match v {
+                Value::Array(_) => true,
+                Value::Object(rc) => {
+                    let c = rc.borrow().class.clone();
+                    self.instance_of_name(&c, "Traversable")
+                        || self.find_method(&c, "current").is_some()
+                        || self.find_method(&c, "getiterator").is_some()
+                }
+                _ => false,
+            },
+            "self" | "static" | "parent" => matches!(v, Value::Object(_)),
+            _ => match v {
+                // class/interface type: exact, ancestor, or implemented interface
+                Value::Object(rc) => {
+                    let c = rc.borrow().class.clone();
+                    self.instance_of_name(&c, t.trim_start_matches('\\'))
+                }
+                Value::Closure(_) => t.eq_ignore_ascii_case("closure"),
+                _ => false,
+            },
+        }
+    }
+
+    /// Is class `c` (or an ancestor) named `want`, or does it implement it?
+    fn instance_of_name(&self, c: &str, want: &str) -> bool {
+        if c.eq_ignore_ascii_case(want) {
+            return true;
+        }
+        for a in self.ancestry(c) {
+            if a.name.eq_ignore_ascii_case(want) {
+                return true;
+            }
+            for i in &a.interfaces {
+                if i.last().eq_ignore_ascii_case(want) || self.instance_of_name(i.last(), want) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The type-name PHP uses in TypeError messages for a given value.
+    fn given_type(&self, v: &Value) -> String {
+        match v {
+            Value::Null => "null".into(),
+            Value::Bool(_) => "bool".into(),
+            Value::Int(_) => "int".into(),
+            Value::Float(_) => "float".into(),
+            Value::Str(_) => "string".into(),
+            Value::Array(_) => "array".into(),
+            Value::Closure(_) => "Closure".into(),
+            Value::Object(rc) => display_class(&rc.borrow().class),
+            Value::Ref(c) => self.given_type(&c.borrow()),
+        }
+    }
+
+    /// Enforce a declared type on an argument or return value: pass it through,
+    /// weak-coerce it (unless strict_types), or produce the TypeError message.
+    /// Returns Err(message) with PHP's "must be of type X, Y given" core.
+    fn coerce_typed(&mut self, hint: &str, v: Value) -> Result<Value, String> {
+        // nullable prefix / union parts (intersections: any object passes)
+        let (nullable, body) = match hint.strip_prefix('?') {
+            Some(rest) => (true, rest),
+            None => (false, hint),
+        };
+        if body.contains('&') {
+            return match v {
+                Value::Object(_) => Ok(v),
+                _ => Err(format!("must be of type {hint}, {} given", self.given_type(&v))),
+            };
+        }
+        let parts: Vec<&str> = body.split('|').collect();
+        if matches!(v, Value::Null)
+            && (nullable || parts.iter().any(|p| p.eq_ignore_ascii_case("null") || p.eq_ignore_ascii_case("mixed")))
+        {
+            return Ok(v);
+        }
+        for p in &parts {
+            if self.type_matches_one(p, &v) {
+                // canonical widening: int satisfies a float declaration as float
+                if p.eq_ignore_ascii_case("float") {
+                    if let Value::Int(n) = v {
+                        return Ok(Value::Float(n as f64));
+                    }
+                }
+                return Ok(v);
+            }
+        }
+        // weak-mode scalar coercions (PHP 8 rules, deprecations not modeled)
+        if !self.strict_types {
+            for p in &parts {
+                let coerced = match (p.to_ascii_lowercase().as_str(), &v) {
+                    ("int", Value::Float(f)) => Some(Value::Int(*f as i64)),
+                    ("int", Value::Bool(b)) => Some(Value::Int(*b as i64)),
+                    ("int", Value::Str(s)) if is_numeric_str(s) => Some(Value::Int(to_i64(&v))),
+                    ("float", Value::Bool(b)) => Some(Value::Float(*b as i64 as f64)),
+                    ("float", Value::Str(s)) if is_numeric_str(s) => Some(Value::Float(to_f64(&v))),
+                    ("string", Value::Int(_) | Value::Float(_) | Value::Bool(_)) => {
+                        Some(Value::Str(to_bytes(&v)))
+                    }
+                    ("string", Value::Object(rc)) => {
+                        let c = rc.borrow().class.clone();
+                        if self.find_method(&c, "__tostring").is_some() {
+                            match self.stringify(&v) {
+                                Ok(s) => Some(Value::Str(s)),
+                                Err(_) => None,
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    ("bool", Value::Int(_) | Value::Float(_) | Value::Str(_)) => {
+                        Some(Value::Bool(to_bool(&v)))
+                    }
+                    _ => None,
+                };
+                if let Some(c) = coerced {
+                    return Ok(c);
+                }
+            }
+        }
+        Err(format!("must be of type {hint}, {} given", self.given_type(&v)))
+    }
+
+    /// Type-check/coerce one passed argument against its declared param type.
+    fn check_arg(&mut self, p: &Param, i: usize, v: Value, fname: &str) -> R<Value> {
+        let Some(hint) = p.type_hint.clone() else { return Ok(v) };
+        if matches!(v, Value::Ref(_)) {
+            return Ok(v); // by-ref alias: checked at write sites, not here
+        }
+        match self.coerce_typed(&hint, v) {
+            Ok(v) => Ok(v),
+            Err(core) => {
+                let file = self
+                    .cur_file
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Err(self.throw_error(
+                    "TypeError",
+                    &format!(
+                        "{fname}(): Argument #{} (${}) {core}, called in {file} on line 0",
+                        i + 1,
+                        p.name
+                    ),
+                ))
+            }
+        }
+    }
+
+    /// Type-check a return value against the declared return type. Null passes
+    /// unconditionally (we can't distinguish `return null` from falling off the
+    /// end, and void/implicit returns must not throw); generators skip too.
+    fn check_return(&mut self, v: Value, rt: &Option<String>, fname: &str) -> R<Value> {
+        let Some(rt) = rt else { return Ok(v) };
+        if matches!(v, Value::Null) {
+            return Ok(v);
+        }
+        let lower = rt.to_ascii_lowercase();
+        if matches!(lower.as_str(), "void" | "never" | "mixed") {
+            return Ok(v);
+        }
+        if let Value::Object(rc) = &v {
+            if rc.borrow().class == "Generator" {
+                return Ok(v);
+            }
+        }
+        let rt = rt.clone();
+        match self.coerce_typed(&rt, v) {
+            Ok(v) => Ok(v),
+            Err(core) => {
+                let msg =
+                    format!("{fname}(): Return value {}", core.replacen(" given", " returned", 1));
+                Err(self.throw_error("TypeError", &msg))
+            }
+        }
     }
 
     fn bind_params(
@@ -4643,6 +4858,7 @@ impl Eval {
         scope: &mut HashMap<String, Value>,
         params: &[Param],
         args: &[Value],
+        fname: &str,
     ) -> R<()> {
         for (i, p) in params.iter().enumerate() {
             if p.variadic {
@@ -4653,6 +4869,7 @@ impl Eval {
                 scope.insert(p.name.clone(), Value::Array(rest));
                 break;
             }
+            let passed = i < args.len();
             let v = match args.get(i) {
                 // A Ref arg (only builtin-driven calls construct these) aliases
                 // into a by-ref param; a by-value param gets the dereferenced copy.
@@ -4669,6 +4886,7 @@ impl Eval {
                     None => Value::Null,
                 },
             };
+            let v = if passed { self.check_arg(p, i, v, fname)? } else { v };
             scope.insert(p.name.clone(), v);
         }
         Ok(())
