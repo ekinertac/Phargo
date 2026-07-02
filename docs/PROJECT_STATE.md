@@ -45,6 +45,21 @@ the shipping number on the same suite. Then deleted the legacy engine (`lib.rs`
 
 - Legacy single-pass engine peaked ~**1981** passing.
 - v2 (Path B) reached parity, then surpassed it; legacy retired.
+- **2026-07-02/03 session: 3007 → 3150** (13.8% → 14.3%), three rungs:
+  (1) **named arguments** (parsed but silently positional — merged onto param
+  slots at every call shape) + **foreach-by-ref** (real `Value::Ref` cells in
+  array elements, promoted/demoted in place, `&` markers via `Rc::strong_count`)
+  + `*_exists` kind checks; (2) **late static binding** (`static::` had been a
+  synonym for `self::`; forwarding-call semantics), const initializers scoped to
+  declaring class, **undefined constants throw** per PHP 8 (after filling LC_*/
+  EXTR_*/PHP_QUERY_*/STREAM_FILTER_*), real `error_reporting()` state, E_ALL=30719;
+  (3) **named timezones** — from-scratch TZif reader (`src/tz.rs`) over the host's
+  /usr/share/zoneinfo, wired through date()/mktime()/strtotime()/DateTime/
+  DateTimeZone (per-object zones, wall-clock add/sub/modify, getTransitions),
+  `--INI--` date.timezone honored by the runner, DatePeriod + DATE_* constants,
+  DateTime var_dump synthesis — and the discovery that **`clone` was never
+  implemented** (evaluated to NULL engine-wide; DateTimeImmutable was silently
+  broken everywhere). ext/date went 77 → 155.
 - **2026-06-14 → 07-02 grind: 2176 → 3007** (9.98% → 13.8% of gradeable),
   crossing 10/11/12/13% and 3000 tests. Key rungs in order:
   generators (eager `yield`); the **6 GiB capped allocator + generator node caps**
@@ -85,22 +100,29 @@ the shipping number on the same suite. Then deleted the legacy engine (`lib.rs`
   path; check `git status --porcelain` before every add.
 - **`git add -A` once swept in a corpus-generated junk file.** Always inspect first.
 
-## Current state (2026-07-02)
+## Current state (2026-07-03)
 
-- **~3007 / 21796 gradeable (~13.8%).** From the whole-corpus analysis: only ~6
-  panics in 13.5k tests (engine is robust); failures are missing features.
+- **3150 / 21970 gradeable (14.3%).** Only ~7 panics in the whole corpus (engine
+  is robust); failures are missing features.
 - **Realistic ceiling ~40–45%** — the rest is out-of-scope C extensions.
 - The **pure-PHP-builtins vein is largely mined out**; remaining MISSING_FN are C
   extensions + `crypt`.
+- **Timezones are now real** (TZif reader over host zoneinfo — note: needs
+  /usr/share/zoneinfo, i.e. Unix; Windows hosts fall back to UTC-only).
+  ext/date sits at 155/689; the biggest remaining date cluster is
+  **`DateTime::createFromFormat`** (real format-string parsing, ~30 files) +
+  microsecond storage ('u' currently prints 000000).
 
 ## Next targets (by leverage, achievable only)
 
-1. **`ext/date` timezones** — named zones / offsets / DST / abbreviations. The
-   larger unbuilt half of date; hundreds of tests. Touches all date formatting →
-   watch the scoreboard for regressions. `strtotime` parsing is already expanded.
+1. **`DateTime::createFromFormat`** — real format parser; unlocks ~30 date files
+   plus knock-on passes elsewhere.
 2. **DOM convenience methods** (`loadHTML`, `remove`/`append`/`before`/`after`) —
    cheap on the existing tree, but ext/dom is capped by exact-serialization matching.
-3. **Parser clusters** — small whole-test wins (e.g. lexer "unterminated string").
+3. **Parser clusters** — small whole-test wins (e.g. lexer "unterminated string",
+   `#[Attr]` in expressions, semi-reserved method names).
+4. **MISMATCH_CLOSE sampler** (`suiteanalyze -- close`) keeps paying: it found
+   named args, LSB, and clone. Re-run it after each batch.
 
 **Avoid:** the Uri/Url 8.5 API (needs IDN/punycode + exact var_dump of internal
 objects — PHP uses C libs lexbor/uriparser; much harder than it looks) and all the

@@ -68,10 +68,36 @@ pub(crate) const DAYS: [&str; 7] = [
     "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
 ];
 
-/// Format a Unix timestamp with a PHP `date()` format string (UTC).
+/// Format a Unix timestamp with a PHP `date()` format string, UTC (gmdate & the
+/// default-UTC fast path).
 pub(crate) fn php_date(fmt: &str, ts: i64) -> String {
-    let days = ts.div_euclid(86400);
-    let secs = ts.rem_euclid(86400);
+    php_date_tz(fmt, ts, None)
+}
+
+/// ISO-8601 week number and week-year (`W` / `o` format codes).
+fn iso_week(y: i64, m: i64, d: i64) -> (i64, i64) {
+    let days = days_from_civil(y, m, d);
+    let wday = (days.rem_euclid(7) + 3) % 7; // 0 = Monday
+    let thursday = days - wday + 3;
+    let (wy, _, _) = civil_from_days(thursday);
+    let jan1 = days_from_civil(wy, 1, 1);
+    let week = (thursday - jan1) / 7 + 1;
+    (week, wy)
+}
+
+/// Format a Unix timestamp with a PHP `date()` format string in the given zone
+/// (`None` = UTC). Zone-dependent codes (e/T/O/P/p/Z/I) come from the TZif data.
+pub(crate) fn php_date_tz(fmt: &str, ts: i64, zone: Option<&crate::tz::TzData>) -> String {
+    let (off, isdst, abbr, zname) = match zone {
+        Some(z) => {
+            let (o, d, a) = z.offset_at(ts);
+            (o as i64, d, a.to_string(), z.name.clone())
+        }
+        None => (0, false, "UTC".to_string(), "UTC".to_string()),
+    };
+    let local = ts + off;
+    let days = local.div_euclid(86400);
+    let secs = local.rem_euclid(86400);
     let (y, m, d) = civil_from_days(days);
     let (hour, minute, second) = (secs / 3600, (secs % 3600) / 60, secs % 60);
     let wday = (days.rem_euclid(7) + 4) % 7; // 1970-01-01 = Thursday
@@ -83,6 +109,11 @@ pub(crate) fn php_date(fmt: &str, ts: i64) -> String {
         } else {
             h
         }
+    };
+    let off_hm = |sep: &str| {
+        let sign = if off < 0 { '-' } else { '+' };
+        let a = off.abs();
+        format!("{sign}{:02}{sep}{:02}", a / 3600, (a % 3600) / 60)
     };
     let mut out = String::new();
     let chars: Vec<char> = fmt.chars().collect();
@@ -123,6 +154,35 @@ pub(crate) fn php_date(fmt: &str, ts: i64) -> String {
             'L' => out.push_str(if is_leap(y) { "1" } else { "0" }),
             'z' => out.push_str(&yday.to_string()),
             'U' => out.push_str(&ts.to_string()),
+            'u' => out.push_str("000000"),
+            'v' => out.push_str("000"),
+            'W' => out.push_str(&format!("{:02}", iso_week(y, m, d).0)),
+            'o' => out.push_str(&iso_week(y, m, d).1.to_string()),
+            // Swatch Internet Time — always relative to UTC+1, zone-independent
+            'B' => {
+                let beat = ((ts + 3600).rem_euclid(86400)) * 1000 / 86400;
+                out.push_str(&format!("{beat:03}"));
+            }
+            // timezone-dependent
+            'e' => out.push_str(&zname),
+            'T' => out.push_str(&abbr),
+            'O' => out.push_str(&off_hm("")),
+            'P' => out.push_str(&off_hm(":")),
+            'p' => out.push_str(&if off == 0 { "Z".to_string() } else { off_hm(":") }),
+            'Z' => out.push_str(&off.to_string()),
+            'I' => out.push_str(if isdst { "1" } else { "0" }),
+            'c' => {
+                out.push_str(&format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}"));
+                out.push_str(&off_hm(":"));
+            }
+            'r' => {
+                out.push_str(&format!(
+                    "{}, {d:02} {} {y} {hour:02}:{minute:02}:{second:02} {}",
+                    &DAYS[wday as usize][..3],
+                    &MONTHS[(m - 1) as usize][..3],
+                    off_hm("")
+                ));
+            }
             'S' => out.push_str(match d % 10 {
                 _ if (11..=13).contains(&(d % 100)) => "th",
                 1 => "st",
@@ -269,6 +329,24 @@ fn parse_time(tok: &str) -> Option<(i64, i64, i64)> {
         if !pm && h == 12 { h = 0; }
     }
     Some((h, mi, se))
+}
+
+/// Timezone-aware `strtotime`: wall-clock strings are interpreted in `zone`.
+/// The parser itself works in "wall seconds"; we shift the base into local wall
+/// time, parse there, and convert the result back to UTC. `@ts` stays absolute.
+pub(crate) fn php_strtotime_tz(s: &str, base: i64, zone: Option<&crate::tz::TzData>) -> Option<i64> {
+    let t = s.trim();
+    if let Some(rest) = t.strip_prefix('@') {
+        return rest.trim().split('.').next().unwrap_or("").parse::<i64>().ok();
+    }
+    match zone {
+        None => php_strtotime(s, base),
+        Some(z) => {
+            let (off, _, _) = z.offset_at(base);
+            let wall = php_strtotime(s, base + off as i64)?;
+            Some(crate::tz::ts_from_local(wall, z))
+        }
+    }
 }
 
 pub(crate) fn php_strtotime(s: &str, base: i64) -> Option<i64> {

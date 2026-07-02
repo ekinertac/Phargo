@@ -80,6 +80,7 @@ static GLOBAL: capped_alloc::Capped = capped_alloc::Capped;
 mod datetime;
 mod hash;
 mod regex;
+pub(crate) mod tz;
 pub(crate) use datetime::*;
 pub(crate) use hash::*;
 pub(crate) use regex::*;
@@ -103,6 +104,12 @@ pub(crate) type R<T> = Result<T, EngineError>;
 /// Execute PHP `source` and return everything it would have printed to stdout.
 pub fn run(source: &str) -> R<String> {
     run_with_path(source, None)
+}
+
+/// Set the default timezone (IANA name) the next run starts with — the harness
+/// hook for a .phpt `--INI--` `date.timezone=` line. `None` resets to UTC.
+pub fn set_default_timezone(tz: Option<String>) {
+    tz::set_default_tz(tz);
 }
 
 /// Like [`run`], but records the script's file path so `__FILE__`/`__DIR__` and

@@ -21,6 +21,9 @@ struct Phpt {
     file: String,
     expect: Option<String>,
     expectf: Option<String>,
+    /// `date.timezone=` from the --INI-- section (run-tests.php applies these
+    /// ini lines; the timezone is the only one that changes graded output often).
+    ini_tz: Option<String>,
     path: PathBuf,
 }
 
@@ -116,12 +119,17 @@ fn evaluate(t: &Phpt) -> Outcome {
         return Outcome::Unsupported;
     }
     // A buggy engine path on one test must never crash the whole run.
+    phargo::set_default_timezone(t.ini_tz.clone());
     let actual = match panic::catch_unwind(panic::AssertUnwindSafe(|| {
         run_with_path(&t.file, Some(t.path.clone()))
     })) {
         Ok(Ok(s)) => s,
-        _ => return Outcome::Fail,
+        _ => {
+            phargo::set_default_timezone(None);
+            return Outcome::Fail;
+        }
     };
+    phargo::set_default_timezone(None);
     // Normalize line endings: the corpus is checked out with CRLF on Windows, but
     // PHP output (and run-tests.php's comparison) is LF — so compare LF-to-LF.
     let actual = lf(&actual);
@@ -371,10 +379,19 @@ fn parse_phpt(text: &str) -> Phpt {
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.clone())
     };
+    let ini_tz = get("INI").and_then(|ini| {
+        ini.lines().find_map(|l| {
+            let l = l.trim();
+            l.strip_prefix("date.timezone")
+                .and_then(|r| r.trim_start().strip_prefix('='))
+                .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_string())
+        })
+    });
     Phpt {
         file: get("FILE").unwrap_or_default(),
         expect: get("EXPECT"),
         expectf: get("EXPECTF"),
+        ini_tz,
         path: PathBuf::new(),
     }
 }

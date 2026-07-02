@@ -27,6 +27,46 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-03 — Real timezones (a from-scratch TZif reader), and `clone` didn't exist
+
+**Pass rate: 3051 → 3150 — the biggest single-batch jump since the CRLF discovery.**
+
+The marquee rung this project has been circling for weeks: **named timezones**.
+The engine was UTC-only — `DateTimeZone::getOffset()` returned a hardcoded 0.
+
+- **`src/tz.rs`: a from-scratch RFC 8536 (TZif) reader.** Instead of embedding a
+  timezone database, we parse the host's `/usr/share/zoneinfo` files — the same
+  IANA tzdata PHP's own timezonedb is generated from, so historical offsets, DST
+  transitions, and abbreviations match PHP's answers exactly. ~150 lines, no
+  dependencies, cached per thread. `zdump` confirmed macOS ships fat TZif2 files
+  with transitions precomputed through 2037 — full coverage for every date the
+  corpus tests actually use.
+- Everything date-shaped grew a timezone dimension: `date()` vs `gmdate()`,
+  `mktime()` (wall-clock inverse mapping with the classic two-pass offset fixup),
+  `strtotime()` (parses in the default zone), `DateTime`/`DateTimeImmutable`
+  carry a per-object zone, `getTransitions()` streams the real transition table,
+  and `DateTime::add/sub/modify` now do calendar math on the **local wall clock**
+  — crossing a fall-back transition keeps the wall time, gaining an hour of real
+  time, exactly like PHP.
+- The scoreboard runner now honors `--INI--` `date.timezone=` lines the way
+  run-tests.php does — 157 date tests declare their zone there.
+- `var_dump(new DateTime)` prints PHP's synthesized debug props
+  (`date`/`timezone_type`/`timezone`), not our internal state.
+- The `DATE_*` / `DateTimeInterface::*` format constants, `getdate()`,
+  `DatePeriod` (all three constructor forms), `DateInterval::createFromDateString`,
+  Swatch beat `date('B')`, ISO week `W`/`o`, and `c`/`r` formats.
+
+And then the stunner, found because `DatePeriod` looped forever: **`clone` was
+never implemented.** The parser built `Expr::Clone` nodes; the evaluator had no
+arm for them — every `clone $obj` in every test quietly evaluated to NULL. All
+of `DateTimeImmutable` was silently broken; so was every OOP test that clones.
+One proper eval arm (shallow prop copy, fresh instance id, `__clone()` hook)
+later, whole families of tests lit up. The corpus keeps teaching the same
+lesson: it's never the fancy features — it's the load-bearing keyword nobody
+tested by hand.
+
+---
+
 ## 2026-07-02 (later) — `static::` was a synonym for `self::`
 
 **Pass rate: 3029 → 3051.**

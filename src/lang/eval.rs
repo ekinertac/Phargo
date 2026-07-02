@@ -44,6 +44,9 @@ pub struct Eval {
     /// error_reporting() level (default E_ALL; we don't emit notices, but tests
     /// read the value back).
     error_level: i64,
+    /// date.timezone / date_default_timezone_set() — IANA zone name. "UTC" means
+    /// the trivial zone (no TZif lookup).
+    default_tz: String,
     /// In-flight thrown exception (set by `throw`, cleared by a matching `catch`).
     thrown: Option<Value>,
     /// Current function/method call nesting — guards against stack overflow.
@@ -149,44 +152,140 @@ class UnderflowException extends RuntimeException {}
 class OverflowException extends RuntimeException {}
 class JsonException extends Exception {}
 
-interface DateTimeInterface {}
+interface DateTimeInterface {
+    const ATOM = 'Y-m-d\TH:i:sP';
+    const ISO8601 = 'Y-m-d\TH:i:sO';
+    const RFC822 = 'D, d M y H:i:s O';
+    const RFC850 = 'l, d-M-y H:i:s T';
+    const RFC1036 = 'D, d M y H:i:s O';
+    const RFC1123 = 'D, d M Y H:i:s O';
+    const RFC2822 = 'D, d M Y H:i:s O';
+    const RFC3339 = 'Y-m-d\TH:i:sP';
+    const RFC3339_EXTENDED = 'Y-m-d\TH:i:s.vP';
+    const RFC7231 = 'D, d M Y H:i:s \G\M\T';
+    const COOKIE = 'l, d-M-Y H:i:s T';
+    const RSS = 'D, d M Y H:i:s O';
+    const W3C = 'Y-m-d\TH:i:sP';
+}
 class DateTimeZone {
     public $name;
-    public function __construct($name = "UTC") { $this->name = $name; }
+    public function __construct($name = "UTC") {
+        if (!__phargo_tz_valid($name)) {
+            throw new Exception("DateTimeZone::__construct(): Unknown or bad timezone ($name)");
+        }
+        $this->name = $name;
+    }
     public function getName() { return $this->name; }
-    public function getOffset($dt) { return 0; }
+    public function getOffset($dt) { return __phargo_tz_offset($this->name, $dt->getTimestamp()); }
+    public function getTransitions($begin = null, $end = null) {
+        if ($begin === null) { $begin = -2147483648; }
+        if ($end === null) { $end = 2147483647; }
+        return __phargo_tz_transitions($this->name, $begin, $end);
+    }
+}
+class DatePeriod implements IteratorAggregate {
+    const EXCLUDE_START_DATE = 1;
+    const INCLUDE_END_DATE = 2;
+    public $start; public $interval; public $end;
+    public $recurrences; public $include_start_date = true; public $include_end_date = false;
+    private $__options = 0;
+    public function __construct($start, $interval = null, $end = null, $options = 0) {
+        if (is_string($start)) {
+            // ISO 8601 form: "R<n>/<start>/P<interval>"
+            $parts = explode("/", $start);
+            $options = $interval === null ? 0 : $interval;
+            $this->recurrences = (int)substr($parts[0], 1);
+            $start = new DateTimeImmutable($parts[1]);
+            $interval = new DateInterval($parts[2]);
+            $end = null;
+        }
+        $this->start = $start; $this->interval = $interval;
+        if (is_int($end)) { $this->recurrences = $end; }
+        else { $this->end = $end; }
+        $this->__options = $options;
+        $this->include_start_date = ($options & 1) === 0;
+        $this->include_end_date = ($options & 2) !== 0;
+    }
+    public static function createFromISO8601String($spec, $options = 0) {
+        return new DatePeriod($spec, $options);
+    }
+    public function getStartDate() { return $this->start; }
+    public function getEndDate() { return $this->end; }
+    public function getDateInterval() { return $this->interval; }
+    public function getRecurrences() { return $this->recurrences; }
+    public function getIterator(): Iterator {
+        $out = [];
+        $cur = clone $this->start;
+        $emitted = 0; $step = 0;
+        while (true) {
+            if ($this->end !== null) {
+                $endts = $this->end->getTimestamp();
+                if ($cur->getTimestamp() > $endts) { break; }
+                if ($cur->getTimestamp() == $endts && !$this->include_end_date) { break; }
+            } elseif ($this->recurrences !== null) {
+                // recurrences = periods after the start date
+                if ($step > $this->recurrences) { break; }
+            } else { break; }
+            if (!($step === 0 && !$this->include_start_date)) {
+                $out[] = clone $cur;
+                $emitted++;
+            }
+            if ($emitted > 10000) { break; }
+            $next = clone $cur;
+            $cur = $next->add($this->interval);
+            $step++;
+        }
+        return new ArrayIterator($out);
+    }
 }
 class DateTime implements DateTimeInterface {
     public $__ts;
-    public function __construct($s = "now") { $this->__ts = strtotime($s); }
-    public function format($fmt) { return date($fmt, $this->__ts); }
+    public $__tz;
+    public function __construct($s = "now", $tz = null) {
+        $this->__tz = $tz === null ? date_default_timezone_get() : $tz->getName();
+        $this->__ts = __phargo_strtotime_tz($s, time(), $this->__tz);
+        if ($this->__ts === false) {
+            throw new Exception("DateTime::__construct(): Failed to parse time string ($s)");
+        }
+    }
+    public function format($fmt) { return __phargo_date_tz($fmt, $this->__ts, $this->__tz); }
     public function getTimestamp() { return $this->__ts; }
     public function setTimestamp($ts) { $this->__ts = $ts; return $this; }
-    public function setDate($y, $m, $d) { $this->__ts = mktime((int)date("H", $this->__ts), (int)date("i", $this->__ts), (int)date("s", $this->__ts), $m, $d, $y); return $this; }
-    public function setTime($h, $i, $s = 0) { $this->__ts = mktime($h, $i, $s, (int)date("n", $this->__ts), (int)date("j", $this->__ts), (int)date("Y", $this->__ts)); return $this; }
-    public function getTimezone() { return new DateTimeZone("UTC"); }
-    public function setTimezone($tz) { return $this; }
-    public function getOffset() { return 0; }
-    public function add($iv) { $this->__ts = phargo_civil_add($this->__ts, $iv->y, $iv->m, $iv->d, $iv->h, $iv->i, $iv->s); return $this; }
-    public function sub($iv) { $this->__ts = phargo_civil_add($this->__ts, -$iv->y, -$iv->m, -$iv->d, -$iv->h, -$iv->i, -$iv->s); return $this; }
-    public function modify($s) { $this->__ts = __phargo_modify($this->__ts, $s); return $this; }
+    public function setDate($y, $m, $d) { $this->__ts = __phargo_mktime_tz((int)$this->format("H"), (int)$this->format("i"), (int)$this->format("s"), $m, $d, $y, $this->__tz); return $this; }
+    public function setTime($h, $i, $s = 0) { $this->__ts = __phargo_mktime_tz($h, $i, $s, (int)$this->format("n"), (int)$this->format("j"), (int)$this->format("Y"), $this->__tz); return $this; }
+    public function getTimezone() { return new DateTimeZone($this->__tz); }
+    public function setTimezone($tz) { $this->__tz = $tz->getName(); return $this; }
+    public function getOffset() { return __phargo_tz_offset($this->__tz, $this->__ts); }
+    public function add($iv) { $this->__ts = phargo_civil_add($this->__ts, $iv->y, $iv->m, $iv->d, $iv->h, $iv->i, $iv->s, $this->__tz); return $this; }
+    public function sub($iv) { $this->__ts = phargo_civil_add($this->__ts, -$iv->y, -$iv->m, -$iv->d, -$iv->h, -$iv->i, -$iv->s, $this->__tz); return $this; }
+    public function modify($s) { $this->__ts = __phargo_modify($this->__ts, $s, $this->__tz); return $this; }
     public function diff($other) { return DateInterval::__fromArray(phargo_date_diff($this->__ts, $other->getTimestamp())); }
-    public static function createFromFormat($fmt, $s, $tz = null) { return new DateTime($s); }
+    public static function createFromFormat($fmt, $s, $tz = null) { return new DateTime($s, $tz); }
 }
 class DateTimeImmutable implements DateTimeInterface {
     public $__ts;
-    public function __construct($s = "now") { $this->__ts = strtotime($s); }
-    public function format($fmt) { return date($fmt, $this->__ts); }
+    public $__tz;
+    public function __construct($s = "now", $tz = null) {
+        $this->__tz = $tz === null ? date_default_timezone_get() : $tz->getName();
+        $this->__ts = __phargo_strtotime_tz($s, time(), $this->__tz);
+        if ($this->__ts === false) {
+            throw new Exception("DateTimeImmutable::__construct(): Failed to parse time string ($s)");
+        }
+    }
+    public function format($fmt) { return __phargo_date_tz($fmt, $this->__ts, $this->__tz); }
     public function getTimestamp() { return $this->__ts; }
-    public function getTimezone() { return new DateTimeZone("UTC"); }
-    public function add($iv) { $n = clone $this; $n->__ts = phargo_civil_add($this->__ts, $iv->y, $iv->m, $iv->d, $iv->h, $iv->i, $iv->s); return $n; }
-    public function sub($iv) { $n = clone $this; $n->__ts = phargo_civil_add($this->__ts, -$iv->y, -$iv->m, -$iv->d, -$iv->h, -$iv->i, -$iv->s); return $n; }
-    public function modify($s) { $n = clone $this; $n->__ts = __phargo_modify($this->__ts, $s); return $n; }
+    public function setTimestamp($ts) { $n = clone $this; $n->__ts = $ts; return $n; }
+    public function getTimezone() { return new DateTimeZone($this->__tz); }
+    public function setTimezone($tz) { $n = clone $this; $n->__tz = $tz->getName(); return $n; }
+    public function getOffset() { return __phargo_tz_offset($this->__tz, $this->__ts); }
+    public function add($iv) { $n = clone $this; $n->__ts = phargo_civil_add($this->__ts, $iv->y, $iv->m, $iv->d, $iv->h, $iv->i, $iv->s, $this->__tz); return $n; }
+    public function sub($iv) { $n = clone $this; $n->__ts = phargo_civil_add($this->__ts, -$iv->y, -$iv->m, -$iv->d, -$iv->h, -$iv->i, -$iv->s, $this->__tz); return $n; }
+    public function modify($s) { $n = clone $this; $n->__ts = __phargo_modify($this->__ts, $s, $this->__tz); return $n; }
     public function diff($other) { return DateInterval::__fromArray(phargo_date_diff($this->__ts, $other->getTimestamp())); }
-    public static function createFromFormat($fmt, $s, $tz = null) { return new DateTimeImmutable($s); }
+    public static function createFromFormat($fmt, $s, $tz = null) { return new DateTimeImmutable($s, $tz); }
 }
-function date_create($s = "now", $tz = null) { return new DateTime($s); }
-function date_create_immutable($s = "now", $tz = null) { return new DateTimeImmutable($s); }
+function date_create($s = "now", $tz = null) { return new DateTime($s, $tz); }
+function date_create_immutable($s = "now", $tz = null) { return new DateTimeImmutable($s, $tz); }
 function date_create_from_format($fmt, $s, $tz = null) { return DateTime::createFromFormat($fmt, $s, $tz); }
 function date_create_immutable_from_format($fmt, $s, $tz = null) { return DateTimeImmutable::createFromFormat($fmt, $s, $tz); }
 function date_diff($a, $b, $absolute = false) { return $a->diff($b); }
@@ -203,8 +302,8 @@ function date_date_set($d, $y, $m, $day) { return $d->setDate($y, $m, $day); }
 function date_time_set($d, $h, $i, $s = 0) { return $d->setTime($h, $i, $s); }
 function timezone_open($tz) { return new DateTimeZone($tz); }
 function timezone_name_get($tz) { return $tz->getName(); }
-function timezone_offset_get($tz, $dt) { return 0; }
-function date_interval_create_from_date_string($s) { $a = strtotime("now"); $b = strtotime($s); return DateInterval::__fromArray(phargo_date_diff($a, $b)); }
+function timezone_offset_get($tz, $dt) { return $tz->getOffset($dt); }
+function date_interval_create_from_date_string($s) { return DateInterval::createFromDateString($s); }
 function date_interval_format($iv, $fmt) { return $iv->format($fmt); }
 class DateInterval {
     public $y = 0; public $m = 0; public $d = 0;
@@ -233,6 +332,10 @@ class DateInterval {
         $iv->h = $a["h"]; $iv->i = $a["i"]; $iv->s = $a["s"];
         $iv->days = $a["days"]; $iv->invert = $a["invert"];
         return $iv;
+    }
+    public static function createFromDateString($s) {
+        $b = __phargo_modify(946684800, $s, "UTC"); // fixed base avoids now() drift
+        return DateInterval::__fromArray(phargo_date_diff(946684800, $b));
     }
     public function __serialize(): array {
         return ["y" => $this->y, "m" => $this->m, "d" => $this->d, "h" => $this->h,
@@ -1081,6 +1184,7 @@ impl Eval {
             current_class: None,
             called_class: None,
             error_level: 30719,
+            default_tz: crate::tz::default_tz(),
             thrown: None,
             call_depth: 0,
             eval_depth: 0,
@@ -1730,6 +1834,15 @@ impl Eval {
 
     /// One foreach iteration: bind key/value, run the body. Returns `Some(flow)`
     /// if the loop must stop (break/return propagation), `None` to continue.
+    /// The engine-default timezone as parsed TZif data (None = UTC).
+    fn cur_tz(&self) -> Option<Rc<crate::tz::TzData>> {
+        if crate::tz::is_utc_name(&self.default_tz) {
+            None
+        } else {
+            crate::tz::lookup(&self.default_tz)
+        }
+    }
+
     /// Run one `&mut Arr` operation against the array stored under a variable
     /// (directly or through a reference cell), without cloning the array.
     fn with_array_mut<T>(&mut self, name: &str, f: impl FnOnce(&mut Arr) -> T) -> Option<T> {
@@ -2086,6 +2199,32 @@ impl Eval {
                     Value::Str(self.stringify(&v)?)
                 } else {
                     self.cast(*ct, v)
+                }
+            }
+            Expr::Clone(e) => {
+                let v = self.eval(e)?;
+                match &v {
+                    Value::Object(rc) => {
+                        // shallow copy: props copied (objects inside stay shared),
+                        // fresh instance id, then __clone() runs on the copy
+                        let (class, props) = {
+                            let b = rc.borrow();
+                            (b.class.clone(), b.props.clone())
+                        };
+                        let copy = Rc::new(RefCell::new(Obj::new(class.clone())));
+                        copy.borrow_mut().props = props;
+                        let cv = Value::Object(copy);
+                        if self.find_method(&class, "__clone").is_some() {
+                            self.call_method(cv.clone(), "__clone", vec![])?;
+                        }
+                        cv
+                    }
+                    _ => {
+                        return Err(self.throw_error(
+                            "Error",
+                            &format!("__clone method called on non-object"),
+                        ))
+                    }
                 }
             }
             Expr::Match(subj, arms) => {
@@ -6474,7 +6613,78 @@ impl Eval {
             "date" | "gmdate" => {
                 let fmt = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 let ts = if args.len() > 1 { to_i64(&a(1)) } else { crate::now_unix() };
-                Value::Str(crate::php_date(&fmt, ts).into_bytes())
+                let zone = if name == "date" { self.cur_tz() } else { None };
+                Value::Str(crate::php_date_tz(&fmt, ts, zone.as_deref()).into_bytes())
+            }
+            // internal: tz-aware format/parse/offset for the DateTime prelude classes
+            "__phargo_date_tz" => {
+                let fmt = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let ts = to_i64(&a(1));
+                let tzname = String::from_utf8_lossy(&to_bytes(&a(2))).into_owned();
+                let zone = if crate::tz::is_utc_name(&tzname) { None } else { crate::tz::lookup(&tzname) };
+                Value::Str(crate::php_date_tz(&fmt, ts, zone.as_deref()).into_bytes())
+            }
+            "__phargo_tz_offset" => {
+                let tzname = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let ts = to_i64(&a(1));
+                match crate::tz::lookup(&tzname) {
+                    Some(z) => Value::Int(z.offset_at(ts).0 as i64),
+                    None => Value::Int(0),
+                }
+            }
+            "__phargo_tz_valid" => {
+                let tzname = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                Value::Bool(crate::tz::is_utc_name(&tzname) || crate::tz::lookup(&tzname).is_some())
+            }
+            "__phargo_mktime_tz" => {
+                let wall = crate::make_ts(
+                    to_i64(&a(0)),
+                    to_i64(&a(1)),
+                    to_i64(&a(2)),
+                    to_i64(&a(3)),
+                    to_i64(&a(4)),
+                    to_i64(&a(5)),
+                );
+                let tzname = String::from_utf8_lossy(&to_bytes(&a(6))).into_owned();
+                let zone = if crate::tz::is_utc_name(&tzname) { None } else { crate::tz::lookup(&tzname) };
+                Value::Int(match zone {
+                    Some(z) => crate::tz::ts_from_local(wall, &z),
+                    None => wall,
+                })
+            }
+            "__phargo_tz_transitions" => {
+                let tzname = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let begin = if args.len() > 1 { to_i64(&a(1)) } else { i32::MIN as i64 };
+                let end = if args.len() > 2 { to_i64(&a(2)) } else { i32::MAX as i64 };
+                match crate::tz::lookup(&tzname) {
+                    Some(z) => {
+                        let mut arr = Arr::new();
+                        for (ts, off, isdst, abbr) in z.transitions(begin, end) {
+                            let mut e = Arr::new();
+                            e.insert(Key::Str(b"ts".to_vec()), Value::Int(ts));
+                            e.insert(
+                                Key::Str(b"time".to_vec()),
+                                Value::Str(crate::php_date_tz("Y-m-d\\TH:i:sP", ts, None).into_bytes()),
+                            );
+                            e.insert(Key::Str(b"offset".to_vec()), Value::Int(off as i64));
+                            e.insert(Key::Str(b"isdst".to_vec()), Value::Bool(isdst));
+                            e.insert(Key::Str(b"abbr".to_vec()), Value::Str(abbr.into_bytes()));
+                            arr.push(Value::Array(e));
+                        }
+                        Value::Array(arr)
+                    }
+                    None => Value::Bool(false),
+                }
+            }
+            "__phargo_strtotime_tz" => {
+                let s = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let base = to_i64(&a(1));
+                let tzname = String::from_utf8_lossy(&to_bytes(&a(2))).into_owned();
+                let zone = if crate::tz::is_utc_name(&tzname) { None } else { crate::tz::lookup(&tzname) };
+                match crate::php_strtotime_tz(&s, base, zone.as_deref()) {
+                    Some(t) => Value::Int(t),
+                    None => Value::Bool(false),
+                }
             }
             "strftime" | "gmstrftime" => {
                 let fmt = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
@@ -6482,26 +6692,56 @@ impl Eval {
                 Value::Str(crate::php_strftime(&fmt, ts).into_bytes())
             }
             "mktime" | "gmmktime" => {
+                // defaults come from "now" in the zone the wall-clock is read in
+                let zone = if name == "mktime" { self.cur_tz() } else { None };
                 let now = crate::now_unix();
-                let (cy, cm, cd) = crate::civil_from_days(now.div_euclid(86400));
-                let secs = now.rem_euclid(86400);
+                let local_now = now + zone.as_ref().map(|z| z.offset_at(now).0 as i64).unwrap_or(0);
+                let (cy, cm, cd) = crate::civil_from_days(local_now.div_euclid(86400));
+                let secs = local_now.rem_euclid(86400);
                 let g = |i: usize, dflt: i64| if args.len() > i { to_i64(&a(i)) } else { dflt };
-                Value::Int(crate::make_ts(
+                let wall = crate::make_ts(
                     g(0, secs / 3600),
                     g(1, (secs % 3600) / 60),
                     g(2, secs % 60),
                     g(3, cm),
                     g(4, cd),
                     g(5, cy),
-                ))
+                );
+                Value::Int(match zone {
+                    Some(z) => crate::tz::ts_from_local(wall, &z),
+                    None => wall,
+                })
             }
             "strtotime" => {
                 let s = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 let base = if args.len() > 1 { to_i64(&a(1)) } else { crate::now_unix() };
-                match crate::php_strtotime(&s, base) {
+                match crate::php_strtotime_tz(&s, base, self.cur_tz().as_deref()) {
                     Some(t) => Value::Int(t),
                     None => Value::Bool(false),
                 }
+            }
+            "getdate" => {
+                let ts = if !args.is_empty() { to_i64(&a(0)) } else { crate::now_unix() };
+                let zone = self.cur_tz();
+                let local = ts + zone.as_ref().map(|z| z.offset_at(ts).0 as i64).unwrap_or(0);
+                let days = local.div_euclid(86400);
+                let secs = local.rem_euclid(86400);
+                let (y, m, d) = crate::civil_from_days(days);
+                let wday = (days.rem_euclid(7) + 4) % 7;
+                let yday = days - crate::days_from_civil(y, 1, 1);
+                let mut r = Arr::new();
+                r.insert(Key::Str(b"seconds".to_vec()), Value::Int(secs % 60));
+                r.insert(Key::Str(b"minutes".to_vec()), Value::Int((secs % 3600) / 60));
+                r.insert(Key::Str(b"hours".to_vec()), Value::Int(secs / 3600));
+                r.insert(Key::Str(b"mday".to_vec()), Value::Int(d));
+                r.insert(Key::Str(b"wday".to_vec()), Value::Int(wday));
+                r.insert(Key::Str(b"mon".to_vec()), Value::Int(m));
+                r.insert(Key::Str(b"year".to_vec()), Value::Int(y));
+                r.insert(Key::Str(b"yday".to_vec()), Value::Int(yday));
+                r.insert(Key::Str(b"weekday".to_vec()), Value::Str(crate::DAYS[wday as usize].as_bytes().to_vec()));
+                r.insert(Key::Str(b"month".to_vec()), Value::Str(crate::MONTHS[(m - 1) as usize].as_bytes().to_vec()));
+                r.insert(Key::Int(0), Value::Int(ts));
+                Value::Array(r)
             }
             "checkdate" => {
                 let (m, d, y) = (to_i64(&a(0)), to_i64(&a(1)), to_i64(&a(2)));
@@ -6730,9 +6970,19 @@ impl Eval {
                 Value::Bool(!s.is_empty() && s.iter().all(|b| b.is_ascii_whitespace()))
             }
             "phargo_civil_add" => {
+                // PHP's DateTime::add does calendar math on the LOCAL wall clock
+                // (crossing a DST change keeps the wall time) — optional arg 7 is
+                // the zone name.
                 let ts = to_i64(&a(0));
-                let days0 = ts.div_euclid(86400);
-                let secs0 = ts.rem_euclid(86400);
+                let zone = if args.len() > 7 {
+                    let tzname = String::from_utf8_lossy(&to_bytes(&a(7))).into_owned();
+                    if crate::tz::is_utc_name(&tzname) { None } else { crate::tz::lookup(&tzname) }
+                } else {
+                    None
+                };
+                let wall = ts + zone.as_ref().map(|z| z.offset_at(ts).0 as i64).unwrap_or(0);
+                let days0 = wall.div_euclid(86400);
+                let secs0 = wall.rem_euclid(86400);
                 let (y, mo, d) = crate::civil_from_days(days0);
                 let (dy, dm, dd) = (to_i64(&a(1)), to_i64(&a(2)), to_i64(&a(3)));
                 let (dh, di, ds) = (to_i64(&a(4)), to_i64(&a(5)), to_i64(&a(6)));
@@ -6741,7 +6991,11 @@ impl Eval {
                 let nmo = total_months.rem_euclid(12) + 1;
                 let nday = d.min(crate::days_in_month(ny, nmo));
                 let base = crate::days_from_civil(ny, nmo, nday) * 86400 + secs0;
-                Value::Int(base + dd * 86400 + dh * 3600 + di * 60 + ds)
+                let out_wall = base + dd * 86400 + dh * 3600 + di * 60 + ds;
+                Value::Int(match zone {
+                    Some(z) => crate::tz::ts_from_local(out_wall, &z),
+                    None => out_wall,
+                })
             }
             "phargo_date_diff" => {
                 let (t1, t2) = (to_i64(&a(0)), to_i64(&a(1)));
@@ -6809,15 +7063,27 @@ impl Eval {
                         i += 1;
                     }
                 }
-                let days0 = ts.div_euclid(86400);
-                let secs0 = ts.rem_euclid(86400);
+                // wall-clock math in the object's zone (optional arg 2)
+                let zone = if args.len() > 2 {
+                    let tzname = String::from_utf8_lossy(&to_bytes(&a(2))).into_owned();
+                    if crate::tz::is_utc_name(&tzname) { None } else { crate::tz::lookup(&tzname) }
+                } else {
+                    None
+                };
+                let wall = ts + zone.as_ref().map(|z| z.offset_at(ts).0 as i64).unwrap_or(0);
+                let days0 = wall.div_euclid(86400);
+                let secs0 = wall.rem_euclid(86400);
                 let (y, mo, d) = crate::civil_from_days(days0);
                 let total_months = (y * 12 + (mo - 1)) + dy * 12 + dm;
                 let ny = total_months.div_euclid(12);
                 let nmo = total_months.rem_euclid(12) + 1;
                 let nday = d.min(crate::days_in_month(ny, nmo));
                 let base = crate::days_from_civil(ny, nmo, nday) * 86400 + secs0;
-                Value::Int(base + dd * 86400 + dh * 3600 + di * 60 + ds)
+                let out_wall = base + dd * 86400 + dh * 3600 + di * 60 + ds;
+                Value::Int(match zone {
+                    Some(z) => crate::tz::ts_from_local(out_wall, &z),
+                    None => out_wall,
+                })
             }
             // ---- filesystem ----
             "file_get_contents" => {
@@ -7218,8 +7484,17 @@ impl Eval {
             | "gc_enable" | "gc_disable" | "header" | "clearstatcache" | "usleep" | "sleep" => {
                 Value::Null
             }
+            "date_default_timezone_set" => {
+                let tzname = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                if crate::tz::is_utc_name(&tzname) || crate::tz::lookup(&tzname).is_some() {
+                    self.default_tz = tzname;
+                    Value::Bool(true)
+                } else {
+                    Value::Bool(false)
+                }
+            }
             "trigger_error" | "spl_autoload_register" | "spl_autoload_unregister"
-            | "date_default_timezone_set" | "assert" | "gc_enabled" | "headers_sent"
+            | "assert" | "gc_enabled" | "headers_sent"
             | "stream_set_blocking" | "stream_set_timeout" | "stream_set_read_buffer"
             | "stream_set_write_buffer" | "stream_wrapper_register" | "stream_wrapper_unregister"
             | "stream_wrapper_restore" | "stream_filter_remove" => {
@@ -7283,7 +7558,7 @@ impl Eval {
             "session_status" => Value::Int(1), // PHP_SESSION_NONE
             "session_save_path" | "session_module_name" => Value::Str(Vec::new()),
             "session_get_cookie_params" => Value::Array(Arr::new()),
-            "date_default_timezone_get" => Value::Str(b"UTC".to_vec()),
+            "date_default_timezone_get" => Value::Str(self.default_tz.clone().into_bytes()),
             "debug_backtrace" => Value::Array(Arr::new()),
             "gc_collect_cycles" | "http_response_code" | "getmypid" | "hrtime" => Value::Int(0),
             "memory_get_usage" | "memory_get_peak_usage" => Value::Int(2_000_000),
@@ -8024,6 +8299,34 @@ fn var_dump_seen(ev: &Eval, v: &Value, indent: usize, out: &mut String, seen: &m
                 out.push_str(&format!("{pad}resource({rid}) of type (stream)\n"));
                 return;
             }
+            // PHP shows DateTime/DateTimeZone with computed debug props (date /
+            // timezone_type / timezone), not their internal state.
+            if matches!(ob.class.as_str(), "DateTime" | "DateTimeImmutable") {
+                let ts = ob.get("__ts").map(to_i64).unwrap_or(0);
+                let tzname = ob
+                    .get("__tz")
+                    .map(|v| String::from_utf8_lossy(&to_bytes(v)).into_owned())
+                    .unwrap_or_else(|| "UTC".to_string());
+                let zone = if crate::tz::is_utc_name(&tzname) { None } else { crate::tz::lookup(&tzname) };
+                let datestr = crate::php_date_tz("Y-m-d H:i:s", ts, zone.as_deref()) + ".000000";
+                out.push_str(&format!("{pad}object({})#{} (3) {{\n", ob.class, ob.id));
+                out.push_str(&format!("{pad}  [\"date\"]=>\n{pad}  string({}) \"{datestr}\"\n", datestr.len()));
+                out.push_str(&format!("{pad}  [\"timezone_type\"]=>\n{pad}  int(3)\n"));
+                out.push_str(&format!("{pad}  [\"timezone\"]=>\n{pad}  string({}) \"{tzname}\"\n", tzname.len()));
+                out.push_str(&format!("{pad}}}\n"));
+                return;
+            }
+            if ob.class == "DateTimeZone" {
+                let tzname = ob
+                    .get("name")
+                    .map(|v| String::from_utf8_lossy(&to_bytes(v)).into_owned())
+                    .unwrap_or_else(|| "UTC".to_string());
+                out.push_str(&format!("{pad}object(DateTimeZone)#{} (2) {{\n", ob.id));
+                out.push_str(&format!("{pad}  [\"timezone_type\"]=>\n{pad}  int(3)\n"));
+                out.push_str(&format!("{pad}  [\"timezone\"]=>\n{pad}  string({}) \"{tzname}\"\n", tzname.len()));
+                out.push_str(&format!("{pad}}}\n"));
+                return;
+            }
             out.push_str(&format!("{pad}object({})#{} ({}) {{\n", display_class(&ob.class), ob.id, ob.props.len()));
             seen.push(id);
             for (k, val) in &ob.props {
@@ -8189,6 +8492,20 @@ fn php_const(n: &str) -> Option<Value> {
     let sep = if cfg!(windows) { "\\" } else { "/" };
     Some(match n {
         "PHP_EOL" => Str(b"\n".to_vec()),
+        // date() format-string presets (also DateTimeInterface class constants)
+        "DATE_ATOM" => Str(b"Y-m-d\\TH:i:sP".to_vec()),
+        "DATE_ISO8601" => Str(b"Y-m-d\\TH:i:sO".to_vec()),
+        "DATE_RFC822" => Str(b"D, d M y H:i:s O".to_vec()),
+        "DATE_RFC850" => Str(b"l, d-M-y H:i:s T".to_vec()),
+        "DATE_RFC1036" => Str(b"D, d M y H:i:s O".to_vec()),
+        "DATE_RFC1123" => Str(b"D, d M Y H:i:s O".to_vec()),
+        "DATE_RFC2822" => Str(b"D, d M Y H:i:s O".to_vec()),
+        "DATE_RFC3339" => Str(b"Y-m-d\\TH:i:sP".to_vec()),
+        "DATE_RFC3339_EXTENDED" => Str(b"Y-m-d\\TH:i:s.vP".to_vec()),
+        "DATE_RFC7231" => Str(b"D, d M Y H:i:s \\G\\M\\T".to_vec()),
+        "DATE_COOKIE" => Str(b"l, d-M-Y H:i:s T".to_vec()),
+        "DATE_RSS" => Str(b"D, d M Y H:i:s O".to_vec()),
+        "DATE_W3C" => Str(b"Y-m-d\\TH:i:sP".to_vec()),
         "PHP_INT_MAX" => Int(i64::MAX),
         "PHP_INT_MIN" => Int(i64::MIN),
         "PHP_INT_SIZE" => Int(8),
