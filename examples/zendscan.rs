@@ -72,7 +72,7 @@ fn scan() {
         match res {
             Ok(Ok(out)) => {
                 let out = out.replace("\r\n", "\n").replace('\r', "\n");
-                if out.trim_end() == expect.trim_end() {
+                if out.trim() == expect.trim() {
                     pass += 1;
                 } else {
                     mismatch += 1;

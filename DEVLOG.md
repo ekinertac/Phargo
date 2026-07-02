@@ -27,6 +27,29 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-03 (later still) — Measure your measurement, part two
+
+**Pass rate: 3197 → 3281 (+84).**
+
+Second orchestrated wave. An analysis subagent built `examples/emptyscan.rs` to
+bucket the ~650 tests that produce empty output (verdict: mostly out-of-scope
+SOAP fixtures and a long tail, plus a few real engine-lifecycle gaps now
+queued). An implementation subagent added the SPL constants + iterator-mode /
+extract-flags plumbing (`IT_MODE_*`, `EXTR_*`, `setIteratorMode`,
+`setExtractFlags`). The orchestrator added **variable variables** — `$$x` and
+`${expr}` had NO eval, assign, or unset arms; like `clone`, a whole language
+keyword silently evaluating to NULL since day one (+10 Zend tests by itself).
+
+But the number that moved the needle was a **harness bug, again**: PHP's
+run-tests.php `trim()`s BOTH sides of actual and expected output before
+comparing. Our scoreboard only trimmed the end — so every test whose output
+legitimately begins with a newline (`echo PHP_EOL, "Done"`) failed on leading
+whitespace alone. One-line fix, +dozens of tests across every area
+(ext/standard +36, Zend +23, core +9). The CRLF lesson keeps generalizing:
+when a failure makes no sense, suspect the ruler before the thing measured.
+
+---
+
 ## 2026-07-03 (later) — First orchestrated batch: three subagents + two core fixes
 
 **Pass rate: 3175 → 3197.**

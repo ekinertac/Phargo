@@ -134,7 +134,8 @@ fn evaluate(t: &Phpt) -> Outcome {
     // PHP output (and run-tests.php's comparison) is LF — so compare LF-to-LF.
     let actual = lf(&actual);
     if let Some(e) = &t.expect {
-        if actual.trim_end() == lf(e).trim_end() {
+        // run-tests.php trims BOTH sides of actual and expected before comparing
+        if actual.trim() == lf(e).trim() {
             return Outcome::Pass;
         }
         return Outcome::Fail;
@@ -162,8 +163,8 @@ enum Tok {
 }
 
 fn expectf_matches(pattern: &str, actual: &str) -> bool {
-    let toks = parse_expectf(pattern.trim_end());
-    let s: Vec<char> = actual.trim_end().chars().collect();
+    let toks = parse_expectf(pattern.trim());
+    let s: Vec<char> = actual.trim().chars().collect();
     let mut budget: u64 = 300_000;
     match_toks(&toks, &s, &mut budget)
 }

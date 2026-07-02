@@ -622,6 +622,7 @@ class Generator implements Iterator {
     public function getReturn() { return $this->__ret; }
 }
 class ArrayIterator implements Iterator, ArrayAccess, Countable {
+    const STD_PROP_LIST = 1; const ARRAY_AS_PROPS = 2;
     private $__d; private $__k; private $__p = 0;
     public function __construct($array = []) { $this->__d = $array; $this->__k = array_keys($array); }
     public function rewind(): void { $this->__k = array_keys($this->__d); $this->__p = 0; }
@@ -799,6 +800,7 @@ class SplTempFileObject extends SplFileObject {
     public function __construct($maxmem = 0) { parent::__construct("php://temp", "w+"); }
 }
 class ArrayObject implements ArrayAccess, IteratorAggregate, Countable {
+    const STD_PROP_LIST = 1; const ARRAY_AS_PROPS = 2;
     private $__d;
     public function __construct($array = []) { $this->__d = $array; }
     public function offsetExists($k): bool { return isset($this->__d[$k]); }
@@ -811,7 +813,8 @@ class ArrayObject implements ArrayAccess, IteratorAggregate, Countable {
     public function getIterator(): Iterator { return new ArrayIterator($this->__d); }
 }
 class SplDoublyLinkedList implements Iterator, Countable, ArrayAccess {
-    protected $__d = []; protected $__p = 0; protected $__lifo = false;
+    const IT_MODE_LIFO = 2; const IT_MODE_FIFO = 0; const IT_MODE_DELETE = 1; const IT_MODE_KEEP = 0;
+    protected $__d = []; protected $__p = 0; protected $__lifo = false; protected $__mode = 0;
     public function push($v) { $this->__d[] = $v; }
     public function pop() { return array_pop($this->__d); }
     public function shift() { return array_shift($this->__d); }
@@ -824,13 +827,17 @@ class SplDoublyLinkedList implements Iterator, Countable, ArrayAccess {
     public function offsetGet($k): mixed { return $this->__d[$k]; }
     public function offsetSet($k, $v): void { if ($k === null) { $this->__d[] = $v; } else { $this->__d[$k] = $v; } }
     public function offsetUnset($k): void { unset($this->__d[$k]); $n = []; foreach ($this->__d as $x) { $n[] = $x; } $this->__d = $n; }
+    // Iteration direction is bit 2 of the mode (LIFO vs FIFO); __lifo mirrors it
+    // for SplStack's constructor default and is kept in sync by setIteratorMode.
+    public function setIteratorMode($mode) { $this->__mode = $mode; $this->__lifo = ($mode & 2) !== 0; }
+    public function getIteratorMode() { return $this->__mode; }
     public function rewind(): void { $this->__p = $this->__lifo ? count($this->__d) - 1 : 0; }
     public function valid(): bool { return $this->__p >= 0 && $this->__p < count($this->__d); }
     public function current(): mixed { return $this->__d[$this->__p]; }
     public function key(): mixed { return $this->__p; }
     public function next(): void { if ($this->__lifo) { $this->__p = $this->__p - 1; } else { $this->__p = $this->__p + 1; } }
 }
-class SplStack extends SplDoublyLinkedList { public function __construct() { $this->__lifo = true; } }
+class SplStack extends SplDoublyLinkedList { public function __construct() { $this->__lifo = true; $this->__mode = 2; } }
 class SplQueue extends SplDoublyLinkedList {
     public function enqueue($v) { $this->push($v); }
     public function dequeue() { return $this->shift(); }
@@ -905,11 +912,18 @@ abstract class SplHeap implements Countable, Iterator {
 class SplMinHeap extends SplHeap { protected function compare($a, $b): int { return ($a < $b) ? 1 : (($a > $b) ? -1 : 0); } }
 class SplMaxHeap extends SplHeap { protected function compare($a, $b): int { return ($a > $b) ? 1 : (($a < $b) ? -1 : 0); } }
 class SplPriorityQueue implements Countable, Iterator {
-    private $__d = [];
+    const EXTR_DATA = 1; const EXTR_PRIORITY = 2; const EXTR_BOTH = 3;
+    private $__d = []; private $__flags = 1;
     private function __top_index() { $best = 0; for ($i = 1; $i < count($this->__d); $i++) { if ($this->__d[$i][0] > $this->__d[$best][0]) { $best = $i; } } return $best; }
+    private function __shape($i) {
+        if ($this->__flags === 2) { return $this->__d[$i][0]; }
+        if ($this->__flags === 3) { return ["data" => $this->__d[$i][1], "priority" => $this->__d[$i][0]]; }
+        return $this->__d[$i][1];
+    }
     public function insert($value, $priority) { $this->__d[] = [$priority, $value]; return true; }
-    public function top() { return $this->__d[$this->__top_index()][1]; }
-    public function extract() { if (count($this->__d) === 0) { return null; } $i = $this->__top_index(); $v = $this->__d[$i][1]; array_splice($this->__d, $i, 1); return $v; }
+    public function setExtractFlags($flags) { $this->__flags = $flags; }
+    public function top() { return $this->__shape($this->__top_index()); }
+    public function extract() { if (count($this->__d) === 0) { return null; } $i = $this->__top_index(); $v = $this->__shape($i); array_splice($this->__d, $i, 1); return $v; }
     public function count(): int { return count($this->__d); }
     public function isEmpty() { return count($this->__d) === 0; }
     public function rewind(): void {}
@@ -1860,6 +1874,11 @@ impl Eval {
                                 self.vars().remove(name);
                             }
                         }
+                        Expr::VarVar(inner) => {
+                            let name =
+                                String::from_utf8_lossy(&to_bytes(&self.eval(inner)?)).into_owned();
+                            self.vars().remove(&name);
+                        }
                         Expr::Index(base, Some(idx)) => {
                             if let Some(obj) = self.arrayaccess_obj(base, "offsetunset") {
                                 let raw = self.eval(idx)?;
@@ -2158,6 +2177,11 @@ impl Eval {
                 } else {
                     self.vars().get(name).map(|v| v.deref()).unwrap_or(Value::Null)
                 }
+            }
+            // variable variables: $$x / ${expr} — the inner value names the slot
+            Expr::VarVar(inner) => {
+                let name = String::from_utf8_lossy(&to_bytes(&self.eval(inner)?)).into_owned();
+                self.vars().get(&name).map(|v| v.deref()).unwrap_or(Value::Null)
             }
             Expr::ConstFetch(name) => match self.const_fetch(name) {
                 Some(v) => v,
@@ -2954,6 +2978,16 @@ impl Eval {
                     *cell.borrow_mut() = val;
                 } else {
                     self.vars().insert(name.clone(), val);
+                }
+            }
+            // variable variables: $$x = v / ${expr} = v
+            Expr::VarVar(inner) => {
+                let name = String::from_utf8_lossy(&to_bytes(&self.eval(inner)?)).into_owned();
+                if let Some(Value::Ref(cell)) = self.vars().get(&name) {
+                    let cell = cell.clone();
+                    *cell.borrow_mut() = val;
+                } else {
+                    self.vars().insert(name, val);
                 }
             }
             Expr::Index(base, idx) => {
