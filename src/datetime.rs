@@ -563,7 +563,10 @@ fn parse_time(tok: &str) -> Option<(i64, i64, i64)> {
 
 /// Timezone-aware `strtotime`: wall-clock strings are interpreted in `zone`.
 /// The parser itself works in "wall seconds"; we shift the base into local wall
-/// time, parse there, and convert the result back to UTC. `@ts` stays absolute.
+/// time, parse there, and convert the result back to UTC. `@ts` stays absolute,
+/// and so does any string that carries its own explicit offset/abbreviation
+/// (ISO `+HH:MM`, RFC-2822 `+HHMM`, or a zone abbreviation like `GMT`/`PST`) —
+/// those bypass the wall→UTC conversion entirely since they're already UTC-exact.
 pub(crate) fn php_strtotime_tz(s: &str, base: i64, zone: Option<&crate::tz::TzData>) -> Option<i64> {
     let t = s.trim();
     if let Some(rest) = t.strip_prefix('@') {
@@ -573,19 +576,28 @@ pub(crate) fn php_strtotime_tz(s: &str, base: i64, zone: Option<&crate::tz::TzDa
         None => php_strtotime(s, base),
         Some(z) => {
             let (off, _, _) = z.offset_at(base);
-            let wall = php_strtotime(s, base + off as i64)?;
-            Some(crate::tz::ts_from_local(wall, z))
+            let (wall, absolute) = php_strtotime2(s, base + off as i64)?;
+            if absolute {
+                Some(wall)
+            } else {
+                Some(crate::tz::ts_from_local(wall, z))
+            }
         }
     }
 }
 
-pub(crate) fn php_strtotime(s: &str, base: i64) -> Option<i64> {
+/// Core `strtotime`. Returns `(timestamp, absolute)`: `absolute` is true when the
+/// input carried its own explicit UTC offset/abbreviation, in which case the
+/// timestamp is already a true UTC instant (the tz wrapper must not re-convert
+/// it as wall-clock local time). Everything else stays in "wall seconds", the
+/// contract the tz wrapper depends on.
+pub(crate) fn php_strtotime2(s: &str, base: i64) -> Option<(i64, bool)> {
     let t = s.trim();
     if t.is_empty() || t.eq_ignore_ascii_case("now") {
-        return Some(base);
+        return Some((base, false));
     }
     if let Some(rest) = t.strip_prefix('@') {
-        return rest.trim().parse::<i64>().ok();
+        return rest.trim().parse::<i64>().ok().map(|ts| (ts, true));
     }
     let lower = t.to_ascii_lowercase();
 
@@ -593,72 +605,186 @@ pub(crate) fn php_strtotime(s: &str, base: i64) -> Option<i64> {
     let (by, bm, bd) = civil_from_days(base.div_euclid(86400));
     let midnight = make_ts(0, 0, 0, bm, bd, by);
     match lower.as_str() {
-        "today" | "midnight" => return Some(midnight),
-        "noon" => return Some(midnight + 12 * 3600),
-        "tomorrow" => return Some(midnight + 86400),
-        "yesterday" => return Some(midnight - 86400),
+        "today" | "midnight" => return Some((midnight, false)),
+        "noon" => return Some((midnight + 12 * 3600, false)),
+        "tomorrow" => return Some((midnight + 86400, false)),
+        "yesterday" => return Some((midnight - 86400, false)),
         _ => {}
     }
 
-    // ---- ISO / numeric absolute: Y-m-d or m/d/Y, optional time ----
-    if let Some(ts) = parse_absolute(t) {
-        return Some(ts);
+    // ---- ISO / numeric absolute: Y-m-d or m/d/Y, optional time [+zone] ----
+    if let Some(r) = parse_absolute(t) {
+        return Some(r);
     }
 
     // ---- time-only (applies to the base date) ----
     if let Some((h, mi, se)) = parse_time(t) {
-        return Some(midnight + h * 3600 + mi * 60 + se);
+        return Some((midnight + h * 3600 + mi * 60 + se, false));
     }
 
     // ---- textual / relative, token by token ----
     parse_relative_or_textual(&lower, base, midnight)
 }
 
+/// Thin wrapper over [`php_strtotime2`] for callers that only need the
+/// timestamp (wall-domain contract unchanged from before the tz/offset work).
+pub(crate) fn php_strtotime(s: &str, base: i64) -> Option<i64> {
+    php_strtotime2(s, base).map(|(ts, _)| ts)
+}
+
 /// Absolute `YYYY-MM-DD`, `M/D/Y`, `DD-Mon-YYYY`, optionally with a time after a
-/// space or `T`.
-fn parse_absolute(t: &str) -> Option<i64> {
+/// space or `T`, and an optional trailing UTC offset/zone abbreviation on the
+/// time (`+02:00`, ` GMT`, ` PST`, …). Returns `(ts, absolute)` — see
+/// [`php_strtotime2`] for what `absolute` means.
+fn parse_absolute(t: &str) -> Option<(i64, bool)> {
     let (date_part, time_part) = match t.split_once(['T', ' ']) {
         Some((d, tm)) => (d, Some(tm.trim())),
         None => (t, None),
     };
+    let mut absolute = false;
+    let mut offset = 0i64;
     let (h, mi, se) = match time_part {
-        Some(tp) if !tp.is_empty() => parse_time(tp.split_whitespace().next().unwrap_or("")).unwrap_or((0, 0, 0)),
+        Some(tp) if !tp.is_empty() => {
+            let (tp2, off, abs) = strip_zone_suffix(tp);
+            if abs {
+                absolute = true;
+                offset = off;
+            }
+            parse_time(tp2.split_whitespace().next().unwrap_or("")).unwrap_or((0, 0, 0))
+        }
         _ => (0, 0, 0),
     };
     // dashes → Y-m-d (or D-Mon-Y); slashes → m/d/Y (US)
-    if date_part.contains('-') {
+    let ts = if date_part.contains('-') {
         let p: Vec<&str> = date_part.split('-').collect();
-        if p.len() == 3 {
-            if let Some(mon) = month_from_name(p[1]) {
-                // D-Mon-Y
-                let d = p[0].parse().ok()?;
-                let y = norm_year(p[2].parse().ok()?);
-                return Some(make_ts(h, mi, se, mon, d, y));
-            }
+        if p.len() != 3 {
+            return None;
+        }
+        if let Some(mon) = month_from_name(p[1]) {
+            // D-Mon-Y
+            let d = p[0].parse().ok()?;
+            let y = norm_year(p[2].parse().ok()?);
+            make_ts(h, mi, se, mon, d, y)
+        } else {
             let y = p[0].parse::<i64>().ok()?;
             let mo = p[1].parse::<i64>().ok()?;
             let d = p[2].parse::<i64>().ok()?;
-            return Some(make_ts(h, mi, se, mo, d, y));
+            make_ts(h, mi, se, mo, d, y)
         }
     } else if date_part.contains('/') {
         let p: Vec<&str> = date_part.split('/').collect();
-        if p.len() == 3 {
-            let mo = p[0].parse::<i64>().ok()?;
-            let d = p[1].parse::<i64>().ok()?;
-            let y = norm_year(p[2].parse::<i64>().ok()?);
-            return Some(make_ts(h, mi, se, mo, d, y));
+        if p.len() != 3 {
+            return None;
         }
-    }
-    None
+        let mo = p[0].parse::<i64>().ok()?;
+        let d = p[1].parse::<i64>().ok()?;
+        let y = norm_year(p[2].parse::<i64>().ok()?);
+        make_ts(h, mi, se, mo, d, y)
+    } else {
+        return None;
+    };
+    Some((if absolute { ts - offset } else { ts }, absolute))
 }
 
 fn norm_year(y: i64) -> i64 {
     if y < 70 { 2000 + y } else if y < 100 { 1900 + y } else { y }
 }
 
+/// Strip a trailing timezone offset or abbreviation from a time-of-day string
+/// like `"22:30:41+02:00"`, `"22:30:41 GMT"`, or `"22:30:41 PST"`. Returns the
+/// remaining time text, the offset in seconds east of UTC, and whether a
+/// zone marker was actually found (vs. a bare time with nothing to strip).
+fn strip_zone_suffix(tp: &str) -> (String, i64, bool) {
+    let tp = tp.trim();
+    // space-separated trailing token, e.g. "22:30:41 GMT" / "22:30:41 +0200"
+    if let Some(idx) = tp.rfind(' ') {
+        let (rest, last) = tp.split_at(idx);
+        let last = last.trim();
+        if let Some(off) = parse_offset_str(last) {
+            return (rest.trim().to_string(), off, true);
+        }
+        if let Some(off) = abbrev_offset(last) {
+            return (rest.trim().to_string(), off, true);
+        }
+    }
+    // offset glued directly onto the time, e.g. "22:30:41+02:00" (ISO 8601)
+    if let Some((rest, off)) = strip_attached_offset(tp) {
+        return (rest.to_string(), off, true);
+    }
+    (tp.to_string(), 0, false)
+}
+
+/// Find a `+HH:MM`/`-HHMM`/`+HH` offset glued onto the end of `tp` with no
+/// separating space (the ISO-8601 `T22:30:41+02:00` shape).
+fn strip_attached_offset(tp: &str) -> Option<(&str, i64)> {
+    let bytes = tp.as_bytes();
+    for i in 1..bytes.len() {
+        if bytes[i] == b'+' || bytes[i] == b'-' {
+            if let Some(off) = parse_offset_str(&tp[i..]) {
+                return Some((&tp[..i], off));
+            }
+        }
+    }
+    None
+}
+
+/// Parse a standalone signed offset token: `+02:00`, `-0500`, `+02`, or `Z`.
+/// Returns seconds east of UTC.
+fn parse_offset_str(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("z") {
+        return Some(0);
+    }
+    let mut chars = s.chars();
+    let sign = match chars.next()? {
+        '+' => 1i64,
+        '-' => -1i64,
+        _ => return None,
+    };
+    let rest: String = chars.collect::<String>().replace(':', "");
+    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let (h, m) = match rest.len() {
+        2 => (rest[0..2].parse::<i64>().ok()?, 0i64),
+        4 => (rest[0..2].parse::<i64>().ok()?, rest[2..4].parse::<i64>().ok()?),
+        _ => return None,
+    };
+    Some(sign * (h * 3600 + m * 60))
+}
+
+/// Zone-abbreviation → seconds-east-of-UTC lookup (case-insensitive). `IST` is
+/// deliberately omitted — it's ambiguous across India/Ireland/Israel.
+fn abbrev_offset(s: &str) -> Option<i64> {
+    let u = s.to_ascii_uppercase();
+    const TABLE: &[(&str, i64)] = &[
+        ("GMT", 0), ("UT", 0), ("UTC", 0), ("Z", 0),
+        ("EST", -18000), ("EDT", -14400),
+        ("CST", -21600), ("CDT", -18000),
+        ("MST", -25200), ("MDT", -21600),
+        ("PST", -28800), ("PDT", -25200),
+        ("AKST", -32400), ("AKDT", -28800),
+        ("HST", -36000),
+        ("CET", 3600), ("CEST", 7200),
+        ("WET", 0), ("WEST", 3600),
+        ("BST", 3600),
+        ("EET", 7200), ("EEST", 10800),
+        ("MSK", 10800),
+        ("SAST", 7200),
+        ("JST", 32400), ("KST", 32400),
+        ("AEST", 36000), ("AEDT", 39600),
+        ("NZST", 43200), ("NZDT", 46800),
+    ];
+    TABLE.iter().find(|(k, _)| *k == u).map(|(_, v)| *v)
+}
+
 /// Relative offsets (`+1 day`, `2 weeks ago`, `next monday`) and textual dates
-/// (`1 January 2020`, `Jan 1 2020`, `January 1, 2020`).
-fn parse_relative_or_textual(lower: &str, base: i64, midnight: i64) -> Option<i64> {
+/// (`1 January 2020`, `Jan 1 2020`, `January 1, 2020`, and RFC-2822-shaped
+/// strings like `Thu, 14 Jul 2005 22:30:41 +0200` — the leading weekday name
+/// is harmless noise here since the month-name scan below runs first and
+/// simply never matches it). Returns `(ts, absolute)` — see
+/// [`php_strtotime2`] for what `absolute` means.
+fn parse_relative_or_textual(lower: &str, base: i64, midnight: i64) -> Option<(i64, bool)> {
     let toks: Vec<String> = lower
         .replace(',', " ")
         .split_whitespace()
@@ -687,7 +813,34 @@ fn parse_relative_or_textual(lower: &str, base: i64, midnight: i64) -> Option<i6
             let (y, _, _) = civil_from_days(base.div_euclid(86400));
             y
         });
-        return Some(make_ts(0, 0, 0, mon, day, norm_year(year)));
+        // trailing clock time, e.g. the "10:30" in "14 July 2005 10:30"
+        // (defaults to midnight — the pre-existing, still-correct behavior
+        // for pure textual dates with no time component)
+        let mut h = 0i64;
+        let mut mi = 0i64;
+        let mut se = 0i64;
+        for w in &toks {
+            if let Some((th, tm, ts_)) = parse_time(w) {
+                h = th;
+                mi = tm;
+                se = ts_;
+                break;
+            }
+        }
+        // trailing zone offset/abbreviation, e.g. RFC-2822's "+0200"
+        let mut absolute = false;
+        let mut offset = 0i64;
+        if let Some(last) = toks.last() {
+            if let Some(off) = parse_offset_str(last) {
+                offset = off;
+                absolute = true;
+            } else if let Some(off) = abbrev_offset(last) {
+                offset = off;
+                absolute = true;
+            }
+        }
+        let ts = make_ts(h, mi, se, mon, day, norm_year(year));
+        return Some((if absolute { ts - offset } else { ts }, absolute));
     }
 
     // weekday navigation: "next monday" / "last friday" / "monday"
@@ -701,7 +854,7 @@ fn parse_relative_or_textual(lower: &str, base: i64, midnight: i64) -> Option<i6
             let mut delta = (target - cur_dow).rem_euclid(7);
             if dir > 0 && delta == 0 { delta = 7; }
             if dir < 0 { delta = -((cur_dow - target).rem_euclid(7)); if delta == 0 { delta = -7; } }
-            return Some(midnight + delta * 86400);
+            return Some((midnight + delta * 86400, false));
         }
     }
 
@@ -734,7 +887,7 @@ fn parse_relative_or_textual(lower: &str, base: i64, midnight: i64) -> Option<i6
         }
         i += 1;
     }
-    if matched { Some(ts) } else { None }
+    if matched { Some((ts, false)) } else { None }
 }
 
 fn apply_unit(ts: &mut i64, n: i64, unit: &str) -> bool {

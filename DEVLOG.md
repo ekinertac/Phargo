@@ -27,6 +27,39 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-03 (later) — First orchestrated batch: three subagents + two core fixes
+
+**Pass rate: 3175 → 3197.**
+
+New working mode: well-specified rungs go to cheaper-model subagents in
+parallel (each with exact file scope, expected outputs, and regression
+baselines to hold); the analysis, the architecture calls, and the regression
+verdicts stay with the orchestrator. Three agents ran concurrently on
+non-overlapping files and all landed clean on the first try:
+
+- **DOM ChildNode/ParentNode API** (`remove`/`append`/`prepend`/`before`/
+  `after`/`replaceWith`, `setAttributeNode`) on the prelude DOM tree.
+- **`timezone_identifiers_list()`** + `DateTimeZone::listIdentifiers()` +
+  the zone-group class constants, walking /usr/share/zoneinfo.
+- **strtotime with explicit zone info** — ISO offsets (`…T22:30:41+02:00`),
+  trailing abbreviations (`GMT`, `PST`, 28 more), RFC-2822 dates, and textual
+  dates no longer dropping their time-of-day. Architecturally: the parser now
+  returns an "absolute" flag so offset-carrying strings skip the wall-clock
+  conversion.
+
+Meanwhile the orchestrator took the two semantics fixes the samplers surfaced:
+**by-ref callback parameters** (a `Value::Ref` argument now aliases into a
+`&$x` param instead of binding a copy — `array_walk` finally mutates, in place,
+one writeback) and **live-append iteration in by-ref foreach** (PHP visits
+elements appended during the loop). The second one bit back immediately: the
+corpus contains tests that append *forever*, relying on PHP's memory_limit to
+die — the first implementation hung the whole regression sweep and had an
+O(n²) rescan. The fix is a cursor-based tail scan (appends only land at the
+end) plus a 100k-visit cap. The old lesson again, from the other direction:
+resource guards aren't optional, even inside brand-new code.
+
+---
+
 ## 2026-07-03 — Real timezones (a from-scratch TZif reader), and `clone` didn't exist
 
 **Pass rate: 3051 → 3150, then 3175 with the follow-up batch.**

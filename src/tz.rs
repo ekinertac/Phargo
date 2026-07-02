@@ -234,6 +234,57 @@ pub fn ts_from_local(wall: i64, tz: &TzData) -> i64 {
     wall - o2 as i64
 }
 
+/// List all IANA zone identifiers under /usr/share/zoneinfo, for
+/// `timezone_identifiers_list()` / `DateTimeZone::listIdentifiers()`.
+///
+/// The zoneinfo tree also holds POSIX-rules copies (`posix/`), leap-second
+/// variants (`right/`), and non-zone metadata (`+VERSION`, `*.tab`,
+/// `Factory`) that PHP's list does not include. Filtering on "first path
+/// component starts with an uppercase ASCII letter" naturally excludes the
+/// lowercase `posix/`/`right/` subtrees; the remaining exclusions are named
+/// explicitly. Deterministic (byte-sorted) so callers can rely on ordering.
+pub fn identifiers() -> Vec<String> {
+    const ROOT: &str = "/usr/share/zoneinfo";
+    const CAP: usize = 3000;
+    let mut out = Vec::new();
+    let mut stack = vec![std::path::PathBuf::from(ROOT)];
+    while let Some(dir) = stack.pop() {
+        if out.len() >= CAP {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            if out.len() >= CAP {
+                break;
+            }
+            let path = entry.path();
+            let Ok(rel) = path.strip_prefix(ROOT) else { continue };
+            let Some(first) = rel.components().next() else { continue };
+            let first_str = first.as_os_str().to_string_lossy();
+            let Some(first_ch) = first_str.chars().next() else { continue };
+            if !first_ch.is_ascii_uppercase() {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            let rel_str = rel.to_string_lossy();
+            if rel_str.contains('.') || rel_str == "+VERSION" || rel_str == "Factory" {
+                continue;
+            }
+            out.push(rel_str.into_owned());
+        }
+    }
+    out.sort();
+    out.truncate(CAP);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

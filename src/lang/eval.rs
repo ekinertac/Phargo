@@ -168,6 +168,20 @@ interface DateTimeInterface {
     const W3C = 'Y-m-d\TH:i:sP';
 }
 class DateTimeZone {
+    const AFRICA = 1;
+    const AMERICA = 2;
+    const ANTARCTICA = 4;
+    const ARCTIC = 8;
+    const ASIA = 16;
+    const ATLANTIC = 32;
+    const AUSTRALIA = 64;
+    const EUROPE = 128;
+    const INDIAN = 256;
+    const PACIFIC = 512;
+    const UTC = 1024;
+    const ALL = 2047;
+    const ALL_WITH_BC = 4095;
+    const PER_COUNTRY = 4096;
     public $name;
     public function __construct($name = "UTC") {
         if (!__phargo_tz_valid($name)) {
@@ -182,6 +196,10 @@ class DateTimeZone {
         if ($end === null) { $end = 2147483647; }
         return __phargo_tz_transitions($this->name, $begin, $end);
     }
+    public static function listIdentifiers($group = 2047, $country = null) {
+        return timezone_identifiers_list($group, $country);
+    }
+    public static function listAbbreviations() { return []; }
 }
 class DatePeriod implements IteratorAggregate {
     const EXCLUDE_START_DATE = 1;
@@ -980,6 +998,32 @@ class DOMNode {
         }
         return $out;
     }
+    // ChildNode / ParentNode convenience API (PHP 8+ DOM): plain strings passed
+    // to append/prepend/before/after/replaceWith are coerced to DOMText nodes,
+    // matching native PHP DOM behavior.
+    private function __asNode($n) { return is_string($n) ? new DOMText($n) : $n; }
+    public function remove() { if ($this->__parent !== null) { $this->__parent->removeChild($this); } }
+    public function append(...$nodes) { foreach ($nodes as $n) { $this->appendChild($this->__asNode($n)); } }
+    public function prepend(...$nodes) {
+        $first = $this->__kids[0] ?? null;
+        foreach ($nodes as $n) {
+            $node = $this->__asNode($n);
+            if ($first === null) { $this->appendChild($node); } else { $this->insertBefore($node, $first); }
+        }
+    }
+    public function before(...$nodes) {
+        if ($this->__parent === null) { return; }
+        foreach ($nodes as $n) { $this->__parent->insertBefore($this->__asNode($n), $this); }
+    }
+    public function after(...$nodes) {
+        if ($this->__parent === null) { return; }
+        $next = $this->__sib(1);
+        foreach ($nodes as $n) {
+            $node = $this->__asNode($n);
+            if ($next === null) { $this->__parent->appendChild($node); } else { $this->__parent->insertBefore($node, $next); }
+        }
+    }
+    public function replaceWith(...$nodes) { $this->before(...$nodes); $this->remove(); }
 }
 class DOMElement extends DOMNode {
     public function __construct($name, $value = null) {
@@ -996,6 +1040,13 @@ class DOMElement extends DOMNode {
     public function hasAttributeNS($ns, $n) { return $this->hasAttribute($n); }
     public function removeAttributeNS($ns, $n) { $this->removeAttribute($n); }
     public function setIdAttribute($n, $isId) {}
+    public function setAttributeNode($attr) {
+        $old = isset($this->__attrs[$attr->nodeName]) ? new DOMAttr($attr->nodeName, $this->__attrs[$attr->nodeName]) : null;
+        $this->__attrs[$attr->nodeName] = $attr->value;
+        return $old;
+    }
+    public function setAttributeNodeNS($attr) { return $this->setAttributeNode($attr); }
+    public function getAttributeNodeNS($ns, $n) { return $this->getAttributeNode($n); }
 }
 class DOMDocumentFragment extends DOMNode {
     public function __construct() { $this->nodeType = 11; $this->nodeName = "#document-fragment"; }
@@ -1916,8 +1967,48 @@ impl Eval {
             Some(ks) => ks,
             None => return Ok(Flow::Normal),
         };
+        // PHP's by-ref foreach iterates LIVE: elements appended during the loop
+        // are visited too. We approximate the hash-pointer with rounds: drain the
+        // snapshot, then re-scan for keys not yet visited, until none appear.
+        // Guards (the corpus has tests that append forever, relying on PHP's
+        // memory_limit fatal): post-snapshot visits are capped, and the re-scan
+        // starts from a cursor (appends land at the end) so a one-append-per-
+        // iteration loop stays O(n), not O(n²).
+        const MAX_LIVE_APPENDS: usize = 100_000;
+        let mut appended = 0usize;
+        let mut scan_pos = keys.len();
+        let mut visited: HashSet<Key> = HashSet::new();
+        let mut queue: std::collections::VecDeque<Key> = keys.into();
         let mut prev: Option<(Key, Rc<RefCell<Value>>)> = None;
-        for k in keys {
+        loop {
+            let k = match queue.pop_front() {
+                Some(k) => k,
+                None => {
+                    if appended >= MAX_LIVE_APPENDS {
+                        break;
+                    }
+                    let fresh: Vec<Key> = match self.with_array_mut(aname, |a| {
+                        let start = scan_pos.min(a.entries.len());
+                        let f: Vec<Key> = a.entries[start..]
+                            .iter()
+                            .map(|(k, _)| k.clone())
+                            .filter(|k| !visited.contains(k))
+                            .collect();
+                        scan_pos = a.entries.len();
+                        f
+                    }) {
+                        Some(f) => f,
+                        None => break,
+                    };
+                    if fresh.is_empty() {
+                        break;
+                    }
+                    appended += fresh.len();
+                    queue.extend(fresh);
+                    continue;
+                }
+            };
+            visited.insert(k.clone());
             self.tick()?;
             // promote the element to a Ref cell (in place, no array clone)
             let cell = match self.with_array_mut(aname, |a| {
@@ -3203,6 +3294,11 @@ impl Eval {
                 "array_multisort" if !args.is_empty() => {
                     return self.array_multisort(args, &argv);
                 }
+                // array_walk mutates through &$value callback params — needs the
+                // array lvalue for writeback, so it dispatches here.
+                "array_walk" if args.len() >= 2 => {
+                    return self.array_walk_byref(args, &argv);
+                }
                 "settype" if args.len() >= 2 => {
                     let ty = to_bytes(argv.get(1).unwrap_or(&Value::Null)).to_ascii_lowercase();
                     let cur = argv.first().cloned().unwrap_or(Value::Null);
@@ -3428,6 +3524,30 @@ impl Eval {
             }
             self.assign_to(&args[c.arg_idx].value, Value::Array(out))?;
         }
+        Ok(Value::Bool(true))
+    }
+
+    /// array_walk with by-ref callback support: each element is temporarily
+    /// promoted to a Ref cell so a `&$value` callback param aliases it, then the
+    /// cell's final value lands back in the array, which is written back to the
+    /// caller's lvalue once.
+    fn array_walk_byref(&mut self, args: &[Arg], argv: &[Value]) -> R<Value> {
+        let mut arr = match argv.first() {
+            Some(Value::Array(a)) => a.clone(),
+            _ => return Ok(Value::Bool(false)),
+        };
+        let cb = argv.get(1).cloned().unwrap_or(Value::Null);
+        for i in 0..arr.entries.len() {
+            let (k, v) = arr.entries[i].clone();
+            let cell = Rc::new(RefCell::new(v.deref()));
+            let mut cargs = vec![Value::Ref(cell.clone()), akey_to_value(&k)];
+            if argv.len() > 2 {
+                cargs.push(argv[2].clone());
+            }
+            self.call_value(cb.clone(), cargs)?;
+            arr.entries[i].1 = cell.borrow().clone();
+        }
+        self.assign_to(&args[0].value, Value::Array(arr))?;
         Ok(Value::Bool(true))
     }
 
@@ -3785,7 +3905,13 @@ impl Eval {
                 break;
             }
             let v = match args.get(i) {
-                Some(Value::Ref(c)) => c.borrow().deref(),
+                Some(Value::Ref(c)) => {
+                    if p.by_ref {
+                        Value::Ref(c.clone())
+                    } else {
+                        c.borrow().deref()
+                    }
+                }
                 Some(v) => v.clone(),
                 None => match &p.default {
                     Some(d) => self.eval(d)?,
@@ -4451,9 +4577,15 @@ impl Eval {
                 break;
             }
             let v = match args.get(i) {
-                // deref: a Ref element passed through a builtin callback must
-                // bind by value, not alias into the callee's scope
-                Some(Value::Ref(c)) => c.borrow().deref(),
+                // A Ref arg (only builtin-driven calls construct these) aliases
+                // into a by-ref param; a by-value param gets the dereferenced copy.
+                Some(Value::Ref(c)) => {
+                    if p.by_ref {
+                        Value::Ref(c.clone())
+                    } else {
+                        c.borrow().deref()
+                    }
+                }
                 Some(v) => v.clone(),
                 None => match &p.default {
                     Some(d) => self.eval(d)?,
@@ -6667,6 +6799,16 @@ impl Eval {
                     Some(z) => Value::Int(z.offset_at(ts).0 as i64),
                     None => Value::Int(0),
                 }
+            }
+            "timezone_identifiers_list" => {
+                // Args (group, country) are accepted for signature compatibility with
+                // PHP's timezone_identifiers_list()/DateTimeZone::listIdentifiers() but
+                // ignored — we return the full sorted zoneinfo list regardless of group.
+                let mut arr = Arr::new();
+                for id in crate::tz::identifiers() {
+                    arr.push(Value::Str(id.into_bytes()));
+                }
+                Value::Array(arr)
             }
             "__phargo_tz_valid" => {
                 let tzname = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
