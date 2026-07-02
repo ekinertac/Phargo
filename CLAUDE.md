@@ -5,6 +5,10 @@ Phargo is a **from-scratch, memory-safe PHP engine in Rust**, driven by PHP's ow
 public (build-in-public; north star = run WordPress in WordPress Playground via
 Rust→WASM). You are continuing that climb.
 
+> **Also read [`docs/PROJECT_STATE.md`](docs/PROJECT_STATE.md)** — the portable
+> project memory: mission, milestone history, hard-won lessons, current state, and
+> next targets. This file is the *how*; that file is the *what/why/where-we-are*.
+
 ## The number that matters
 
 The scoreboard runs every upstream php-src `.phpt` in `vendor/php-src/` and reports
