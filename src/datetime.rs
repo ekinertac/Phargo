@@ -275,6 +275,236 @@ pub(crate) fn make_ts(h: i64, mi: i64, s: i64, mon: i64, day: i64, year: i64) ->
     days_from_civil(year, mon, day) * 86400 + h * 3600 + mi * 60 + s
 }
 
+// ---- DateTime::createFromFormat ------------------------------------------
+
+/// Fields extracted by [`php_parse_from_format`]. `None` = not present in the
+/// format; the caller fills defaults (now, or the epoch after `!`/`|`).
+#[derive(Default)]
+pub(crate) struct ParsedFmt {
+    pub y: Option<i64>,
+    pub mo: Option<i64>,
+    pub d: Option<i64>,
+    pub h: Option<i64>,
+    pub mi: Option<i64>,
+    pub s: Option<i64>,
+    pub pm: Option<bool>,      // a/A: seen "pm"?
+    pub epoch: Option<i64>,    // U: absolute timestamp — overrides everything
+    pub off: Option<i64>,      // O/P: fixed UTC offset in seconds
+    pub tzname: Option<String>, // e/T: parsed zone identifier
+    pub default_epoch: bool,   // saw ! or | → unset fields default to the epoch
+}
+
+/// `DateTime::createFromFormat` format matcher. Returns None on any mismatch
+/// (PHP returns false there). Mirrors PHP's parsing codes; microseconds are
+/// consumed but dropped (we don't store sub-second precision).
+pub(crate) fn php_parse_from_format(fmt: &str, input: &str) -> Option<ParsedFmt> {
+    let f: Vec<char> = fmt.chars().collect();
+    let s: Vec<char> = input.chars().collect();
+    let mut out = ParsedFmt::default();
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut allow_trailing = false;
+
+    // read 1..=max digits (PHP is lenient about leading zeros)
+    fn digits(s: &[char], j: &mut usize, max: usize) -> Option<i64> {
+        let start = *j;
+        while *j < s.len() && *j - start < max && s[*j].is_ascii_digit() {
+            *j += 1;
+        }
+        if *j == start {
+            return None;
+        }
+        s[start..*j].iter().collect::<String>().parse().ok()
+    }
+    // case-insensitive literal word match
+    fn word(s: &[char], j: &mut usize, w: &str) -> bool {
+        let wc: Vec<char> = w.chars().collect();
+        if *j + wc.len() > s.len() {
+            return false;
+        }
+        for (k, c) in wc.iter().enumerate() {
+            if !s[*j + k].eq_ignore_ascii_case(c) {
+                return false;
+            }
+        }
+        *j += wc.len();
+        true
+    }
+    // signed HH:MM / HHMM offset, with optional GMT/UTC prefix
+    fn tz_offset(s: &[char], j: &mut usize) -> Option<i64> {
+        let save = *j;
+        if word(s, j, "GMT") || word(s, j, "UTC") {
+            if *j >= s.len() || (s[*j] != '+' && s[*j] != '-') {
+                // bare "GMT"/"UTC" = +00:00
+                return Some(0);
+            }
+        }
+        if *j >= s.len() || (s[*j] != '+' && s[*j] != '-') {
+            *j = save;
+            return None;
+        }
+        let neg = s[*j] == '-';
+        *j += 1;
+        let h = digits(s, j, 2)?;
+        if *j < s.len() && s[*j] == ':' {
+            *j += 1;
+        }
+        let m = digits(s, j, 2).unwrap_or(0);
+        let v = h * 3600 + m * 60;
+        Some(if neg { -v } else { v })
+    }
+
+    while i < f.len() {
+        let c = f[i];
+        i += 1;
+        match c {
+            '\\' => {
+                // escaped literal
+                if i < f.len() {
+                    if j >= s.len() || s[j] != f[i] {
+                        return None;
+                    }
+                    i += 1;
+                    j += 1;
+                }
+            }
+            'd' | 'j' => out.d = Some(digits(&s, &mut j, 2)?),
+            'm' | 'n' => out.mo = Some(digits(&s, &mut j, 2)?),
+            'Y' => out.y = Some(digits(&s, &mut j, 4)?),
+            'y' => out.y = Some(norm_year(digits(&s, &mut j, 2)?)),
+            'H' | 'G' => out.h = Some(digits(&s, &mut j, 2)?),
+            'h' | 'g' => out.h = Some(digits(&s, &mut j, 2)?),
+            'i' => out.mi = Some(digits(&s, &mut j, 2)?),
+            's' => out.s = Some(digits(&s, &mut j, 2)?),
+            'u' | 'v' => {
+                // consume fraction digits, drop (no sub-second storage)
+                digits(&s, &mut j, 6)?;
+            }
+            'z' => {
+                digits(&s, &mut j, 3)?; // day-of-year: consumed, unused
+            }
+            'a' | 'A' => {
+                if word(&s, &mut j, "am") || word(&s, &mut j, "a.m.") {
+                    out.pm = Some(false);
+                } else if word(&s, &mut j, "pm") || word(&s, &mut j, "p.m.") {
+                    out.pm = Some(true);
+                } else {
+                    return None;
+                }
+            }
+            'F' | 'M' => {
+                // month name (full or 3-letter)
+                let names = [
+                    "January", "February", "March", "April", "May", "June", "July",
+                    "August", "September", "October", "November", "December",
+                ];
+                let mut found = None;
+                for (k, n) in names.iter().enumerate() {
+                    if word(&s, &mut j, n) {
+                        found = Some(k as i64 + 1);
+                        break;
+                    }
+                    if word(&s, &mut j, &n[..3]) {
+                        found = Some(k as i64 + 1);
+                        break;
+                    }
+                }
+                out.mo = Some(found?);
+            }
+            'D' | 'l' => {
+                // day name: matched and discarded (date fields decide the day)
+                let mut ok = false;
+                for n in DAYS {
+                    if word(&s, &mut j, n) || word(&s, &mut j, &n[..3]) {
+                        ok = true;
+                        break;
+                    }
+                }
+                if !ok {
+                    return None;
+                }
+            }
+            'S' => {
+                // ordinal suffix
+                if !(word(&s, &mut j, "st")
+                    || word(&s, &mut j, "nd")
+                    || word(&s, &mut j, "rd")
+                    || word(&s, &mut j, "th"))
+                {
+                    return None;
+                }
+            }
+            'N' | 'w' => {
+                digits(&s, &mut j, 1)?; // weekday number: consumed, unused
+            }
+            'U' => {
+                let neg = j < s.len() && s[j] == '-';
+                if neg {
+                    j += 1;
+                }
+                let v = digits(&s, &mut j, 19)?;
+                out.epoch = Some(if neg { -v } else { v });
+            }
+            'O' | 'P' | 'p' => out.off = Some(tz_offset(&s, &mut j)?),
+            'e' | 'T' => {
+                // timezone identifier / abbreviation — or a numeric offset
+                if let Some(off) = tz_offset(&s, &mut j) {
+                    out.off = Some(off);
+                } else {
+                    let start = j;
+                    while j < s.len()
+                        && (s[j].is_ascii_alphanumeric() || matches!(s[j], '/' | '_' | '-' | '+'))
+                    {
+                        j += 1;
+                    }
+                    if j == start {
+                        return None;
+                    }
+                    out.tzname = Some(s[start..j].iter().collect());
+                }
+            }
+            '!' => {
+                // reset everything (parsed so far included) to the epoch
+                out = ParsedFmt { default_epoch: true, ..Default::default() };
+            }
+            '|' => out.default_epoch = true,
+            '?' => {
+                if j >= s.len() {
+                    return None;
+                }
+                j += 1;
+            }
+            '*' => {
+                // skip input until the next separator byte
+                while j < s.len() && !matches!(s[j], ';' | ':' | '/' | '.' | ',' | '-' | '(' | ')' | ' ') {
+                    j += 1;
+                }
+            }
+            '+' => allow_trailing = true,
+            '#' => {
+                if j >= s.len() || !matches!(s[j], ';' | ':' | '/' | '.' | ',' | '-') {
+                    return None;
+                }
+                j += 1;
+            }
+            ' ' => {
+                if j < s.len() && (s[j] == ' ' || s[j] == '\t') {
+                    j += 1;
+                }
+            }
+            lit => {
+                if j >= s.len() || s[j] != lit {
+                    return None;
+                }
+                j += 1;
+            }
+        }
+    }
+    if j < s.len() && !allow_trailing {
+        return None; // unconsumed input
+    }
+    Some(out)
+}
+
 /// A small `strtotime`: `@<ts>`, `now`, and `YYYY-MM-DD[ HH:MM:SS]` / `YYYY/MM/DD`.
 fn month_from_name(s: &str) -> Option<i64> {
     let l = s.to_ascii_lowercase();

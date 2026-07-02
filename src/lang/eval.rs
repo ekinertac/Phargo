@@ -253,6 +253,16 @@ class DateTime implements DateTimeInterface {
     public function setTimestamp($ts) { $this->__ts = $ts; return $this; }
     public function setDate($y, $m, $d) { $this->__ts = __phargo_mktime_tz((int)$this->format("H"), (int)$this->format("i"), (int)$this->format("s"), $m, $d, $y, $this->__tz); return $this; }
     public function setTime($h, $i, $s = 0) { $this->__ts = __phargo_mktime_tz($h, $i, $s, (int)$this->format("n"), (int)$this->format("j"), (int)$this->format("Y"), $this->__tz); return $this; }
+    public function setISODate($y, $w, $day = 1) {
+        // Monday of ISO week 1 contains Jan 4
+        $jan4 = __phargo_mktime_tz(0, 0, 0, 1, 4, $y, $this->__tz);
+        $dow = (int)__phargo_date_tz('N', $jan4, $this->__tz);
+        $target = $jan4 + ((($w - 1) * 7) + ($day - $dow)) * 86400;
+        $this->__ts = __phargo_mktime_tz((int)$this->format('H'), (int)$this->format('i'), (int)$this->format('s'),
+            (int)__phargo_date_tz('n', $target, $this->__tz), (int)__phargo_date_tz('j', $target, $this->__tz),
+            (int)__phargo_date_tz('Y', $target, $this->__tz), $this->__tz);
+        return $this;
+    }
     public function getTimezone() { return new DateTimeZone($this->__tz); }
     public function setTimezone($tz) { $this->__tz = $tz->getName(); return $this; }
     public function getOffset() { return __phargo_tz_offset($this->__tz, $this->__ts); }
@@ -260,7 +270,14 @@ class DateTime implements DateTimeInterface {
     public function sub($iv) { $this->__ts = phargo_civil_add($this->__ts, -$iv->y, -$iv->m, -$iv->d, -$iv->h, -$iv->i, -$iv->s, $this->__tz); return $this; }
     public function modify($s) { $this->__ts = __phargo_modify($this->__ts, $s, $this->__tz); return $this; }
     public function diff($other) { return DateInterval::__fromArray(phargo_date_diff($this->__ts, $other->getTimestamp())); }
-    public static function createFromFormat($fmt, $s, $tz = null) { return new DateTime($s, $tz); }
+    public static function createFromFormat($fmt, $s, $tz = null) {
+        $tzname = $tz === null ? date_default_timezone_get() : $tz->getName();
+        $r = __phargo_createfromformat($fmt, $s, $tzname);
+        if ($r === false) { return false; }
+        $d = new static("@" . $r["ts"]);
+        $d->__tz = $r["tz"];
+        return $d;
+    }
 }
 class DateTimeImmutable implements DateTimeInterface {
     public $__ts;
@@ -275,6 +292,17 @@ class DateTimeImmutable implements DateTimeInterface {
     public function format($fmt) { return __phargo_date_tz($fmt, $this->__ts, $this->__tz); }
     public function getTimestamp() { return $this->__ts; }
     public function setTimestamp($ts) { $n = clone $this; $n->__ts = $ts; return $n; }
+    private function __viaMutable($m, $args) {
+        $d = new DateTime("@" . $this->__ts);
+        $d->__tz = $this->__tz;
+        call_user_func_array([$d, $m], $args);
+        $n = clone $this;
+        $n->__ts = $d->getTimestamp();
+        return $n;
+    }
+    public function setDate($y, $m, $d) { return $this->__viaMutable("setDate", [$y, $m, $d]); }
+    public function setTime($h, $i, $s = 0) { return $this->__viaMutable("setTime", [$h, $i, $s]); }
+    public function setISODate($y, $w, $day = 1) { return $this->__viaMutable("setISODate", [$y, $w, $day]); }
     public function getTimezone() { return new DateTimeZone($this->__tz); }
     public function setTimezone($tz) { $n = clone $this; $n->__tz = $tz->getName(); return $n; }
     public function getOffset() { return __phargo_tz_offset($this->__tz, $this->__ts); }
@@ -282,7 +310,14 @@ class DateTimeImmutable implements DateTimeInterface {
     public function sub($iv) { $n = clone $this; $n->__ts = phargo_civil_add($this->__ts, -$iv->y, -$iv->m, -$iv->d, -$iv->h, -$iv->i, -$iv->s, $this->__tz); return $n; }
     public function modify($s) { $n = clone $this; $n->__ts = __phargo_modify($this->__ts, $s, $this->__tz); return $n; }
     public function diff($other) { return DateInterval::__fromArray(phargo_date_diff($this->__ts, $other->getTimestamp())); }
-    public static function createFromFormat($fmt, $s, $tz = null) { return new DateTimeImmutable($s, $tz); }
+    public static function createFromFormat($fmt, $s, $tz = null) {
+        $tzname = $tz === null ? date_default_timezone_get() : $tz->getName();
+        $r = __phargo_createfromformat($fmt, $s, $tzname);
+        if ($r === false) { return false; }
+        $d = new static("@" . $r["ts"]);
+        $d->__tz = $r["tz"];
+        return $d;
+    }
 }
 function date_create($s = "now", $tz = null) { return new DateTime($s, $tz); }
 function date_create_immutable($s = "now", $tz = null) { return new DateTimeImmutable($s, $tz); }
@@ -300,6 +335,7 @@ function date_timezone_get($d) { return $d->getTimezone(); }
 function date_timezone_set($d, $tz) { return $d->setTimezone($tz); }
 function date_date_set($d, $y, $m, $day) { return $d->setDate($y, $m, $day); }
 function date_time_set($d, $h, $i, $s = 0) { return $d->setTime($h, $i, $s); }
+function date_isodate_set($d, $y, $w, $day = 1) { return $d->setISODate($y, $w, $day); }
 function timezone_open($tz) { return new DateTimeZone($tz); }
 function timezone_name_get($tz) { return $tz->getName(); }
 function timezone_offset_get($tz, $dt) { return $tz->getOffset($dt); }
@@ -6652,6 +6688,79 @@ impl Eval {
                     None => wall,
                 })
             }
+            "__phargo_createfromformat" => {
+                let fmt = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let input = String::from_utf8_lossy(&to_bytes(&a(1))).into_owned();
+                let tzname = String::from_utf8_lossy(&to_bytes(&a(2))).into_owned();
+                match crate::php_parse_from_format(&fmt, &input) {
+                    None => Value::Bool(false),
+                    Some(p) => {
+                        // an e/T zone in the input overrides the passed zone
+                        let effective = p.tzname.clone().unwrap_or(tzname);
+                        let zone = if crate::tz::is_utc_name(&effective) {
+                            None
+                        } else {
+                            crate::tz::lookup(&effective)
+                        };
+                        if let Some(ts) = p.epoch {
+                            // U is absolute
+                            let mut r = Arr::new();
+                            r.insert(Key::Str(b"ts".to_vec()), Value::Int(ts));
+                            r.insert(Key::Str(b"tz".to_vec()), Value::Str(effective.into_bytes()));
+                            return Ok(Value::Array(r));
+                        }
+                        // unset fields default to "now" in the zone — or to the
+                        // epoch after !/| (PHP's reset semantics)
+                        let (dy, dmo, dd, dh, dmi, ds) = if p.default_epoch {
+                            (1970, 1, 1, 0, 0, 0)
+                        } else {
+                            let now = crate::now_unix();
+                            let local =
+                                now + zone.as_ref().map(|z| z.offset_at(now).0 as i64).unwrap_or(0);
+                            let (y, mo, d) = crate::civil_from_days(local.div_euclid(86400));
+                            let secs = local.rem_euclid(86400);
+                            (y, mo, d, secs / 3600, (secs % 3600) / 60, secs % 60)
+                        };
+                        let mut h = p.h.unwrap_or(dh);
+                        if let Some(pm) = p.pm {
+                            if pm && h < 12 {
+                                h += 12;
+                            }
+                            if !pm && h == 12 {
+                                h = 0;
+                            }
+                        }
+                        let wall = crate::make_ts(
+                            h,
+                            p.mi.unwrap_or(dmi),
+                            p.s.unwrap_or(ds),
+                            p.mo.unwrap_or(dmo),
+                            p.d.unwrap_or(dd),
+                            p.y.unwrap_or(dy),
+                        );
+                        let ts = if let Some(off) = p.off {
+                            wall - off
+                        } else {
+                            match &zone {
+                                Some(z) => crate::tz::ts_from_local(wall, z),
+                                None => wall,
+                            }
+                        };
+                        let mut r = Arr::new();
+                        r.insert(Key::Str(b"ts".to_vec()), Value::Int(ts));
+                        // a parsed O/P offset becomes the object's (fixed-offset) zone
+                        let tzout = match (p.off, &p.tzname) {
+                            (Some(off), None) => {
+                                let a = off.abs();
+                                format!("{}{:02}:{:02}", if off < 0 { '-' } else { '+' }, a / 3600, (a % 3600) / 60)
+                            }
+                            _ => effective,
+                        };
+                        r.insert(Key::Str(b"tz".to_vec()), Value::Str(tzout.into_bytes()));
+                        Value::Array(r)
+                    }
+                }
+            }
             "__phargo_tz_transitions" => {
                 let tzname = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 let begin = if args.len() > 1 { to_i64(&a(1)) } else { i32::MIN as i64 };
@@ -6719,6 +6828,13 @@ impl Eval {
                     Some(t) => Value::Int(t),
                     None => Value::Bool(false),
                 }
+            }
+            "idate" => {
+                let fmt = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let ts = if args.len() > 1 { to_i64(&a(1)) } else { crate::now_unix() };
+                let zone = self.cur_tz();
+                let s = crate::php_date_tz(&fmt, ts, zone.as_deref());
+                Value::Int(s.trim_start_matches('0').parse::<i64>().unwrap_or(0))
             }
             "getdate" => {
                 let ts = if !args.is_empty() { to_i64(&a(0)) } else { crate::now_unix() };

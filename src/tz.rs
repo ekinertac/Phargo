@@ -66,9 +66,45 @@ pub fn default_tz() -> String {
     DEFAULT_TZ.with(|d| d.borrow().clone()).unwrap_or_else(|| "UTC".to_string())
 }
 
+/// A fixed-offset "zone" name: `+08:00`, `-0830`, `+05`. Returns offset seconds.
+fn parse_offset_name(name: &str) -> Option<i64> {
+    let b = name.as_bytes();
+    if b.len() < 2 || (b[0] != b'+' && b[0] != b'-') || !b[1].is_ascii_digit() {
+        return None;
+    }
+    let neg = b[0] == b'-';
+    let rest: String = name[1..].chars().filter(|c| *c != ':').collect();
+    if rest.is_empty() || rest.len() > 4 || !rest.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let (h, m) = if rest.len() <= 2 {
+        (rest.parse::<i64>().ok()?, 0)
+    } else {
+        let split = rest.len() - 2;
+        (rest[..split].parse::<i64>().ok()?, rest[split..].parse::<i64>().ok()?)
+    };
+    let v = h * 3600 + m * 60;
+    Some(if neg { -v } else { v })
+}
+
 /// Look up a zone by IANA name (case-corrected lookups are NOT attempted — PHP is
 /// case-sensitive-ish here; we accept the name as given and try the file).
+/// Fixed-offset names (`+08:00`) synthesize a single-type zone.
 pub fn lookup(name: &str) -> Option<Rc<TzData>> {
+    if let Some(off) = parse_offset_name(name) {
+        let canon = format!(
+            "{}{:02}:{:02}",
+            if off < 0 { '-' } else { '+' },
+            off.abs() / 3600,
+            (off.abs() % 3600) / 60
+        );
+        return Some(Rc::new(TzData {
+            name: canon.clone(),
+            trans: Vec::new(),
+            idx: Vec::new(),
+            types: vec![(off as i32, false, canon)],
+        }));
+    }
     let key = name.to_string();
     CACHE.with(|c| {
         if let Some(hit) = c.borrow().get(&key) {

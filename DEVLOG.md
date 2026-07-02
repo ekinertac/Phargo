@@ -29,7 +29,7 @@ you would never think to write a test for.
 
 ## 2026-07-03 — Real timezones (a from-scratch TZif reader), and `clone` didn't exist
 
-**Pass rate: 3051 → 3150 — the biggest single-batch jump since the CRLF discovery.**
+**Pass rate: 3051 → 3150, then 3175 with the follow-up batch.**
 
 The marquee rung this project has been circling for weeks: **named timezones**.
 The engine was UTC-only — `DateTimeZone::getOffset()` returned a hardcoded 0.
@@ -64,6 +64,15 @@ One proper eval arm (shallow prop copy, fresh instance id, `__clone()` hook)
 later, whole families of tests lit up. The corpus keeps teaching the same
 lesson: it's never the fancy features — it's the load-bearing keyword nobody
 tested by hand.
+
+Follow-up batch (3150 → 3175): **`DateTime::createFromFormat`** got a real
+format matcher — the parsing codes (`d j m n Y y H G h g i s u a A F M D l S U
+O P e T z N w`), the reset modifiers `!`/`|` with PHP's exact
+position-sensitive semantics (`Y-m-d!` wipes the already-parsed date back to
+the epoch; `Y-m-d|` keeps it), `GMT±hh:mm` offsets, and fixed-offset zones
+(`+08:00`) synthesized as single-type TzData so they flow through the whole
+formatting layer. Plus `setISODate` (Jan-4 rule), `date_isodate_set`, and
+`idate()`. ext/date is now 178/689 — it was 76 when the day started.
 
 ---
 
