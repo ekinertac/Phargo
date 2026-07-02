@@ -184,6 +184,12 @@ impl Arr {
             }
         }
         if let Some(&i) = self.index.get(&k) {
+            // Write through a reference element (created by `foreach (… as &$v)`)
+            // so aliases of the cell observe the assignment, PHP-style.
+            if let (Value::Ref(cell), false) = (&self.entries[i].1, matches!(v, Value::Ref(_))) {
+                *cell.borrow_mut() = v;
+                return;
+            }
             self.entries[i].1 = v;
         } else {
             self.index.insert(k.clone(), self.entries.len());
@@ -467,6 +473,10 @@ fn loose_eq_d(a: &Value, b: &Value, depth: usize) -> bool {
     use Value::*;
     if depth > 256 {
         return false;
+    }
+    // Reference elements inside containers compare by their target value.
+    if matches!(a, Ref(_)) || matches!(b, Ref(_)) {
+        return loose_eq_d(&a.deref(), &b.deref(), depth);
     }
     match (a, b) {
         (Null, Null) => true,

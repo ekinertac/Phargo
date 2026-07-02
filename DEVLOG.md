@@ -27,6 +27,43 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-02 — Named arguments were silently positional; foreach-by-ref gets real cells
+
+**Pass rate: 3007 → 3029.**
+
+Fresh corpus pull, then the close-mismatch analyzer (`suiteanalyze -- close`) served
+up two language-core bugs that had been quietly failing tests across the whole
+corpus — not in one extension's directory, but *everywhere*:
+
+- **Named arguments didn't exist.** The parser dutifully recorded `f(b: 2)` names
+  into the AST… and the evaluator threw them away, applying every argument
+  positionally. `test('A', e: 'E', d: 'D')` bound `d='E', e='D'`. 454 corpus files
+  use named-arg syntax somewhere. The fix threads a positional/named split through
+  argument evaluation (`eval_args2`) and merges names onto parameter slots — gaps
+  filled from parameter defaults — at every call shape: functions, methods, static
+  calls, constructors, closures, and string-keyed `...$spread` (the PHP 8.1 named
+  form). Zero-cost when no named args are present.
+- **`foreach ($a as &$v)` was a no-op.** The loop bound `$v` by value; mutations
+  vanished. Worse, passing the var_dump tests needs the `&` refcount marker on
+  elements that still have a live alias. So references got their next step: element
+  slots can now hold real `Value::Ref` cells. By-ref foreach promotes the visited
+  element to a shared cell in place (no array clone — the O(n²) rule), binds `$v`
+  to it, and *demotes it back to a plain value* once nothing else holds the cell —
+  so, like PHP, only elements still aliased keep the ref. `var_dump` prints `&`
+  by consulting `Rc::strong_count`, which tracks PHP's refcount surprisingly well.
+  Reads through ref elements deref transparently (index paths, destructuring,
+  param binding, comparisons); writes into a ref'd slot write *through* the cell,
+  so `$a[1] = 99` is visible via `$v` and vice versa.
+- Side dishes: `class_exists`/`interface_exists`/`trait_exists`/`enum_exists` now
+  check the declaration *kind* instead of answering "true" for any class-like
+  name, and `print_r` learned to see through reference elements.
+
+The lesson repeats: the marquee features were "done" — generators, references,
+enums — but the corpus keeps finding the load-bearing 20% we skipped. Named args
+shipped in PHP 8.0; we parsed and ignored them for the project's entire life.
+
+---
+
 ## 2026-06-23 — "What's taking so long?" — three O(n²) holes and a prelude re-parse
 
 **Pass rate: 2766 → 2810. Scoreboard runtime: ~11 min → ~7 min.**

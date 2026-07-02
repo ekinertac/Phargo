@@ -1543,7 +1543,16 @@ impl Eval {
                     }
                 }
             }
-            Stmt::Foreach { array, key, value, by_ref: _, body } => {
+            Stmt::Foreach { array, key, value, by_ref, body } => {
+                // By-reference iteration over a plain array variable: elements are
+                // promoted to shared Ref cells so writes through the loop var stick.
+                if *by_ref {
+                    if let (Expr::Var(aname), Expr::Var(vname)) = (array, value) {
+                        if !is_superglobal(aname) {
+                            return self.foreach_by_ref(aname, vname, key, body);
+                        }
+                    }
+                }
                 let arr = self.eval(array)?;
                 match arr {
                     Value::Array(a) => {
@@ -1711,6 +1720,101 @@ impl Eval {
 
     /// One foreach iteration: bind key/value, run the body. Returns `Some(flow)`
     /// if the loop must stop (break/return propagation), `None` to continue.
+    /// Run one `&mut Arr` operation against the array stored under a variable
+    /// (directly or through a reference cell), without cloning the array.
+    fn with_array_mut<T>(&mut self, name: &str, f: impl FnOnce(&mut Arr) -> T) -> Option<T> {
+        let scope = self.scopes.last_mut().unwrap();
+        match scope.get_mut(name) {
+            Some(Value::Array(a)) => Some(f(a)),
+            Some(Value::Ref(cell)) => {
+                let cell = cell.clone();
+                let mut b = cell.borrow_mut();
+                match &mut *b {
+                    Value::Array(a) => Some(f(a)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `foreach ($arr as [$k =>] &$v)`: promote each visited element to a shared
+    /// Ref cell in place and bind $v to that cell, so writes through $v (and
+    /// writes to $arr[$k]) alias. After moving on, an element whose cell has no
+    /// other holder is unwrapped back to a plain value — mirroring PHP, where
+    /// only elements still referenced elsewhere keep the `&` refcount marker.
+    /// Keys are snapshotted up front (append-during-iteration isn't modeled).
+    fn foreach_by_ref(
+        &mut self,
+        aname: &str,
+        vname: &str,
+        key: &Option<Expr>,
+        body: &[Stmt],
+    ) -> R<Flow> {
+        let keys: Vec<Key> = match self.with_array_mut(aname, |a| {
+            a.entries.iter().map(|(k, _)| k.clone()).collect()
+        }) {
+            Some(ks) => ks,
+            None => return Ok(Flow::Normal),
+        };
+        let mut prev: Option<(Key, Rc<RefCell<Value>>)> = None;
+        for k in keys {
+            self.tick()?;
+            // promote the element to a Ref cell (in place, no array clone)
+            let cell = match self.with_array_mut(aname, |a| {
+                a.get_mut(&k).map(|slot| match slot {
+                    Value::Ref(c) => c.clone(),
+                    other => {
+                        let c = Rc::new(RefCell::new(std::mem::replace(other, Value::Null)));
+                        *other = Value::Ref(c.clone());
+                        c
+                    }
+                })
+            }) {
+                Some(Some(c)) => c,
+                Some(None) => continue, // key removed during iteration
+                None => break,          // variable no longer holds an array
+            };
+            if let Some(ke) = key {
+                self.assign_to(ke, akey_to_value(&k))?;
+            }
+            self.vars().insert(vname.to_string(), Value::Ref(cell.clone()));
+            // now that $v moved off the previous cell, unwrap it if unaliased
+            if let Some((pk, pc)) = prev.take() {
+                self.unwrap_element(aname, &pk, &pc);
+            }
+            match self.exec_block(body)? {
+                Flow::Break(n) => {
+                    return if n > 1 { Ok(Flow::Break(n - 1)) } else { Ok(Flow::Normal) };
+                }
+                Flow::Continue(n) if n > 1 => return Ok(Flow::Continue(n - 1)),
+                Flow::Return(rv) => return Ok(Flow::Return(rv)),
+                _ => {}
+            }
+            prev = Some((k, cell));
+        }
+        // the final element stays a Ref — $v still aliases it (PHP-correct)
+        Ok(Flow::Normal)
+    }
+
+    /// Demote a foreach-by-ref element back to a plain value once nothing but
+    /// the array (and our transient handle) holds its cell.
+    fn unwrap_element(&mut self, aname: &str, k: &Key, cell: &Rc<RefCell<Value>>) {
+        if Rc::strong_count(cell) != 2 {
+            return; // still aliased (closure capture, =&, …) — keep the ref
+        }
+        self.with_array_mut(aname, |a| {
+            if let Some(slot) = a.get_mut(k) {
+                if let Value::Ref(c) = slot {
+                    if Rc::ptr_eq(c, cell) {
+                        let v = cell.borrow().clone();
+                        *slot = v;
+                    }
+                }
+            }
+        });
+    }
+
     fn foreach_step(
         &mut self,
         key: &Option<Expr>,
@@ -1723,6 +1827,11 @@ impl Eval {
         if let (Some(ke), Some(k)) = (key, kv) {
             self.assign_to(ke, k)?;
         }
+        // deref: a leftover reference element must not alias into the loop var
+        let vv = match vv {
+            Value::Ref(c) => c.borrow().deref(),
+            v => v,
+        };
         self.assign_to(value, vv)?;
         Ok(match self.exec_block(body)? {
             Flow::Break(n) => Some(if n > 1 { Flow::Break(n - 1) } else { Flow::Normal }),
@@ -2001,7 +2110,15 @@ impl Eval {
             }
             Expr::New(class, args) => {
                 let cname = self.resolve_class_name(class)?;
-                let argv = self.eval_args(args)?;
+                let argv = {
+                    let (pos, named) = self.eval_args2(args)?;
+                    if named.is_empty() {
+                        pos
+                    } else {
+                        let params = self.find_method(&cname, "__construct").map(|(_, m)| m.params);
+                        self.merge_named(pos, named, params.as_deref())?
+                    }
+                };
                 self.instantiate(&cname, argv)?
             }
             Expr::NewAnon(decl, args) => {
@@ -2017,7 +2134,15 @@ impl Eval {
                         n
                     }
                 };
-                let argv = self.eval_args(args)?;
+                let argv = {
+                    let (pos, named) = self.eval_args2(args)?;
+                    if named.is_empty() {
+                        pos
+                    } else {
+                        let params = self.find_method(&cname, "__construct").map(|(_, m)| m.params);
+                        self.merge_named(pos, named, params.as_deref())?
+                    }
+                };
                 self.instantiate(&cname, argv)?
             }
             Expr::Prop(obj, name, nullsafe) => {
@@ -2050,13 +2175,35 @@ impl Eval {
                     return Ok(Value::Null);
                 }
                 let mname = self.prop_name_str(name)?;
-                let argv = self.eval_args(args)?;
+                let argv = {
+                    let (pos, named) = self.eval_args2(args)?;
+                    if named.is_empty() {
+                        pos
+                    } else {
+                        let params = match &o {
+                            Value::Object(rc) => {
+                                let cls = rc.borrow().class.clone();
+                                self.find_method(&cls, &mname).map(|(_, m)| m.params)
+                            }
+                            _ => None,
+                        };
+                        self.merge_named(pos, named, params.as_deref())?
+                    }
+                };
                 self.call_method_ref(o, &mname, argv, Some(args))?
             }
             Expr::StaticCall(class, name, args) => {
                 let cname = self.resolve_class_name(class)?;
                 let mname = self.prop_name_str(name)?;
-                let argv = self.eval_args(args)?;
+                let argv = {
+                    let (pos, named) = self.eval_args2(args)?;
+                    if named.is_empty() {
+                        pos
+                    } else {
+                        let params = self.find_method(&cname, &mname).map(|(_, m)| m.params);
+                        self.merge_named(pos, named, params.as_deref())?
+                    }
+                };
                 // `parent::`/`self::` keep the current $this if present
                 let this = self.vars().get("this").cloned();
                 self.call_static(&cname, &mname, argv, this, Some(args))?
@@ -2393,7 +2540,7 @@ impl Eval {
             if base_complex {
                 // not an ArrayAccess object — index the value as an array/string
                 if let Value::Array(a) = &obj {
-                    return Ok(a.get(&Arr::norm_key(&iv)).cloned().unwrap_or(Value::Null));
+                    return Ok(a.get(&Arr::norm_key(&iv)).map(|v| v.deref()).unwrap_or(Value::Null));
                 }
                 if let Value::Str(s) = &obj {
                     let i = to_i64(&iv);
@@ -2451,24 +2598,29 @@ impl Eval {
             let inner = cell.borrow().clone();
             return Ok(read_index_value(&inner, &keys));
         }
-        for k in &keys {
+        for (i, k) in keys.iter().enumerate() {
             match v {
                 Value::Array(a) => {
                     v = match a.get(k) {
                         Some(x) => x,
                         None => return Ok(Value::Null),
                     };
+                    // Reference element mid-path: continue inside the cell.
+                    if let Value::Ref(cell) = v {
+                        let inner = cell.borrow().clone();
+                        return Ok(read_index_value(&inner, &keys[i + 1..]));
+                    }
                 }
                 Value::Str(s) => return Ok(string_char(s, k)),
                 _ => return Ok(Value::Null),
             }
         }
-        Ok(v.clone())
+        Ok(v.deref())
     }
 
     fn index_get_key(&self, base: &Value, k: &Key) -> Value {
         match base {
-            Value::Array(a) => a.get(k).cloned().unwrap_or(Value::Null),
+            Value::Array(a) => a.get(k).map(|v| v.deref()).unwrap_or(Value::Null),
             Value::Str(s) => string_char(s, k),
             _ => Value::Null,
         }
@@ -2476,7 +2628,7 @@ impl Eval {
 
     fn index_get(&self, base: &Value, idx: &Value) -> Value {
         match base {
-            Value::Array(a) => a.get(&Arr::norm_key(idx)).cloned().unwrap_or(Value::Null),
+            Value::Array(a) => a.get(&Arr::norm_key(idx)).map(|v| v.deref()).unwrap_or(Value::Null),
             Value::Str(s) => {
                 let i = to_i64(idx);
                 let i = if i < 0 { s.len() as i64 + i } else { i };
@@ -2778,7 +2930,7 @@ impl Eval {
                             k
                         }
                     };
-                    let v = a.get(&key).cloned().unwrap_or(Value::Null);
+                    let v = a.get(&key).map(|v| v.deref()).unwrap_or(Value::Null);
                     self.assign_to(&item.value, v)?;
                 } else {
                     idx += 1;
@@ -2805,7 +2957,16 @@ impl Eval {
             {
                 return self.array_pointer(&name, args);
             }
-            let argv = self.eval_args(args)?;
+            let fdecl = self.funcs.get(&name).cloned();
+            let argv = {
+                let (pos, named) = self.eval_args2(args)?;
+                if named.is_empty() {
+                    pos
+                } else {
+                    let params = fdecl.as_ref().map(|f| f.params.clone());
+                    self.merge_named(pos, named, params.as_deref())?
+                }
+            };
             // include/require/eval need the lex->parse->exec machinery
             match name.as_str() {
                 "include" | "include_once" | "require" | "require_once" => {
@@ -2874,14 +3035,22 @@ impl Eval {
                 }
                 _ => {}
             }
-            if let Some(f) = self.funcs.get(&name).cloned() {
+            if let Some(f) = fdecl {
                 return self.call_user(&f, argv, Some(args));
             }
             return self.builtin(&name, argv);
         }
         // dynamic callee: $f(...), expr(...) — evaluate to a callable value
         let cv = self.eval(callee)?;
-        let argv = self.eval_args(args)?;
+        let argv = {
+            let (pos, named) = self.eval_args2(args)?;
+            if named.is_empty() {
+                pos
+            } else {
+                let params = self.callable_params(&cv);
+                self.merge_named(pos, named, params.as_deref())?
+            }
+        };
         self.call_value(cv, argv)
     }
 
@@ -3423,6 +3592,7 @@ impl Eval {
                 break;
             }
             let v = match args.get(i) {
+                Some(Value::Ref(c)) => c.borrow().deref(),
                 Some(v) => v.clone(),
                 None => match &p.default {
                     Some(d) => self.eval(d)?,
@@ -3538,22 +3708,111 @@ impl Eval {
     }
 
     fn eval_args(&mut self, args: &[Arg]) -> R<Vec<Value>> {
-        let mut out = Vec::new();
+        let (mut pos, named) = self.eval_args2(args)?;
+        // No callee params known here: append named values in order (legacy behavior
+        // for call sites that can't resolve the callee's signature).
+        for (_, v) in named {
+            pos.push(v);
+        }
+        Ok(pos)
+    }
+
+    /// Evaluate call arguments, separating positional from named. String keys in
+    /// a spread array become named args (PHP 8.1 `...['name' => $v]` semantics).
+    fn eval_args2(&mut self, args: &[Arg]) -> R<(Vec<Value>, Vec<(String, Value)>)> {
+        let mut pos = Vec::new();
+        let mut named: Vec<(String, Value)> = Vec::new();
         for a in args {
             if a.name.as_deref() == Some("...") {
                 continue;
             }
             if a.spread {
                 if let Value::Array(arr) = self.eval(&a.value)? {
-                    for (_, v) in arr.entries {
-                        out.push(v);
+                    for (k, v) in arr.entries {
+                        match k {
+                            Key::Str(s) => named.push((String::from_utf8_lossy(&s).into_owned(), v)),
+                            Key::Int(_) => pos.push(v),
+                        }
                     }
                 }
+            } else if let Some(n) = &a.name {
+                named.push((n.clone(), self.eval(&a.value)?));
             } else {
-                out.push(self.eval(&a.value)?);
+                pos.push(self.eval(&a.value)?);
             }
         }
-        Ok(out)
+        Ok((pos, named))
+    }
+
+    /// Map named arguments onto their positional parameter slots. Gaps between the
+    /// last positional arg and a named arg's slot get the parameter default (Null
+    /// if none — the required-arg error case). Unknown names append positionally.
+    fn merge_named(
+        &mut self,
+        mut pos: Vec<Value>,
+        named: Vec<(String, Value)>,
+        params: Option<&[Param]>,
+    ) -> R<Vec<Value>> {
+        let params = match params {
+            Some(p) if !named.is_empty() => p,
+            _ => {
+                for (_, v) in named {
+                    pos.push(v);
+                }
+                return Ok(pos);
+            }
+        };
+        for (name, val) in named {
+            match params.iter().position(|p| p.name == name && !p.variadic) {
+                Some(idx) => {
+                    while pos.len() < idx {
+                        let gap = &params[pos.len()];
+                        let dv = match &gap.default {
+                            Some(d) => self.eval(d)?,
+                            None => Value::Null,
+                        };
+                        pos.push(dv);
+                    }
+                    if pos.len() == idx {
+                        pos.push(val);
+                    } else {
+                        pos[idx] = val;
+                    }
+                }
+                None => pos.push(val),
+            }
+        }
+        Ok(pos)
+    }
+
+    /// Callee parameter list for named-arg resolution on a dynamic callable value.
+    fn callable_params(&self, cv: &Value) -> Option<Vec<Param>> {
+        match cv {
+            Value::Closure(c) => Some(match &c.kind {
+                ClosureKind::Full(f) => f.params.clone(),
+                ClosureKind::Arrow(f) => f.params.clone(),
+            }),
+            Value::Str(s) => {
+                let name = String::from_utf8_lossy(s).to_ascii_lowercase();
+                self.funcs.get(&name).map(|f| f.params.clone())
+            }
+            Value::Object(rc) => {
+                let class = rc.borrow().class.clone();
+                self.find_method(&class, "__invoke").map(|(_, m)| m.params)
+            }
+            Value::Array(a) if a.len() == 2 => {
+                let recv = a.get(&Key::Int(0)).cloned()?;
+                let m = a.get(&Key::Int(1)).cloned()?;
+                let mname = String::from_utf8_lossy(&to_bytes(&m)).into_owned();
+                let cls = match recv {
+                    Value::Object(rc) => rc.borrow().class.clone(),
+                    Value::Str(s) => String::from_utf8_lossy(&s).into_owned(),
+                    _ => return None,
+                };
+                self.find_method(&cls, &mname).map(|(_, m)| m.params)
+            }
+            _ => None,
+        }
     }
 
     /// The ancestor chain (self first, then parents), as class decls.
@@ -3958,6 +4217,9 @@ impl Eval {
                 break;
             }
             let v = match args.get(i) {
+                // deref: a Ref element passed through a builtin callback must
+                // bind by value, not alias into the callee's scope
+                Some(Value::Ref(c)) => c.borrow().deref(),
                 Some(v) => v.clone(),
                 None => match &p.default {
                     Some(d) => self.eval(d)?,
@@ -5868,7 +6130,17 @@ impl Eval {
             }
             "class_exists" | "interface_exists" | "trait_exists" | "enum_exists" => {
                 let n = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
-                Value::Bool(self.find_class(&n).is_some())
+                Value::Bool(match self.find_class(&n) {
+                    // class_exists is true for classes AND enums (enums are classes);
+                    // the others each match only their own kind.
+                    Some(d) => match name {
+                        "interface_exists" => d.kind == ClassKind::Interface,
+                        "trait_exists" => d.kind == ClassKind::Trait,
+                        "enum_exists" => d.kind == ClassKind::Enum,
+                        _ => matches!(d.kind, ClassKind::Class | ClassKind::Enum),
+                    },
+                    None => false,
+                })
             }
             "get_declared_classes" | "get_declared_interfaces" | "get_declared_traits" => {
                 let want_kind = match name {
@@ -7102,9 +7374,14 @@ fn trim_bytes(s: &[u8], left: bool, right: bool) -> Vec<u8> {
 /// Navigate a value by a sequence of already-normalized keys (array/string).
 fn read_index_value(base: &Value, keys: &[Key]) -> Value {
     let mut v = base;
-    for k in keys {
+    for (i, k) in keys.iter().enumerate() {
         match v {
             Value::Array(a) => match a.get(k) {
+                Some(Value::Ref(cell)) => {
+                    // reference element mid-path: continue inside the cell
+                    let inner = cell.borrow().clone();
+                    return read_index_value(&inner, &keys[i + 1..]);
+                }
                 Some(x) => v = x,
                 None => return Value::Null,
             },
@@ -7112,7 +7389,7 @@ fn read_index_value(base: &Value, keys: &[Key]) -> Value {
             _ => return Value::Null,
         }
     }
-    v.clone()
+    v.deref()
 }
 
 /// The user-visible class name: anonymous classes are registered under a unique
@@ -7680,7 +7957,28 @@ fn var_dump_seen(ev: &Eval, v: &Value, indent: usize, out: &mut String, seen: &m
             out.push_str(&format!("{pad}}}\n"));
         }
         Value::Closure(_) => out.push_str(&format!("{pad}object(Closure)#1 (0) {{\n{pad}}}\n")),
-        Value::Ref(c) => var_dump_seen(ev, &c.borrow(), indent, out, seen),
+        Value::Ref(c) => {
+            // PHP marks a reference element with `&` only while it has another
+            // durable alias (refcount > 1). Our Rc count includes one temp clone
+            // made evaluating the var_dump argument, hence the threshold of 3.
+            if Rc::strong_count(c) >= 3 {
+                let mut inner = String::new();
+                var_dump_seen(ev, &c.borrow(), indent, &mut inner, seen);
+                // each dump line starts with the indent pad; the `&` sits between
+                // the pad and the value's type token
+                let pad = "  ".repeat(indent);
+                if let Some(rest) = inner.strip_prefix(pad.as_str()) {
+                    out.push_str(&pad);
+                    out.push('&');
+                    out.push_str(rest);
+                } else {
+                    out.push('&');
+                    out.push_str(&inner);
+                }
+            } else {
+                var_dump_seen(ev, &c.borrow(), indent, out, seen);
+            }
+        }
     }
 }
 
@@ -7779,6 +8077,8 @@ fn print_r(v: &Value, indent: usize, out: &mut String) {
             }
             out.push_str(&format!("{pad})\n"));
         }
+        // reference elements are transparent in print_r (no & marker)
+        Value::Ref(c) => print_r(&c.borrow(), indent, out),
         other => out.push_str(&String::from_utf8_lossy(&to_bytes(other))),
     }
 }
