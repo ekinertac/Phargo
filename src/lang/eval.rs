@@ -63,6 +63,11 @@ pub struct Eval {
     next_res_id: i64,
     /// Callbacks registered via register_shutdown_function, run after main exits.
     shutdown_fns: Vec<(Value, Vec<Value>)>,
+    /// Autoloaders registered via spl_autoload_register, tried in order when a
+    /// class is first touched and unknown.
+    autoloaders: Vec<Value>,
+    /// Classes currently being autoloaded (recursion guard, lowercased).
+    autoload_active: HashSet<String>,
     /// Per-call argument stack, for func_get_args()/func_num_args().
     cur_args: Vec<Vec<Value>>,
     /// Per-call function/method name stack, for __FUNCTION__/__METHOD__.
@@ -1294,6 +1299,8 @@ impl Eval {
             ob_stack: Vec::new(),
             next_res_id: 1,
             shutdown_fns: Vec::new(),
+            autoloaders: Vec::new(),
+            autoload_active: HashSet::new(),
             cur_args: Vec::new(),
             cur_fn: Vec::new(),
             rng_state: 0x2545_F491_4F6C_DD1D,
@@ -1565,6 +1572,8 @@ impl Eval {
                         "\nFatal error: Uncaught {cls}: {msg} in {file}:0\nStack trace:\n#0 {{main}}\n  thrown in {file} on line 0\n"
                     );
                     e.out.extend_from_slice(s.as_bytes());
+                    // PHP runs shutdown functions after an uncaught exception too
+                    e.run_shutdown();
                     Ok(e.out)
                 } else {
                     Err(err)
@@ -4010,6 +4019,37 @@ impl Eval {
         self.classes.get(&name.to_ascii_lowercase()).cloned()
     }
 
+    /// Run registered autoloaders for an unknown class. Returns true if the
+    /// class exists afterwards. Re-entrant loads of the same name are no-ops.
+    fn autoload(&mut self, name: &str) -> bool {
+        if self.autoloaders.is_empty() || name.is_empty() {
+            return false;
+        }
+        let key = name.to_ascii_lowercase();
+        if self.classes.contains_key(&key) || self.autoload_active.contains(&key) {
+            return self.classes.contains_key(&key);
+        }
+        self.autoload_active.insert(key.clone());
+        let loaders = self.autoloaders.clone();
+        for l in loaders {
+            let _ = self.call_value(l, vec![Value::Str(name.as_bytes().to_vec())]);
+            if self.classes.contains_key(&key) {
+                break;
+            }
+        }
+        self.autoload_active.remove(&key);
+        self.classes.contains_key(&key)
+    }
+
+    /// find_class, invoking autoloaders on a miss (the `new`/static-access path).
+    fn find_class_autoload(&mut self, name: &str) -> Option<Rc<ClassDecl>> {
+        if let Some(c) = self.find_class(name) {
+            return Some(c);
+        }
+        self.autoload(name);
+        self.find_class(name)
+    }
+
     /// Resolve a class reference expression to a class name.
     fn resolve_class_name(&mut self, e: &Expr) -> R<String> {
         match e {
@@ -4294,7 +4334,7 @@ impl Eval {
     }
 
     fn instantiate(&mut self, class: &str, args: Vec<Value>) -> R<Value> {
-        let decl = match self.find_class(class) {
+        let decl = match self.find_class_autoload(class) {
             Some(d) => d,
             None => return Err(RunError(format!("class {class} not found"))),
         };
@@ -4540,6 +4580,9 @@ impl Eval {
                 }
             }
         }
+        if self.find_class(class).is_none() {
+            self.autoload(class);
+        }
         let (decl_class, m) = match self.find_method(class, method) {
             Some(x) => x,
             None => return Err(RunError(format!("call to undefined method {class}::{method}()"))),
@@ -4668,6 +4711,9 @@ impl Eval {
     }
 
     fn class_const(&mut self, class: &str, name: &str) -> R<Value> {
+        if self.find_class(class).is_none() {
+            self.autoload(class);
+        }
         // enum case?
         if let Some(c) = self.find_class(class) {
             if c.kind == ClassKind::Enum {
@@ -6542,6 +6588,10 @@ impl Eval {
             }
             "class_exists" | "interface_exists" | "trait_exists" | "enum_exists" => {
                 let n = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                // second arg $autoload defaults to true
+                if self.find_class(&n).is_none() && (args.len() < 2 || to_bool(&a(1))) {
+                    self.autoload(&n);
+                }
                 Value::Bool(match self.find_class(&n) {
                     // class_exists is true for classes AND enums (enums are classes);
                     // the others each match only their own kind.
@@ -7785,8 +7835,29 @@ impl Eval {
                     Value::Bool(false)
                 }
             }
-            "trigger_error" | "spl_autoload_register" | "spl_autoload_unregister"
-            | "assert" | "gc_enabled" | "headers_sent"
+            "spl_autoload_register" => {
+                if !args.is_empty() {
+                    self.autoloaders.push(a(0));
+                }
+                Value::Bool(true)
+            }
+            "spl_autoload_unregister" => {
+                let target = a(0);
+                self.autoloaders.retain(|l| match (l, &target) {
+                    (Value::Str(x), Value::Str(y)) => x != y,
+                    (Value::Closure(x), Value::Closure(y)) => !Rc::ptr_eq(x, y),
+                    _ => true,
+                });
+                Value::Bool(true)
+            }
+            "spl_autoload_functions" => {
+                let mut arr = Arr::new();
+                for l in &self.autoloaders {
+                    arr.push(l.clone());
+                }
+                Value::Array(arr)
+            }
+            "trigger_error" | "assert" | "gc_enabled" | "headers_sent"
             | "stream_set_blocking" | "stream_set_timeout" | "stream_set_read_buffer"
             | "stream_set_write_buffer" | "stream_wrapper_register" | "stream_wrapper_unregister"
             | "stream_wrapper_restore" | "stream_filter_remove" => {

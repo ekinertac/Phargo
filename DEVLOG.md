@@ -27,6 +27,25 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-03 (night) — Autoloading exists now; 15% crossed
+
+**Pass rate: 3281 → 3302 — 15.0% of gradeable.**
+
+`spl_autoload_register` had been a silent no-op. Now it's real: registered
+callbacks fire (with a re-entrancy guard) the first time an unknown class is
+touched via `new`, a static call, a class constant, or `class_exists` (whose
+`$autoload` parameter defaults to true — several tests check exactly that
+flag's behavior). And shutdown functions now also run after an uncaught
+exception, matching PHP's lifecycle — that plus autoload converted a chunk of
+the "engine printed nothing" bucket the emptyscan tool identified.
+
+Day tally: **3007 → 3302 (+295, 13.8% → 15.0%)** across seven batches — five
+of them with cheaper-model subagents doing the well-specified implementation
+work in parallel while the analysis, the architecture, and every
+commit-or-revert verdict stayed with the orchestrator.
+
+---
+
 ## 2026-07-03 (later still) — Measure your measurement, part two
 
 **Pass rate: 3197 → 3281 (+84).**

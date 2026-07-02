@@ -100,29 +100,41 @@ the shipping number on the same suite. Then deleted the legacy engine (`lib.rs`
   path; check `git status --porcelain` before every add.
 - **`git add -A` once swept in a corpus-generated junk file.** Always inspect first.
 
-## Current state (2026-07-03)
+## Current state (2026-07-03 night)
 
-- **3150 / 21970 gradeable (14.3%).** Only ~7 panics in the whole corpus (engine
-  is robust); failures are missing features.
+- **3302 / 21970 gradeable (15.0%).** Seven batches on 07-02/03 took 3007 → 3302.
 - **Realistic ceiling ~40–45%** — the rest is out-of-scope C extensions.
-- The **pure-PHP-builtins vein is largely mined out**; remaining MISSING_FN are C
-  extensions + `crypt`.
-- **Timezones are now real** (TZif reader over host zoneinfo — note: needs
-  /usr/share/zoneinfo, i.e. Unix; Windows hosts fall back to UTC-only).
-  ext/date sits at 155/689; the biggest remaining date cluster is
-  **`DateTime::createFromFormat`** (real format-string parsing, ~30 files) +
-  microsecond storage ('u' currently prints 000000).
+- Landed this session: named args; foreach-by-ref (real Ref cells in elements,
+  live-append iteration with cursor+cap guard); LSB; undefined-const Error;
+  timezones (TZif reader, createFromFormat, DatePeriod, identifiers list,
+  strtotime offsets/abbrevs); `clone` (was missing); variable variables `$$x`
+  (were missing); by-ref callback params (array_walk mutates); autoloading
+  (spl_autoload_register was a no-op); shutdown fns after fatals; SPL
+  IT_MODE/EXTR plumbing; DOM ChildNode API; **harness now trims both sides**
+  like run-tests.php (that alone was +84).
+- **Orchestration mode works:** well-specified rungs go to Sonnet subagents
+  (exact file scope + expected outputs + regression baselines to hold);
+  analysis/architecture/commit-verdicts stay with the orchestrator. Five agent
+  tasks, all first-try clean. See memory note `phargo-subagent-orchestration`.
+- Analysis tools: `suiteanalyze [close]`, `zendscan`, `errscan`,
+  `emptyscan` (buckets empty-output failures), `examples/xxx_run.rs <substr>`
+  (quick subset PASS/FAIL, EXPECT-only).
 
 ## Next targets (by leverage, achievable only)
 
-1. **`DateTime::createFromFormat`** — real format parser; unlocks ~30 date files
-   plus knock-on passes elsewhere.
-2. **DOM convenience methods** (`loadHTML`, `remove`/`append`/`before`/`after`) —
-   cheap on the existing tree, but ext/dom is capped by exact-serialization matching.
-3. **Parser clusters** — small whole-test wins (e.g. lexer "unterminated string",
-   `#[Attr]` in expressions, semi-reserved method names).
-4. **MISMATCH_CLOSE sampler** (`suiteanalyze -- close`) keeps paying: it found
-   named args, LSB, and clone. Re-run it after each batch.
+1. **Parameter/return type enforcement + TypeError messages** — the biggest
+   remaining cluster (MISMATCH_FATAL has ~1300 `throw:Error` tests, many being
+   "expected fatal, engine continued"). Regression-heavy; needs its own
+   analysis pass first (measure which error messages dominate).
+2. **Tokenizer ext** (`token_get_all`/`PhpToken`, ~55 tests) — needs a raw
+   whitespace-preserving scan + PHP's exact numeric token-ID table. A full
+   session, mechanical once designed.
+3. **DOM `loadHTML` + saveHTML** (~27+ tests) — needs lenient HTML parse mode
+   over the existing XML tree + HTML serializer.
+4. **ReflectionClass::newLazyGhost/newLazyProxy** (~55 tests, PHP 8.4 lazy
+   objects).
+5. Keep re-running `suiteanalyze -- close` after each batch — it found named
+   args, LSB, clone, and $$x.
 
 **Avoid:** the Uri/Url 8.5 API (needs IDN/punycode + exact var_dump of internal
 objects — PHP uses C libs lexbor/uriparser; much harder than it looks) and all the
