@@ -27,6 +27,28 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-04 (late night) — Stack traces, frame by frame
+
+**Pass rate: 3430 → 3436.**
+
+The second half of what the line infrastructure was built for: real stack
+traces. Every call shape pushes a frame (`inner`, `Class->method`,
+`Class::method`, `{closure}`) tagged with the caller's line; exceptions
+snapshot the stack at construction (prelude-internal frames filtered — the
+corpus doesn't expect to see our PHP-emulated internals); and both
+`getTraceAsString()` and the uncaught-fatal printer render PHP's format
+byte-for-byte: `#0 /file.php(3): inner()` … `#2 {main}`. En route, a real
+bug from batch 8 got fixed: a TypeError thrown during argument binding leaked
+`cur_fn` entries, quietly corrupting `__FUNCTION__` for the rest of the run.
+
+Honest accounting: +7 and +6 for the two error-infrastructure batches — the
+fatal-test cluster demands message, file, line, and trace all exact at once,
+so the payoff arrives test by test rather than in a burst. The
+infrastructure is the point: every future error-message rung now lands on
+correct scaffolding.
+
+---
+
 ## 2026-07-04 (night) — Line numbers are real
 
 **Pass rate: 3423 → 3430.**

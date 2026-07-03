@@ -73,6 +73,9 @@ pub struct Eval {
     has_error_handler: bool,
     /// 1-based source line of the statement currently executing (0 = unknown).
     cur_line: u32,
+    /// Call-frame stack for exception traces: (display name like "f" or
+    /// "Class->m", caller's line at the call site). Parallel to cur_fn pushes.
+    frames: Vec<(String, u32)>,
     /// Function/class names registered by the PRELUDE — they emulate C
     /// internals, so their bodies never emit engine warnings (lowercased).
     prelude_fns: HashSet<String>,
@@ -138,12 +141,21 @@ class Exception implements Throwable {
         $this->message = $message; $this->code = $code; $this->previous = $previous;
         $this->file = __phargo_cur_file();
         $this->line = __phargo_cur_line();
+        $this->__trace = __phargo_trace();
     }
     public function getMessage() { return $this->message; }
     public function getCode() { return $this->code; }
     public function getPrevious() { return $this->previous; }
-    public function getTrace() { return []; }
-    public function getTraceAsString() { return "#0 {main}"; }
+    public function getTrace() { return $this->__trace ?? []; }
+    public function getTraceAsString() {
+        $out = []; $i = 0;
+        foreach (($this->__trace ?? []) as $f) {
+            $out[] = "#$i " . $f["file"] . "(" . $f["line"] . "): " . $f["function"] . "()";
+            $i++;
+        }
+        $out[] = "#$i {main}";
+        return implode("\n", $out);
+    }
     public function getFile() { return $this->file; }
     public function getLine() { return $this->line; }
     public function __toString() { return $this->message; }
@@ -159,12 +171,21 @@ class Error implements Throwable {
         $this->message = $message; $this->code = $code; $this->previous = $previous;
         $this->file = __phargo_cur_file();
         $this->line = __phargo_cur_line();
+        $this->__trace = __phargo_trace();
     }
     public function getMessage() { return $this->message; }
     public function getCode() { return $this->code; }
     public function getPrevious() { return $this->previous; }
-    public function getTrace() { return []; }
-    public function getTraceAsString() { return "#0 {main}"; }
+    public function getTrace() { return $this->__trace ?? []; }
+    public function getTraceAsString() {
+        $out = []; $i = 0;
+        foreach (($this->__trace ?? []) as $f) {
+            $out[] = "#$i " . $f["file"] . "(" . $f["line"] . "): " . $f["function"] . "()";
+            $i++;
+        }
+        $out[] = "#$i {main}";
+        return implode("\n", $out);
+    }
     public function getFile() { return $this->file; }
     public function getLine() { return $this->line; }
     public function __toString() { return $this->message; }
@@ -1334,6 +1355,7 @@ impl Eval {
             quiet: 0,
             has_error_handler: false,
             cur_line: 0,
+            frames: Vec::new(),
             prelude_fns: HashSet::new(),
             prelude_classes: HashSet::new(),
             byref_ret: Vec::new(),
@@ -1615,8 +1637,12 @@ impl Eval {
                         }
                         _ => (String::new(), 0),
                     };
+                    let trace = e
+                        .call_method(exc.clone(), "getTraceAsString", vec![])
+                        .map(|v| String::from_utf8_lossy(&to_bytes(&v)).into_owned())
+                        .unwrap_or_else(|_| "#0 {main}".to_string());
                     let s = format!(
-                        "\nFatal error: Uncaught {cls}: {msg} in {file}:{line}\nStack trace:\n#0 {{main}}\n  thrown in {file} on line {line}\n"
+                        "\nFatal error: Uncaught {cls}: {msg} in {file}:{line}\nStack trace:\n{trace}\n  thrown in {file} on line {line}\n"
                     );
                     e.out.extend_from_slice(s.as_bytes());
                     // PHP runs shutdown functions after an uncaught exception too
@@ -4133,6 +4159,7 @@ impl Eval {
         self.enter_call()?;
         self.cur_args.push(args.clone());
         self.cur_fn.push("{closure}".to_string());
+        self.frames.push(("{closure}".to_string(), self.cur_line));
         let mut scope = HashMap::new();
         for (k, v) in &c.captures {
             scope.insert(k.clone(), v.clone());
@@ -4162,6 +4189,7 @@ impl Eval {
         };
         self.cur_args.pop();
         self.cur_fn.pop();
+        self.frames.pop();
         self.call_depth -= 1;
         r
     }
@@ -4219,11 +4247,13 @@ impl Eval {
         self.enter_call()?;
         self.cur_args.push(args.clone());
         self.cur_fn.push(f.name.clone());
+        self.frames.push((f.name.clone(), self.cur_line));
         let mut scope = HashMap::new();
         let bind = self.bind_params(&mut scope, &f.params, &args, &f.name);
         if let Err(e) = bind {
             self.cur_args.pop();
             self.cur_fn.pop();
+            self.frames.pop();
             self.call_depth -= 1;
             return Err(e);
         }
@@ -4244,6 +4274,7 @@ impl Eval {
         self.cur_args.pop();
         self.cur_fn.pop();
         self.call_depth -= 1;
+        self.frames.pop();
         self.apply_byref(byref, wb)?;
         let fname = f.name.clone();
         let rt = f.ret_type.clone();
@@ -4731,7 +4762,14 @@ impl Eval {
             scope.insert("this".to_string(), recv.clone());
         }
         let mfname = format!("{}::{}", display_class(decl_class), m.name);
-        self.bind_params(&mut scope, &m.params, &args, &mfname)?;
+        self.frames.push((format!("{}->{}", display_class(decl_class), m.name), self.cur_line));
+        if let Err(e) = self.bind_params(&mut scope, &m.params, &args, &mfname) {
+            self.cur_args.pop();
+            self.cur_fn.pop();
+            self.frames.pop();
+            self.call_depth -= 1;
+            return Err(e);
+        }
         // constructor property promotion
         if m.name.eq_ignore_ascii_case("__construct") {
             if let Value::Object(rc) = &recv {
@@ -4773,6 +4811,7 @@ impl Eval {
         self.called_class = prev_called;
         self.cur_args.pop();
         self.cur_fn.pop();
+        self.frames.pop();
         self.call_depth -= 1;
         self.apply_byref(byref, wb)?;
         let rt = m.ret_type.clone();
@@ -4901,7 +4940,14 @@ impl Eval {
             }
         }
         let mfname = format!("{}::{}", display_class(&decl_class), m.name);
-        self.bind_params(&mut scope, &m.params, &args, &mfname)?;
+        self.frames.push((mfname.clone(), self.cur_line));
+        if let Err(e) = self.bind_params(&mut scope, &m.params, &args, &mfname) {
+            self.cur_args.pop();
+            self.cur_fn.pop();
+            self.frames.pop();
+            self.call_depth -= 1;
+            return Err(e);
+        }
         let prev_class = self.current_class.replace(decl_class.clone());
         // LSB scope: forwarding calls keep the caller's; explicit C::m() rebinds.
         // (Canonicalize through find_class so case matches the declaration.)
@@ -4930,6 +4976,7 @@ impl Eval {
         self.called_class = prev_called;
         self.cur_args.pop();
         self.cur_fn.pop();
+        self.frames.pop();
         self.call_depth -= 1;
         self.apply_byref(byref, wb)?;
         let rt = m.ret_type.clone();
@@ -7427,6 +7474,32 @@ impl Eval {
                 let tzname = String::from_utf8_lossy(&to_bytes(&a(2))).into_owned();
                 let zone = if crate::tz::is_utc_name(&tzname) { None } else { crate::tz::lookup(&tzname) };
                 Value::Str(crate::php_date_tz(&fmt, ts, zone.as_deref()).into_bytes())
+            }
+            "__phargo_trace" => {
+                let file = self
+                    .cur_file
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let mut arr = Arr::new();
+                for (name, line) in self.frames.iter().rev() {
+                    // frames inside prelude code (Exception::__construct etc.)
+                    // are engine internals — PHP traces don't show them
+                    let base = name
+                        .split(|c| c == '-' || c == ':')
+                        .next()
+                        .unwrap_or(name)
+                        .to_ascii_lowercase();
+                    if self.prelude_classes.contains(&base) || self.prelude_fns.contains(&base) {
+                        continue;
+                    }
+                    let mut f = Arr::new();
+                    f.insert(Key::Str(b"file".to_vec()), Value::Str(file.clone().into_bytes()));
+                    f.insert(Key::Str(b"line".to_vec()), Value::Int(*line as i64));
+                    f.insert(Key::Str(b"function".to_vec()), Value::Str(name.clone().into_bytes()));
+                    arr.push(Value::Array(f));
+                }
+                Value::Array(arr)
             }
             "__phargo_cur_line" => Value::Int(self.cur_line as i64),
             "__phargo_cur_file" => Value::Str(
