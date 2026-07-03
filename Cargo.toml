@@ -9,4 +9,4 @@ license = "MIT OR Apache-2.0"
 # bundled SQLite behind our own PDO/SQLite3 PHP API surface. Everything else
 # stays from-scratch: fast builds, nothing to explain, easy to audit.
 [dependencies]
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }

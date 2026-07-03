@@ -27,6 +27,30 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-08 — WordPress executes: the wall moves from features to speed
+
+**Pass rate: 3639 → 3645. WP oracle: db_connect → 139 seconds of real execution.**
+
+The blocker-popping cadence the oracle enables: `compact()` (never
+implemented — the seventh resurrected staple), honest `extension_loaded()`,
+`umask`, the full PDO constant set, and the interesting one —
+`PDO::sqliteCreateFunction`. WordPress's SQLite plugin registers ~45 PHP
+callbacks as SQL functions (MONTH, FIELD, IF, REGEXP…); instead of building
+evaluator-reentrancy for callbacks-inside-queries, the engine pre-registers
+the whole MySQL-compat set natively in `src/pdo.rs` — our datetime, hash,
+and regex modules answering SQL now — and accepts the registration calls as
+no-ops.
+
+Result: WordPress bootstraps through version checks, SAPI fixup, plugin
+load, PDO connection, and into live query translation… where it burns the
+full 20-million-step budget over 139 seconds. On corpus code the walker does
+20M steps in ~4s; on WP's SQL-lexer code, 35× slower. The wall is no longer
+missing features — it's the tree-walker itself, arriving precisely where
+docs/ROADMAP.md said Phase 2 would find it. Next: profile the grind before
+adding surface.
+
+---
+
 ## 2026-07-07 (night) — The database decision, and PDO is born
 
 **Pass rate: 3633 → 3639. The dependency count: 0 → 1.**

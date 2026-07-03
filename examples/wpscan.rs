@@ -50,17 +50,19 @@ fn scan() {
     if !cfg.exists() {
         std::fs::write(&cfg, WP_CONFIG).expect("write wp-config");
     }
-    // decision-neutral db.php drop-in: defers the mysqli check (WP's own
-    // escape hatch) so the oracle can surface post-DB blockers while the
-    // real database strategy (ROADMAP open decision) is settled.
+    // the real db.php drop-in: the SQLite-integration plugin's db.copy with
+    // its placeholders substituted (what the plugin's activator does)
+    let plug = wp
+        .join("wp-content")
+        .join("plugins")
+        .join("sqlite-database-integration");
     let dbphp = wp.join("wp-content").join("db.php");
-    if !dbphp.exists() {
-        std::fs::write(
-            &dbphp,
-            "<?php // Phargo oracle stub: real db layer TBD (docs/ROADMAP.md).
-",
-        )
-        .expect("write db.php");
+    if plug.join("db.copy").exists() {
+        let tpl = std::fs::read_to_string(plug.join("db.copy")).expect("read db.copy");
+        let filled = tpl
+            .replace("{SQLITE_IMPLEMENTATION_FOLDER_PATH}", &plug.display().to_string())
+            .replace("{SQLITE_PLUGIN}", "sqlite-database-integration/load.php");
+        std::fs::write(&dbphp, filled).expect("write db.php");
     }
 
     // the driver script: SAPI fixture + the real WP entry chain
@@ -92,6 +94,11 @@ echo "\n=== WP BOOTSTRAP COMPLETED ===\n";
     match result {
         Ok(Ok(out)) => {
             println!("run returned OK; output {} bytes", out.len());
+            // the blocker line, untruncated
+            if let Some(i) = out.find("Fatal error") {
+                let line: String = out[i..].lines().next().unwrap_or("").to_string();
+                println!("BLOCKER: {line}");
+            }
             let tail: String = out.chars().rev().take(1200).collect::<String>().chars().rev().collect();
             println!("--- output tail ---\n{tail}");
         }

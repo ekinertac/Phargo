@@ -52,6 +52,161 @@ fn from_ref(v: rusqlite::types::ValueRef<'_>) -> SqlVal {
     }
 }
 
+/// MySQL-compat scalar functions the WordPress SQLite plugin expects to
+/// register via PDO::sqliteCreateFunction. We provide them natively at
+/// connection-open instead (the prelude's sqliteCreateFunction is a no-op),
+/// sidestepping PHP-callback reentrancy into the evaluator.
+fn register_mysql_shims(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    let f = FunctionFlags::SQLITE_UTF8;
+    let det = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+
+    fn ts_of(s: &str) -> i64 {
+        crate::php_strtotime(s, crate::now_unix()).unwrap_or(0)
+    }
+    fn datepart(s: &str, fmt: &str) -> i64 {
+        crate::php_date(fmt, ts_of(s)).parse().unwrap_or(0)
+    }
+
+    conn.create_scalar_function("month", 1, det, |c| {
+        Ok(datepart(&c.get::<String>(0)?, "n"))
+    })?;
+    conn.create_scalar_function("monthnum", 1, det, |c| {
+        Ok(datepart(&c.get::<String>(0)?, "n"))
+    })?;
+    conn.create_scalar_function("year", 1, det, |c| {
+        Ok(datepart(&c.get::<String>(0)?, "Y"))
+    })?;
+    conn.create_scalar_function("day", 1, det, |c| {
+        Ok(datepart(&c.get::<String>(0)?, "j"))
+    })?;
+    conn.create_scalar_function("dayofmonth", 1, det, |c| {
+        Ok(datepart(&c.get::<String>(0)?, "j"))
+    })?;
+    conn.create_scalar_function("hour", 1, det, |c| {
+        Ok(datepart(&c.get::<String>(0)?, "G"))
+    })?;
+    conn.create_scalar_function("minute", 1, det, |c| {
+        Ok(datepart(&c.get::<String>(0)?, "i"))
+    })?;
+    conn.create_scalar_function("second", 1, det, |c| {
+        Ok(datepart(&c.get::<String>(0)?, "s"))
+    })?;
+    conn.create_scalar_function("week", 1, det, |c| {
+        Ok(datepart(&c.get::<String>(0)?, "W"))
+    })?;
+    conn.create_scalar_function("weekday", 1, det, |c| {
+        // MySQL WEEKDAY: 0=Monday
+        Ok((datepart(&c.get::<String>(0)?, "N") - 1).max(0))
+    })?;
+    conn.create_scalar_function("dayofweek", 1, det, |c| {
+        // MySQL DAYOFWEEK: 1=Sunday
+        Ok(datepart(&c.get::<String>(0)?, "w") + 1)
+    })?;
+    conn.create_scalar_function("unix_timestamp", 0, f, |_| Ok(crate::now_unix()))?;
+    conn.create_scalar_function("unix_timestamp", 1, det, |c| {
+        Ok(ts_of(&c.get::<String>(0)?))
+    })?;
+    conn.create_scalar_function("now", 0, f, |_| {
+        Ok(crate::php_date("Y-m-d H:i:s", crate::now_unix()))
+    })?;
+    conn.create_scalar_function("curdate", 0, f, |_| {
+        Ok(crate::php_date("Y-m-d", crate::now_unix()))
+    })?;
+    conn.create_scalar_function("utc_date", 0, f, |_| {
+        Ok(crate::php_date("Y-m-d", crate::now_unix()))
+    })?;
+    conn.create_scalar_function("utc_time", 0, f, |_| {
+        Ok(crate::php_date("H:i:s", crate::now_unix()))
+    })?;
+    conn.create_scalar_function("utc_timestamp", 0, f, |_| {
+        Ok(crate::php_date("Y-m-d H:i:s", crate::now_unix()))
+    })?;
+    conn.create_scalar_function("from_unixtime", 1, det, |c| {
+        Ok(crate::php_date("Y-m-d H:i:s", c.get::<i64>(0)?))
+    })?;
+    conn.create_scalar_function("datediff", 2, det, |c| {
+        let a = ts_of(&c.get::<String>(0)?);
+        let b = ts_of(&c.get::<String>(1)?);
+        Ok(a.div_euclid(86400) - b.div_euclid(86400))
+    })?;
+    conn.create_scalar_function("md5", 1, det, |c| {
+        Ok(crate::md5_hex(c.get::<String>(0)?.as_bytes()))
+    })?;
+    conn.create_scalar_function("rand", 0, f, |_| {
+        // deterministic-ish is fine for WP's uses
+        Ok((crate::now_unix() % 1000) as f64 / 1000.0)
+    })?;
+    conn.create_scalar_function("isnull", 1, det, |c| {
+        Ok(matches!(c.get_raw(0), rusqlite::types::ValueRef::Null) as i64)
+    })?;
+    conn.create_scalar_function("if", 3, det, |c| {
+        use rusqlite::types::{Value as SV, ValueRef};
+        let cond = match c.get_raw(0) {
+            ValueRef::Null => false,
+            ValueRef::Integer(n) => n != 0,
+            ValueRef::Real(r) => r != 0.0,
+            ValueRef::Text(t) => !t.is_empty() && t != b"0",
+            ValueRef::Blob(b) => !b.is_empty(),
+        };
+        Ok(SV::from(c.get_raw(if cond { 1 } else { 2 })))
+    })?;
+    conn.create_scalar_function("regexp", 2, det, |c| {
+        let pat = c.get::<String>(0)?;
+        let subj = c.get::<String>(1)?;
+        // MySQL REGEXP is case-insensitive by default
+        let full = format!("/{}/i", pat.replace('/', "\\/"));
+        let hit = crate::rx_compile(&full)
+            .map(|rx| {
+                let chars: Vec<char> = subj.chars().collect();
+                let mut steps = 0usize;
+                (0..=chars.len()).any(|st| rx.exec(&chars, st, &mut steps).is_some())
+            })
+            .unwrap_or(false);
+        Ok(hit as i64)
+    })?;
+    conn.create_scalar_function("field", -1, det, |c| {
+        let needle = c.get::<String>(0)?;
+        for i in 1..c.len() {
+            if c.get::<String>(i)? == needle {
+                return Ok(i as i64);
+            }
+        }
+        Ok(0i64)
+    })?;
+    conn.create_scalar_function("least", -1, det, |c| {
+        let mut best: Option<f64> = None;
+        for i in 0..c.len() {
+            let v = c.get::<f64>(i)?;
+            best = Some(best.map_or(v, |b: f64| b.min(v)));
+        }
+        Ok(best.unwrap_or(0.0))
+    })?;
+    conn.create_scalar_function("greatest", -1, det, |c| {
+        let mut best: Option<f64> = None;
+        for i in 0..c.len() {
+            let v = c.get::<f64>(i)?;
+            best = Some(best.map_or(v, |b: f64| b.max(v)));
+        }
+        Ok(best.unwrap_or(0.0))
+    })?;
+    conn.create_scalar_function("ucase", 1, det, |c| {
+        Ok(c.get::<String>(0)?.to_uppercase())
+    })?;
+    conn.create_scalar_function("lcase", 1, det, |c| {
+        Ok(c.get::<String>(0)?.to_lowercase())
+    })?;
+    conn.create_scalar_function("locate", 2, det, |c| {
+        let needle = c.get::<String>(0)?;
+        let hay = c.get::<String>(1)?;
+        Ok(hay.find(&needle).map(|i| i as i64 + 1).unwrap_or(0))
+    })?;
+    conn.create_scalar_function("get_lock", 2, f, |_| Ok(1i64))?;
+    conn.create_scalar_function("release_lock", 1, f, |_| Ok(1i64))?;
+    conn.create_scalar_function("version", 0, f, |_| Ok("8.0.35".to_string()))?;
+    Ok(())
+}
+
 /// Open a database ("": empty → :memory:; ":memory:"; or a file path).
 pub fn open(path: &str) -> Result<i64, String> {
     let conn = if path.is_empty() || path == ":memory:" {
@@ -60,6 +215,7 @@ pub fn open(path: &str) -> Result<i64, String> {
         Connection::open(path)
     }
     .map_err(|e| e.to_string())?;
+    register_mysql_shims(&conn).map_err(|e| e.to_string())?;
     CONNS.with(|c| {
         let id = NEXT_ID.with(|n| {
             let id = *n.borrow();

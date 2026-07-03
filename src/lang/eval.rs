@@ -229,6 +229,19 @@ class PDO {
     const ATTR_ERRMODE = 3; const ERRMODE_SILENT = 0; const ERRMODE_WARNING = 1;
     const ERRMODE_EXCEPTION = 2; const ATTR_DEFAULT_FETCH_MODE = 19;
     const ATTR_DRIVER_NAME = 16; const ATTR_STRINGIFY_FETCHES = 17;
+    const ATTR_TIMEOUT = 2; const ATTR_AUTOCOMMIT = 0; const ATTR_PREFETCH = 1;
+    const ATTR_SERVER_VERSION = 4; const ATTR_CLIENT_VERSION = 5;
+    const ATTR_SERVER_INFO = 6; const ATTR_CONNECTION_STATUS = 7;
+    const ATTR_CASE = 8; const ATTR_CURSOR_NAME = 9; const ATTR_CURSOR = 10;
+    const ATTR_ORACLE_NULLS = 11; const ATTR_PERSISTENT = 12;
+    const ATTR_STATEMENT_CLASS = 13; const ATTR_FETCH_TABLE_NAMES = 14;
+    const ATTR_FETCH_CATALOG_NAMES = 15; const ATTR_MAX_COLUMN_LEN = 18;
+    const ATTR_EMULATE_PREPARES = 20; const CASE_NATURAL = 0;
+    const CASE_LOWER = 2; const CASE_UPPER = 1; const NULL_NATURAL = 0;
+    const FETCH_CLASS = 8; const FETCH_INTO = 9; const FETCH_FUNC = 10;
+    const FETCH_NAMED = 11; const FETCH_GROUP = 65536; const FETCH_UNIQUE = 196608;
+    const FETCH_CLASSTYPE = 262144; const FETCH_SERIALIZE = 524288;
+    const FETCH_PROPS_LATE = 1048576; const FETCH_ORI_NEXT = 0;
     public $__h; public $__fetchmode = 4; public $__attrs = [];
     public function __construct($dsn, $user = null, $pass = null, $options = null) {
         if (strpos($dsn, "sqlite:") !== 0) {
@@ -261,6 +274,11 @@ class PDO {
     public function errorInfo() { return ["00000", null, null]; }
     public function errorCode() { return "00000"; }
     public static function getAvailableDrivers() { return ["sqlite"]; }
+    public function sqliteCreateFunction($name, $callback, $argc = -1) {
+        // the engine pre-registers the MySQL-compat set natively (src/pdo.rs);
+        // PHP-callback UDFs would require evaluator reentrancy - accept and ignore
+        return true;
+    }
 }
 class PDOStatement implements IteratorAggregate {
     public $queryString;
@@ -9027,6 +9045,30 @@ impl Eval {
                 let s = crate::php_date_tz(&fmt, ts, zone.as_deref());
                 Value::Int(s.trim_start_matches('0').parse::<i64>().unwrap_or(0))
             }
+            "compact" => {
+                // inverse of extract(): collect named caller variables
+                let mut out = Arr::new();
+                fn collect(ev: &mut Eval, v: &Value, out: &mut Arr) {
+                    match v {
+                        Value::Array(a) => {
+                            let entries = a.entries.clone();
+                            for (_, item) in &entries {
+                                collect(ev, item, out);
+                            }
+                        }
+                        other => {
+                            let name = String::from_utf8_lossy(&to_bytes(other)).into_owned();
+                            if let Some(val) = ev.vars().get(&name).map(|v| v.deref()) {
+                                out.insert(Key::Str(name.into_bytes()), val);
+                            }
+                        }
+                    }
+                }
+                for v in &args {
+                    collect(self, v, &mut out);
+                }
+                Value::Array(out)
+            }
             "getdate" => {
                 let ts = if !args.is_empty() { to_i64(&a(0)) } else { crate::now_unix() };
                 let zone = self.cur_tz();
@@ -9775,7 +9817,19 @@ impl Eval {
                     }
                 }
             }
-            "putenv" | "set_time_limit" | "ignore_user_abort" | "setlocale" | "extension_loaded" => {
+            "extension_loaded" => {
+                let e = String::from_utf8_lossy(&to_bytes(&a(0))).to_ascii_lowercase();
+                // report what the engine genuinely provides
+                Value::Bool(matches!(
+                    e.as_str(),
+                    "core" | "standard" | "pcre" | "spl" | "date" | "json" | "hash"
+                        | "ctype" | "session" | "dom" | "simplexml" | "xml" | "xmlreader"
+                        | "libxml" | "bcmath" | "pdo" | "pdo_sqlite" | "reflection" | "filter"
+                        | "random" | "tokenizer"
+                ))
+            }
+            "umask" => Value::Int(0o022),
+            "putenv" | "set_time_limit" | "ignore_user_abort" | "setlocale" => {
                 Value::Bool(false)
             }
             "ini_get" | "ini_set" => Value::Bool(false),

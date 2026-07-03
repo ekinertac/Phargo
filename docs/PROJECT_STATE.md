@@ -156,6 +156,14 @@ is feature-priced:
    drifts (109), bool flips (30), int drifts (33). Singles, ~1-3 tests each.
 5. **Perf follow-up**: foreach_016 + phpdbg match grind minutes in the
    live-append/step-limit path.
+**WP oracle status (2026-07-07 night):** bootstrap runs from line 0 through
+version checks, SAPI fixup, the SQLite plugin's full load, PDO connection,
+MySQL-shim SQL functions — then burns 139 s / 20M steps inside real query
+translation. The blocker is now PERFORMANCE, not features: ~144k steps/sec
+on WP code vs ~5M steps/sec on corpus code. Profile the hot path (likely
+char-indexed string loops in the plugin's SQL lexer hitting O(n) string_char,
+or preg on long queries) before adding more surface.
+
 Delegation notes: agents run clean off specs with file scope + literal
 expected outputs + numeric baselines (12 successful tasks so far, zero
 first-try failures). eval.rs is single-writer — never two agents in it.
