@@ -27,6 +27,22 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-06 — XMLReader + all eight rounding modes
+
+**Pass rate: 3583 → 3595.**
+
+A subagent delivered `XMLReader` — the pull-parser API implemented by
+flattening our parsed XML tree into a linear event stream (ELEMENT /
+END_ELEMENT / TEXT / SIGNIFICANT_WHITESPACE / COMMENT with depth and
+attributes), with `read()` as a cursor and `next()` as a subtree skip. The
+orchestrator finished the bcmath surface: the PHP 8.4 `RoundingMode` enum
+with all eight modes genuinely implemented in the decimal core (half-even
+parity via the last kept digit), `bcpowmod` argument validation with PHP's
+exact ValueError wordings, and the `x^0 mod 1 = 0` identity that bug #54598
+exists to check. ext/bcmath 72 → 81.
+
+---
+
 ## 2026-07-05 (night) — BcMath\Number, and trim() was ignoring its charlist
 
 **Pass rate: 3549 → 3583.**

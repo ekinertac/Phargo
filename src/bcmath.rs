@@ -465,6 +465,85 @@ pub fn round(a: &Dec, precision: usize) -> Dec {
     add(a, &nudge).with_scale(precision)
 }
 
+/// PHP 8.4 rounding modes for bcround (RoundingMode enum).
+#[derive(Clone, Copy, PartialEq)]
+pub enum Round {
+    HalfAway,
+    HalfTowards,
+    HalfEven,
+    HalfOdd,
+    Towards,
+    Away,
+    NegInf,
+    PosInf,
+}
+
+/// Round to `precision` decimals under `mode`.
+pub fn round_mode(a: &Dec, precision: usize, mode: Round) -> Dec {
+    use std::cmp::Ordering::*;
+    let t = a.with_scale(precision); // truncation toward zero
+    if a.scale <= precision {
+        return t;
+    }
+    let diff = sub(a, &t);
+    if diff.is_zero() {
+        return t;
+    }
+    let step = Dec { neg: a.neg, digits: vec![1], scale: precision };
+    let half = Dec { neg: false, digits: vec![5], scale: precision + 1 };
+    let mag = Dec { neg: false, ..diff.clone() };
+    let against_half = cmp(&mag, &half);
+    let bump = add(&t, &step);
+    match mode {
+        Round::Towards => t,
+        Round::Away => bump,
+        Round::NegInf => {
+            if a.neg {
+                bump
+            } else {
+                t
+            }
+        }
+        Round::PosInf => {
+            if a.neg {
+                t
+            } else {
+                bump
+            }
+        }
+        Round::HalfAway => {
+            if against_half == Less {
+                t
+            } else {
+                bump
+            }
+        }
+        Round::HalfTowards => {
+            if against_half == Greater {
+                bump
+            } else {
+                t
+            }
+        }
+        Round::HalfEven | Round::HalfOdd => match against_half {
+            Less => t,
+            Greater => bump,
+            Equal => {
+                // parity of the last kept decimal digit
+                let scaled = t.with_scale(precision);
+                let last = scaled.digits.first().copied().unwrap_or(0);
+                let even = last % 2 == 0;
+                let keep = (mode == Round::HalfEven) == even;
+                if keep {
+                    t
+                } else {
+                    bump
+                }
+            }
+        },
+    }
+}
+
 /// (base^exp) mod m over integers — modular exponentiation with reduction at
 /// each step so intermediate values stay bounded.
 pub fn powmod(base: &Dec, exp: &Dec, m: &Dec) -> Option<Dec> {
@@ -472,10 +551,13 @@ pub fn powmod(base: &Dec, exp: &Dec, m: &Dec) -> Option<Dec> {
         return None;
     }
     let (b0, e0, m0) = (base.with_scale(0), exp.with_scale(0), m.with_scale(0));
+    // fractional operands and negative exponents are caller-validated;
+    // belt-and-braces here
     if e0.neg {
         return None;
     }
-    let mut result = Dec::parse("1").unwrap();
+    // 1 mod m up front: x^0 mod 1 must be 0, not 1
+    let mut result = modulo(&Dec::parse("1").unwrap(), &m0, 0)?;
     let mut b = modulo(&b0, &m0, 0)?;
     // walk exponent bits by repeated halving
     let mut e = e0;

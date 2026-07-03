@@ -217,6 +217,16 @@ class UnderflowException extends RuntimeException {}
 class OverflowException extends RuntimeException {}
 class JsonException extends Exception {}
 
+enum RoundingMode {
+    case HalfAwayFromZero;
+    case HalfTowardsZero;
+    case HalfEven;
+    case HalfOdd;
+    case TowardsZero;
+    case AwayFromZero;
+    case NegativeInfinity;
+    case PositiveInfinity;
+}
 namespace BcMath {
     class Number {
         public $value;
@@ -1279,6 +1289,191 @@ class HTMLDocument extends DOMDocument {
     public static function createFromString($source, $options = 0, $overrideEncoding = null) { $d = new HTMLDocument(); $d->loadXML($source); return $d; }
     public static function createFromFile($path, $options = 0, $overrideEncoding = null) { $d = new HTMLDocument(); $d->load($path); return $d; }
     public static function createEmpty($encoding = "UTF-8") { $d = new HTMLDocument(); $d->encoding = $encoding; return $d; }
+}
+
+// ---- XMLReader (a pull parser built by flattening the __dom_parse tree) ----
+// PHP's XMLReader walks the document depth-first, emitting one event per
+// read() call. Rather than re-implement streaming parsing, we parse the whole
+// document up front with __dom_parse (same parser DOMDocument uses) and
+// flatten it into a linear list of events once; read()/next() then just walk
+// a cursor over that list. This is not a *true* streaming reader (no huge-file
+// support) but matches observable behavior for the corpus's small fixtures.
+class XMLReader {
+    const NONE = 0;
+    const ELEMENT = 1;
+    const ATTRIBUTE = 2;
+    const TEXT = 3;
+    const CDATA = 4;
+    const ENTITY_REF = 5;
+    const ENTITY = 6;
+    const PI = 7;
+    const COMMENT = 8;
+    const DOC = 9;
+    const DOC_TYPE = 10;
+    const DOC_FRAGMENT = 11;
+    const NOTATION = 12;
+    const WHITESPACE = 13;
+    const SIGNIFICANT_WHITESPACE = 14;
+    const END_ELEMENT = 15;
+    const END_ENTITY = 16;
+    const XML_DECLARATION = 17;
+    const LOADDTD = 1;
+    const DEFAULTATTRS = 2;
+    const VALIDATE = 3;
+    const SUBST_ENTITIES = 4;
+
+    public $nodeType = 0;
+    public $name = "";
+    public $value = "";
+    public $depth = 0;
+    public $isEmptyElement = false;
+    public $hasValue = false;
+    public $hasAttributes = false;
+    public $attributeCount = 0;
+    public $localName = "";
+
+    private $__events = [];
+    private $__pos = -1;
+
+    // Turn one __dom_parse node into 1-2 linear events (ELEMENT [+ END_ELEMENT
+    // once its children are flattened]), recursing depth-first so the event
+    // list order matches the order read() must emit.
+    private function __flatten($n, $depth) {
+        if ($n["t"] == 1) {
+            $empty = empty($n["kids"]);
+            $this->__events[] = ["type" => 1, "name" => $n["name"], "value" => "", "depth" => $depth, "empty" => $empty, "attrs" => $n["attrs"]];
+            if (!$empty) {
+                foreach ($n["kids"] as $k) { $this->__flatten($k, $depth + 1); }
+                $this->__events[] = ["type" => 15, "name" => $n["name"], "value" => "", "depth" => $depth, "empty" => false, "attrs" => []];
+            }
+        } elseif ($n["t"] == 4) {
+            $this->__events[] = ["type" => 4, "name" => "#cdata-section", "value" => $n["text"], "depth" => $depth, "empty" => false, "attrs" => []];
+        } elseif ($n["t"] == 8) {
+            $this->__events[] = ["type" => 8, "name" => "#comment", "value" => $n["text"], "depth" => $depth, "empty" => false, "attrs" => []];
+        } else {
+            $txt = $n["text"];
+            $isWs = trim($txt) === "";
+            $this->__events[] = ["type" => $isWs ? 14 : 3, "name" => "#text", "value" => $txt, "depth" => $depth, "empty" => false, "attrs" => []];
+        }
+    }
+
+    private function __reset() {
+        $this->nodeType = 0; $this->name = ""; $this->value = ""; $this->depth = 0;
+        $this->isEmptyElement = false; $this->hasValue = false; $this->hasAttributes = false;
+        $this->attributeCount = 0; $this->localName = "";
+    }
+
+    private function __load($xml) {
+        $t = __dom_parse($xml);
+        if ($t === false) { return false; }
+        $this->__events = [];
+        $this->__flatten($t, 0);
+        $this->__pos = -1;
+        $this->__reset();
+        return true;
+    }
+
+    // Real XMLReader::open()/XML() are declared `static` but PHP still allows
+    // calling them on an instance (`$r->open(...)`), which is the only form the
+    // corpus actually uses. We implement them as instance methods and detect
+    // the (deprecated) static-call form via `isset($this)`.
+    public function open($uri, $encoding = null, $flags = 0) {
+        if (!isset($this)) {
+            $r = new XMLReader();
+            if (!$r->open($uri, $encoding, $flags)) { return false; }
+            return $r;
+        }
+        $xml = file_get_contents($uri);
+        if ($xml === false) { return false; }
+        return $this->__load($xml);
+    }
+
+    public function XML($source, $encoding = null, $flags = 0) {
+        if (!isset($this)) {
+            $r = new XMLReader();
+            if (!$r->XML($source, $encoding, $flags)) { return false; }
+            return $r;
+        }
+        return $this->__load($source);
+    }
+
+    public function read() {
+        $this->__pos = $this->__pos + 1;
+        if ($this->__pos >= count($this->__events)) {
+            $this->__reset();
+            return false;
+        }
+        $e = $this->__events[$this->__pos];
+        $this->nodeType = $e["type"];
+        $this->name = $e["name"];
+        $this->localName = $e["name"];
+        $this->value = $e["value"];
+        $this->depth = $e["depth"];
+        $this->isEmptyElement = $e["empty"];
+        $this->hasValue = $e["value"] !== "";
+        $this->hasAttributes = count($e["attrs"]) > 0;
+        $this->attributeCount = count($e["attrs"]);
+        return true;
+    }
+
+    public function getAttribute($name) {
+        if ($this->__pos < 0 || $this->__pos >= count($this->__events)) { return null; }
+        $e = $this->__events[$this->__pos];
+        if ($e["type"] != 1) { return null; }
+        return $e["attrs"][$name] ?? null;
+    }
+
+    public function moveToNextAttribute() { return false; }
+    public function moveToElement() { return false; }
+
+    // Skip the rest of the current node's subtree (all events at a deeper
+    // depth, plus its own END_ELEMENT), then read() forward - optionally
+    // filtering to the next ELEMENT with a matching name, like real XMLReader.
+    public function next($name = null) {
+        if ($this->__pos < 0 || $this->__pos >= count($this->__events)) { return false; }
+        $curDepth = $this->__events[$this->__pos]["depth"];
+        $p = $this->__pos + 1;
+        $n = count($this->__events);
+        while ($p < $n && $this->__events[$p]["depth"] > $curDepth) { $p++; }
+        if ($p < $n && $this->__events[$p]["depth"] == $curDepth && $this->__events[$p]["type"] == 15) { $p++; }
+        $this->__pos = $p - 1;
+        while (true) {
+            if (!$this->read()) { return false; }
+            if ($name === null) { return true; }
+            if ($this->nodeType == 1 && $this->name === $name) { return true; }
+        }
+    }
+
+    public function close() {
+        $this->__events = [];
+        $this->__pos = -1;
+        $this->__reset();
+        return true;
+    }
+
+    public function readOuterXml() { return ""; }
+    public function readInnerXml() { return ""; }
+
+    public function readString() {
+        if ($this->__pos < 0 || $this->__pos >= count($this->__events)) { return ""; }
+        $e = $this->__events[$this->__pos];
+        if ($e["type"] == 3 || $e["type"] == 4 || $e["type"] == 14) { return $e["value"]; }
+        if ($e["type"] != 1) { return ""; }
+        $curDepth = $e["depth"];
+        $s = "";
+        $p = $this->__pos + 1;
+        $n = count($this->__events);
+        while ($p < $n && $this->__events[$p]["depth"] > $curDepth) {
+            $t = $this->__events[$p]["type"];
+            if ($t == 3 || $t == 4 || $t == 14) { $s .= $this->__events[$p]["value"]; }
+            $p++;
+        }
+        return $s;
+    }
+
+    public function setParserProperty($property, $value) { return true; }
+    public function getParserProperty($property) { return false; }
+    public function isValid() { return true; }
 }
 
 // ---- SimpleXML (built on the same __dom_parse tree) ----
@@ -6149,7 +6344,23 @@ impl Eval {
                     ));
                 };
                 let prec = if args.len() > 1 { to_i64(&a(1)).max(0) as usize } else { 0 };
-                let r = crate::bc::round(&x, prec.min(100_000));
+                let mode = match &a(2) {
+                    Value::Object(rc) => {
+                        let n = rc.borrow().get("name").map(to_bytes).unwrap_or_default();
+                        match n.as_slice() {
+                            b"HalfTowardsZero" => crate::bc::Round::HalfTowards,
+                            b"HalfEven" => crate::bc::Round::HalfEven,
+                            b"HalfOdd" => crate::bc::Round::HalfOdd,
+                            b"TowardsZero" => crate::bc::Round::Towards,
+                            b"AwayFromZero" => crate::bc::Round::Away,
+                            b"NegativeInfinity" => crate::bc::Round::NegInf,
+                            b"PositiveInfinity" => crate::bc::Round::PosInf,
+                            _ => crate::bc::Round::HalfAway,
+                        }
+                    }
+                    _ => crate::bc::Round::HalfAway,
+                };
+                let r = crate::bc::round_mode(&x, prec.min(100_000), mode);
                 Value::Str(r.to_string_scaled(prec.min(100_000)).into_bytes())
             }
             "bcpowmod" => {
@@ -6160,8 +6371,37 @@ impl Eval {
                         "bcpowmod(): argument is not well-formed",
                     ));
                 };
+                // PHP validates integrality and exponent sign with specific wording
+                let frac = |d: &crate::bc::Dec| {
+                    crate::bc::cmp(d, &d.with_scale(0)) != std::cmp::Ordering::Equal
+                };
+                if frac(&b) {
+                    return Err(self.throw_error(
+                        "ValueError",
+                        "bcpowmod(): Argument #1 ($num) cannot have a fractional part",
+                    ));
+                }
+                if frac(&e) {
+                    return Err(self.throw_error(
+                        "ValueError",
+                        "bcpowmod(): Argument #2 ($exponent) cannot have a fractional part",
+                    ));
+                }
+                if e.neg && !e.is_zero() {
+                    return Err(self.throw_error(
+                        "ValueError",
+                        "bcpowmod(): Argument #2 ($exponent) must be greater than or equal to 0",
+                    ));
+                }
+                if frac(&m) {
+                    return Err(self.throw_error(
+                        "ValueError",
+                        "bcpowmod(): Argument #3 ($modulus) cannot have a fractional part",
+                    ));
+                }
+                let scale = if args.len() > 3 { to_i64(&a(3)).max(0) as usize } else { self.bc_scale };
                 match crate::bc::powmod(&b, &e, &m) {
-                    Some(r) => Value::Str(r.to_string_scaled(0).into_bytes()),
+                    Some(r) => Value::Str(r.to_string_scaled(scale.min(100_000)).into_bytes()),
                     None => {
                         return Err(self.throw_error("DivisionByZeroError", "Modulo by zero"))
                     }
