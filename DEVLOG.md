@@ -27,6 +27,28 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-07 (later) — The second oracle flies: WordPress meets Phargo
+
+**Pass rate: 3630 → 3633. WP bootstrap: line 0 → past the version gate.**
+
+Phase 0 of the roadmap landed: `scripts/fetch-wp.sh` vendors WordPress 6.7.1
+and `examples/wpscan.rs` runs its real bootstrap chain under the engine with
+a synthesized wp-config and a CLI SAPI fixture. First-ever reading: death at
+`wp-settings.php:158` on `version_compare()` — a function no analysis had
+ever ranked, found by the oracle in 23 ms. Implemented it with PHP's full
+canonicalization and special-form ordering (dev < alpha < beta < rc < numbers
+< pl), 12/12 on the semantics probes — including the `5.2 vs 5.12` numeric
+trap that lexicographic comparison gets wrong.
+
+Second reading: WP now dies trying to *render its own* "MySQL extension
+missing" page — which surfaced another parser hole on the way (inline HTML
+inside braced blocks: `if (x) { ?>html<?php }` — legal PHP, previously a
+parse error). The blocker chain now leads where the roadmap predicted:
+the database decision, via WordPress's own `wp-content/db.php` drop-in
+mechanism — the same hatch Playground's SQLite integration uses.
+
+---
+
 ## 2026-07-07 — Small-bore: asXML declarations, method visibility, honest rulers
 
 **Pass rate: 3629 → 3630.**

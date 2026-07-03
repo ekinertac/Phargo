@@ -153,11 +153,33 @@ impl Parser {
     }
 
     /// Parse statements until a closing `}` (consumed) — a `{ … }` block body.
+    /// Inline HTML is legal inside blocks: `if (x) { ?>html<?php }`.
     fn block(&mut self) -> R<Vec<Stmt>> {
         self.expect(&Kind::LBrace)?;
         let mut out = Vec::new();
-        while !matches!(self.kind(), Kind::RBrace | Kind::Eof) {
-            out.push(self.statement()?);
+        loop {
+            match self.kind() {
+                Kind::RBrace | Kind::Eof => break,
+                Kind::InlineHtml(_) => {
+                    if let Kind::InlineHtml(b) = self.bump() {
+                        out.push(Stmt::InlineHtml(b));
+                    }
+                }
+                Kind::OpenTag | Kind::CloseTag => {
+                    self.bump();
+                }
+                Kind::OpenEcho => {
+                    self.bump();
+                    let e = self.expr()?;
+                    let mut items = vec![e];
+                    while self.eat(&Kind::Comma) {
+                        items.push(self.expr()?);
+                    }
+                    self.semi()?;
+                    out.push(Stmt::Echo(items));
+                }
+                _ => out.push(self.statement()?),
+            }
         }
         self.expect(&Kind::RBrace)?;
         Ok(out)

@@ -6548,6 +6548,111 @@ impl Eval {
                     }
                 }
             }
+            "version_compare" => {
+                // PHP semantics: canonicalize (insert dots at digit/alpha
+                // boundaries, -_+ become dots), then compare parts by special
+                // class (dev < alpha/a < beta/b < RC/rc < numbers < pl/p),
+                // numeric parts numerically. Missing parts rank below numbers.
+                fn canon(v: &str) -> Vec<String> {
+                    let mut out: Vec<String> = Vec::new();
+                    let mut cur = String::new();
+                    let mut prev: Option<char> = None;
+                    for ch in v.chars() {
+                        let boundary = match (prev, ch) {
+                            (_, '.') | (_, '-') | (_, '_') | (_, '+') => true,
+                            (Some(p), c) => {
+                                (p.is_ascii_digit() && !c.is_ascii_digit())
+                                    || (!p.is_ascii_digit() && c.is_ascii_digit())
+                            }
+                            (None, _) => false,
+                        };
+                        if boundary {
+                            if !cur.is_empty() {
+                                out.push(std::mem::take(&mut cur));
+                            }
+                        }
+                        if !matches!(ch, '.' | '-' | '_' | '+') {
+                            cur.push(ch);
+                            prev = Some(ch);
+                        } else {
+                            prev = None;
+                        }
+                    }
+                    if !cur.is_empty() {
+                        out.push(cur);
+                    }
+                    out
+                }
+                // (class, numeric value, text): unknown(0) < dev(1) < alpha(2)
+                // < beta(3) < rc(4) < numbers(5) < pl(6); missing part = (5,-1)
+                fn form(part: Option<&String>) -> (i32, i64, String) {
+                    match part {
+                        None => (5, -1, String::new()),
+                        Some(p) => {
+                            if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) {
+                                (5, p.parse::<i64>().unwrap_or(i64::MAX), p.clone())
+                            } else {
+                                let c = match p.to_ascii_lowercase().as_str() {
+                                    "dev" => 1,
+                                    "alpha" | "a" => 2,
+                                    "beta" | "b" => 3,
+                                    "rc" => 4,
+                                    "pl" | "p" => 6,
+                                    _ => 0,
+                                };
+                                (c, 0, p.clone())
+                            }
+                        }
+                    }
+                }
+                let v1 = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let v2 = String::from_utf8_lossy(&to_bytes(&a(1))).into_owned();
+                let (p1, p2) = (canon(&v1), canon(&v2));
+                let n = p1.len().max(p2.len());
+                let mut result = 0i64;
+                for i in 0..n {
+                    let (c1, n1, s1) = form(p1.get(i));
+                    let (c2, n2, s2) = form(p2.get(i));
+                    let ord = if c1 != c2 {
+                        c1.cmp(&c2)
+                    } else if c1 == 5 {
+                        n1.cmp(&n2)
+                    } else {
+                        s1.to_ascii_lowercase().cmp(&s2.to_ascii_lowercase())
+                    };
+                    match ord {
+                        std::cmp::Ordering::Less => {
+                            result = -1;
+                            break;
+                        }
+                        std::cmp::Ordering::Greater => {
+                            result = 1;
+                            break;
+                        }
+                        std::cmp::Ordering::Equal => {}
+                    }
+                }
+                if args.len() > 2 {
+                    let op = String::from_utf8_lossy(&to_bytes(&a(2))).into_owned();
+                    let b = match op.as_str() {
+                        "<" | "lt" => result < 0,
+                        "<=" | "le" => result <= 0,
+                        ">" | "gt" => result > 0,
+                        ">=" | "ge" => result >= 0,
+                        "==" | "eq" => result == 0,
+                        "!=" | "ne" | "<>" => result != 0,
+                        _ => {
+                            return Err(self.throw_error(
+                                "ValueError",
+                                "version_compare(): Argument #3 ($operator) must be a valid comparison operator",
+                            ))
+                        }
+                    };
+                    Value::Bool(b)
+                } else {
+                    Value::Int(result)
+                }
+            }
             "bcfloor" | "bcceil" => {
                 let Some(x) = crate::bc::Dec::parse(&String::from_utf8_lossy(&to_bytes(&a(0)))) else {
                     return Err(self.throw_error(
