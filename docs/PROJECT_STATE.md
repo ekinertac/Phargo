@@ -102,8 +102,9 @@ the shipping number on the same suite. Then deleted the legacy engine (`lib.rs`
 
 ## Current state (2026-07-04, end of session)
 
-- **3430 / 21970 gradeable (15.6%).** Thirteen batches on 07-02→04: 3007 → 3430
-  (+423). Line numbers are real now (per-token line table → Stmt::Marked →
+- **3436 / 21970 gradeable (15.6%).** Fourteen batches on 07-02→04: 3007 → 3436
+  (+429). Stack traces are PHP-exact now (frame stack at all call shapes,
+  snapshot at exception construction, prelude frames filtered). Line numbers are real now (per-token line table → Stmt::Marked →
   cur_line; exceptions capture file+line at construction; __LINE__ works). Batches 8–12 were the error-semantics vein: parameter/return type
   enforcement (weak + strict_types), typed + readonly properties, arithmetic
   TypeErrors/DivisionByZeroError, and **runtime warnings** (undefined
@@ -137,10 +138,12 @@ the shipping number on the same suite. Then deleted the legacy engine (`lib.rs`
 
 ## Next targets (by leverage, achievable only)
 
-1. **Stack-trace frames** — fatals/getTraceAsString print `#0 {main}` only;
-   PHP prints `#0 /file.php(12): funcname()` per frame. We have cur_fn/cur_line
-   stacks — capture (file,line,fn) per call frame at throw time. This is what
-   blocks most remaining plain-EXPECT fatal tests (measured in batch 13).
+1. **Fatal-message wording sweep** — with file/line/trace exact, remaining
+   fatal tests fail on message TEXT. Build an analyzer diffing expected vs
+   actual fatal lines corpus-wide, fix the top wordings (e.g. "Call to
+   undefined function x()" — we say "unknown function"), batch them.
+   Note: engine errors like RunError("unknown function") should become real
+   Error throws with PHP wording.
 2. **Tokenizer ext** (`token_get_all`/`PhpToken`, ~55 tests) — raw
    whitespace-preserving scan + PHP's numeric token-ID table. A full session,
    mechanical once designed.
