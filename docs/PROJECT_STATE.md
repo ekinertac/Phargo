@@ -102,9 +102,13 @@ the shipping number on the same suite. Then deleted the legacy engine (`lib.rs`
 
 ## Current state (2026-07-04, end of session)
 
-- **3436 / 21970 gradeable (15.6%).** Fourteen batches on 07-02→04: 3007 → 3436
-  (+429). Stack traces are PHP-exact now (frame stack at all call shapes,
-  snapshot at exception construction, prelude frames filtered). Line numbers are real now (per-token line table → Stmt::Marked →
+- **3583 / 21970 gradeable (16.3%).** Nineteen batches through 07-05: 3007 → 3583
+  (+576). Since batch 14: engine aborts → catchable PHP Errors (b15),
+  namespaces v1 with FQ registration + use imports + global fallback (b16),
+  error handlers invoked + trigger_error (b17), from-scratch bcmath in
+  src/bcmath.rs + ~70 constants + analyzer reads new fatal format (b18),
+  BcMath\Number w/ operator overloading + trim charlists — trim had ignored
+  charlists forever, fifth hollow builtin found (b19). Line numbers are real now (per-token line table → Stmt::Marked →
   cur_line; exceptions capture file+line at construction; __LINE__ works). Batches 8–12 were the error-semantics vein: parameter/return type
   enforcement (weak + strict_types), typed + readonly properties, arithmetic
   TypeErrors/DivisionByZeroError, and **runtime warnings** (undefined
@@ -138,12 +142,12 @@ the shipping number on the same suite. Then deleted the legacy engine (`lib.rs`
 
 ## Next targets (by leverage, achievable only)
 
-1. **Fatal-message wording sweep** — with file/line/trace exact, remaining
-   fatal tests fail on message TEXT. Build an analyzer diffing expected vs
-   actual fatal lines corpus-wide, fix the top wordings (e.g. "Call to
-   undefined function x()" — we say "unknown function"), batch them.
-   Note: engine errors like RunError("unknown function") should become real
-   Error throws with PHP wording.
+1. **XMLReader** (30 tests) — pull API over the existing XML tree (agent-able).
+2. **DOMDocument::loadHTML/saveHTML** (23+) — lenient HTML pre-pass over the
+   strict XML parser + HTML serializer.
+3. **bcmath residuals** (100 EXPECT fails) — error wordings, edge semantics.
+4. **Perf follow-up**: foreach_016 + phpdbg match tests grind minutes in the
+   live-append/step-limit path — profile before they multiply.
 2. **Tokenizer ext** (`token_get_all`/`PhpToken`, ~55 tests) — raw
    whitespace-preserving scan + PHP's numeric token-ID table. A full session,
    mechanical once designed.
