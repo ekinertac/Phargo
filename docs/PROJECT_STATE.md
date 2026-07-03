@@ -102,7 +102,7 @@ the shipping number on the same suite. Then deleted the legacy engine (`lib.rs`
 
 ## Current state (2026-07-04, end of session)
 
-- **3583 / 21970 gradeable (16.3%).** Nineteen batches through 07-05: 3007 → 3583
+- **3630 / 21970 gradeable (16.5%).** Twenty-three batches through 07-07: 3007 → 3630
   (+576). Since batch 14: engine aborts → catchable PHP Errors (b15),
   namespaces v1 with FQ registration + use imports + global fallback (b16),
   error handlers invoked + trigger_error (b17), from-scratch bcmath in
@@ -142,12 +142,22 @@ the shipping number on the same suite. Then deleted the legacy engine (`lib.rs`
 
 ## Next targets (by leverage, achievable only)
 
-1. **XMLReader** (30 tests) — pull API over the existing XML tree (agent-able).
-2. **DOMDocument::loadHTML/saveHTML** (23+) — lenient HTML pre-pass over the
-   strict XML parser + HTML serializer.
-3. **bcmath residuals** (100 EXPECT fails) — error wordings, edge semantics.
-4. **Perf follow-up**: foreach_016 + phpdbg match tests grind minutes in the
-   live-append/step-limit path — profile before they multiply.
+The easy veins are mined out (b20-23 delivered +12/+9/+25/+1). What's left
+is feature-priced:
+1. **Tokenizer ext** (~55) — raw whitespace-preserving scan + PHP numeric
+   token-id table. Mechanical once designed; a full session.
+2. **ReflectionClass lazy objects** (~55, PHP 8.4) — needs
+   initialize-on-access hooks in the property model. Design-heavy.
+3. **Uri\WhatWg\Url / Uri\Rfc3986** (~200 mentions) — previously marked
+   avoid (IDN/punycode + exact var_dump); a subset might pay now that
+   namespaces/exceptions/var_dump synthesis exist. Scope carefully first.
+4. **MISMATCH_OTHER grind** — `suiteanalyze -- other` histogram: array-count
+   drifts (109), bool flips (30), int drifts (33). Singles, ~1-3 tests each.
+5. **Perf follow-up**: foreach_016 + phpdbg match grind minutes in the
+   live-append/step-limit path.
+Delegation notes: agents run clean off specs with file scope + literal
+expected outputs + numeric baselines (12 successful tasks so far, zero
+first-try failures). eval.rs is single-writer — never two agents in it.
 2. **Tokenizer ext** (`token_get_all`/`PhpToken`, ~55 tests) — raw
    whitespace-preserving scan + PHP's numeric token-ID table. A full session,
    mechanical once designed.
