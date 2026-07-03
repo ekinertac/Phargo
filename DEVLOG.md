@@ -27,6 +27,25 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-05 (night) — Howdy, admin.
+
+**The wp-admin Dashboard renders: 70 KB, `<title>Dashboard ‹ Phargo Test
+Site — WordPress</title>`, admin bar, widgets, zero warnings.** Auth is
+real: the probe forges cookies with `wp_generate_auth_cookie()` — which
+works because hash_hmac/sha256 are the real algorithms — and
+`wp_validate_auth_cookie()` accepts them. Four faces of WordPress now
+render end-to-end: front page, single post, login, dashboard.
+
+Two engine fixes en route:
+- `get_loaded_extensions()` (Site Health calls it) — mirrors the
+  extension_loaded honesty list.
+- **`$a && $b = f()` parsed as `($a && $b) = f()`** — PHP's grammar treats
+  `variable = expr` as its own production, so an assignment to an lvalue
+  wins even as a tighter operator's operand. The dashboard's comments
+  widget does `while (count($x) < $n && $possible = get_comments(...))`.
+  Fixing the Pratt-parser guard also bought +5 corpus tests — php-src
+  exercises the same pattern.
+
 ## 2026-07-05 (later still) — Three pages.
 
 **The single-post view (`?p=1`, 38 KB, comments section and all) and the

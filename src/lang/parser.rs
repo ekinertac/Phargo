@@ -1156,9 +1156,22 @@ impl Parser {
                 lhs = Expr::Ternary(Box::new(lhs), mid, Box::new(els));
                 continue;
             }
-            // assignment (right-assoc, bp 10)
+            // assignment (right-assoc, bp 10). PHP's grammar treats
+            // `variable = expr` as its own production, so an assignment to an
+            // lvalue is consumed even as a tighter operator's operand:
+            // `$a && $b = f()` parses as `$a && ($b = f())`.
             if let Some(op) = self.assign_op() {
-                if 10 < min_bp {
+                let lvalue = matches!(
+                    lhs,
+                    Expr::Var(_)
+                        | Expr::VarVar(_)
+                        | Expr::Index(..)
+                        | Expr::Prop(..)
+                        | Expr::StaticProp(..)
+                        | Expr::List(_)
+                        | Expr::Array(_)
+                );
+                if 10 < min_bp && !lvalue {
                     break;
                 }
                 self.bump();

@@ -10792,6 +10792,18 @@ impl Eval {
                         | "random" | "tokenizer"
                 ))
             }
+            "get_loaded_extensions" => {
+                // mirrors extension_loaded's honesty list
+                let mut arr = Arr::new();
+                for e in [
+                    "Core", "standard", "pcre", "SPL", "date", "json", "hash", "ctype",
+                    "session", "dom", "SimpleXML", "xml", "xmlreader", "libxml", "bcmath",
+                    "PDO", "pdo_sqlite", "Reflection", "filter", "random", "tokenizer",
+                ] {
+                    arr.push(Value::Str(e.as_bytes().to_vec()));
+                }
+                Value::Array(arr)
+            }
             "umask" => Value::Int(0o022),
             "putenv" | "set_time_limit" | "ignore_user_abort" | "setlocale" => {
                 Value::Bool(false)
@@ -11136,7 +11148,7 @@ static KNOWN_BUILTINS: &[&str] = &[
         "func_get_args", "func_num_args", "function_exists", "fwrite", "gc_collect_cycles",
         "gc_disable", "gc_enable", "gc_enabled", "get_called_class", "get_class",
         "get_class_methods", "get_class_vars", "get_declared_classes",
-        "get_declared_interfaces", "get_declared_traits", "get_object_vars",
+        "get_declared_interfaces", "get_declared_traits", "get_loaded_extensions", "get_object_vars",
         "get_parent_class", "get_resource_id", "get_resource_type", "getcwd", "getdate",
         "getenv", "getimagesize", "getmypid", "getrandmax", "gettype", "glob", "gmdate", "gmmktime",
         "gmstrftime", "hash", "hash_algos", "hash_equals", "hash_hmac", "hash_hmac_algos", "header", "headers_sent", "hex2bin", "hexdec", "highlight_file",
