@@ -200,6 +200,10 @@ pub enum Stmt {
     Expr(Expr),
     Block(Vec<Stmt>),
     Nop,
+    // goto: the jump propagates up as a control error until a statement list
+    // containing the target label catches it (see Eval::exec_block)
+    Goto(String),
+    Label(String),
 
     If {
         cond: Expr,

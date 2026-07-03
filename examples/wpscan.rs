@@ -74,6 +74,7 @@ $_SERVER['REQUEST_METHOD'] = 'GET';
 $_SERVER['SERVER_PROTOCOL'] = 'HTTP/1.1';
 $_SERVER['SERVER_NAME'] = 'localhost';
 $_SERVER['SCRIPT_NAME'] = '/index.php';
+$_SERVER['SCRIPT_FILENAME'] = '{wp}/index.php';
 $_SERVER['PHP_SELF'] = '/index.php';
 $_SERVER['DOCUMENT_ROOT'] = '{wp}';
 $_SERVER['REMOTE_ADDR'] = '127.0.0.1';
@@ -98,8 +99,14 @@ echo "\n=== WP BOOTSTRAP COMPLETED ===\n";
             if let Some(i) = out.find("Fatal error") {
                 let line: String = out[i..].lines().next().unwrap_or("").to_string();
                 println!("BLOCKER: {line}");
+            } else if out.is_empty() {
+                println!(
+                    "no output, no fatal: WP exited cleanly — with an empty DB this \
+                     is the wp_not_installed() redirect to the installer (bootstrap \
+                     chain itself completed; verify with define('WP_INSTALLING', true))"
+                );
             }
-            let tail: String = out.chars().rev().take(1200).collect::<String>().chars().rev().collect();
+            let tail: String = out.chars().rev().take(4000).collect::<String>().chars().rev().collect();
             println!("--- output tail ---\n{tail}");
         }
         Ok(Err(e)) => {

@@ -374,7 +374,25 @@ impl Parser {
                     self.semi()?;
                     return Ok(Stmt::Declare { strict_types });
                 }
+                "goto" if matches!(self.at(1), Kind::Ident(_)) => {
+                    self.bump();
+                    if let Kind::Ident(l) = self.kind().clone() {
+                        self.bump();
+                        self.semi()?;
+                        return Ok(Stmt::Goto(l));
+                    }
+                }
                 _ => {}
+            }
+        }
+        // `label:` — a goto target. Statement position only; case/default and
+        // alternative-syntax keywords are consumed by their own parsers and
+        // never reach here.
+        if matches!(self.kind(), Kind::Ident(_)) && matches!(self.at(1), Kind::Colon) {
+            if let Kind::Ident(l) = self.kind().clone() {
+                self.bump();
+                self.bump();
+                return Ok(Stmt::Label(l));
             }
         }
         // block
@@ -560,7 +578,18 @@ impl Parser {
             && !self.at_kw("endswitch")
             && !matches!(self.kind(), Kind::RBrace | Kind::Eof)
         {
-            out.push(self.statement()?);
+            // embedded close/open tags + inline HTML (template-style switch)
+            match self.kind() {
+                Kind::InlineHtml(_) => {
+                    if let Kind::InlineHtml(b) = self.bump() {
+                        out.push(Stmt::InlineHtml(b));
+                    }
+                }
+                Kind::OpenTag | Kind::CloseTag => {
+                    self.bump();
+                }
+                _ => out.push(self.statement()?),
+            }
         }
         Ok(out)
     }
@@ -1484,7 +1513,14 @@ impl Parser {
     fn name_expr(&mut self, name: Name) -> R<Expr> {
         if !name.fully_qualified && name.parts.len() == 1 {
             let u = name.parts[0].to_ascii_uppercase();
-            if u.starts_with("__") && u.ends_with("__") {
+            // Only PHP's actual magic constants — a prefix test also swallows
+            // ordinary names like WP's `__()` translation function ("__" both
+            // starts and ends with "__").
+            if matches!(
+                u.as_str(),
+                "__LINE__" | "__FILE__" | "__DIR__" | "__FUNCTION__" | "__CLASS__"
+                    | "__TRAIT__" | "__METHOD__" | "__NAMESPACE__" | "__COMPILER_HALT_OFFSET__"
+            ) {
                 return Ok(Expr::MagicConst(name.parts[0].clone()));
             }
         }

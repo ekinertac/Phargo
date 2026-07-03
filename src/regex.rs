@@ -369,7 +369,7 @@ impl ReParser {
                             continue;
                         }
                         _ => {
-                            let lo = class_escape_char(e);
+                            let lo = self.class_escape_full(e);
                             // possible range with escaped lo
                             if self.peek() == Some('-')
                                 && self.at(1).is_some()
@@ -405,7 +405,7 @@ impl ReParser {
                 self.i += 1;
                 let e = self.peek().unwrap_or('\\');
                 self.i += 1;
-                class_escape_char(e)
+                self.class_escape_full(e)
             }
             Some(ch) => {
                 self.i += 1;
@@ -413,6 +413,40 @@ impl ReParser {
             }
             None => '\0',
         }
+    }
+
+    /// Escape resolution inside a character class, including multi-char forms
+    /// (`\xHH`, `\x{HHHH}`) that consume extra pattern characters — the plain
+    /// `class_escape_char` table can't express those (WP's shortcode-name
+    /// validator uses `[\x00-\x20]`).
+    fn class_escape_full(&mut self, e: char) -> char {
+        if e == 'x' {
+            if self.peek() == Some('{') {
+                self.i += 1;
+                let mut hex = String::new();
+                while let Some(c) = self.peek() {
+                    self.i += 1;
+                    if c == '}' {
+                        break;
+                    }
+                    hex.push(c);
+                }
+                return char::from_u32(u32::from_str_radix(&hex, 16).unwrap_or(0))
+                    .unwrap_or('\0');
+            }
+            let mut hex = String::new();
+            while hex.len() < 2 {
+                match self.peek() {
+                    Some(c) if c.is_ascii_hexdigit() => {
+                        hex.push(c);
+                        self.i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            return char::from_u32(u32::from_str_radix(&hex, 16).unwrap_or(0)).unwrap_or('\0');
+        }
+        class_escape_char(e)
     }
 
     fn escape(&mut self) -> Option<Re> {

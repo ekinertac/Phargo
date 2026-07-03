@@ -156,14 +156,22 @@ is feature-priced:
    drifts (109), bool flips (30), int drifts (33). Singles, ~1-3 tests each.
 5. **Perf follow-up**: foreach_016 + phpdbg match grind minutes in the
    live-append/step-limit path.
-**WP oracle status (2026-07-08):** perf wall demolished — the
-arrayaccess_obj property-clone fix took bootstrap 136s → 2.8s (48×). Next
-blocker, precisely localized: the SQLite plugin's SQL LEXER spins without
-net-advancing (class-wp-sqlite-lexer.php, backtracking via $this->last —
-some string builtin we return wrong makes parse* never consume). Repro:
-PHARGO_STEP_LIMIT=100000000 cargo run --release --example wpscan → death
-diagnoses itself at db.php:1489 in lex(). Probe the lexer in isolation on
-a trivial query first.
+**WP oracle status (2026-07-04): BOOTSTRAP COMPLETES — Phase 1 gate hit.**
+The full wp-load → wp-config → wp-settings chain (plugins, SQLite drop-in,
+Requests autoloader, i18n, hooks, widgets) runs to the end under
+`define('WP_INSTALLING', true)`; without it WP exits cleanly on the
+wp_not_installed() install redirect (empty DB — correct behavior). The
+"lexer spin" was static property DEFAULTS never initializing (the eighth
+silent hole). The rest of the blocker chain, in order: function_exists
+blind to ~440 of our builtins (polyfill shadowing), global-by-value
+(require_wp_db's isset($wpdb)), str_replace's by-ref $count
+(_deep_replace), `__()` eaten by the magic-constant prefix test, \xNN in
+regex classes, definition-site __DIR__/ns/use-alias context for calls
+(fixed stack-trace file misattribution engine-wide), goto (HTML-API state
+machine), and honest gaps: strtr, parse_url, glob, substr_replace, uniqid,
+array_intersect_key/array_diff_key, alt-syntax switch templates.
+**Next: run the WP installer (wp-admin/install.php?step=2 equivalent) to
+populate the SQLite DB, then render the front page.**
 
 Delegation notes: agents run clean off specs with file scope + literal
 expected outputs + numeric baselines (12 successful tasks so far, zero

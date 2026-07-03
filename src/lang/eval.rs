@@ -15,6 +15,14 @@ use std::rc::Rc;
 
 #[derive(Debug)]
 pub struct RunError(pub String);
+
+/// Definition-site context for a function or class: the file it was declared
+/// in plus that file's namespace and `use` aliases (see Eval::def_ctx).
+struct DefCtx {
+    file: Option<PathBuf>,
+    ns: String,
+    uses: Rc<HashMap<String, String>>,
+}
 type R<T> = Result<T, RunError>;
 
 /// Control-flow signal bubbled up from statement execution.
@@ -79,6 +87,11 @@ pub struct Eval {
     bc_scale: usize,
     /// (class, method) → resolved Rc'd declaration; cleared on class changes.
     method_cache: RefCell<HashMap<(String, String), Option<(String, Rc<MethodDecl>)>>>,
+    /// `fn:<name>` / `class:<name>` (lowercase) → definition-site context.
+    /// __FILE__/__DIR__, the namespace, and `use` aliases are all bound at the
+    /// file that DECLARED the function/class — bodies executing later (called
+    /// from another file) must see that context, not the caller's.
+    def_ctx: HashMap<String, DefCtx>,
     /// Current namespace (lowercased, "" = global) and `use` alias map
     /// (alias-lower → FQ-lower). File-scoped: saved/restored across includes.
     cur_ns: String,
@@ -1965,6 +1978,7 @@ impl Eval {
             use_map: HashMap::new(),
             bc_scale: 0,
             method_cache: RefCell::new(HashMap::new()),
+            def_ctx: HashMap::new(),
             frames: Vec::new(),
             prelude_fns: HashSet::new(),
             prelude_classes: HashSet::new(),
@@ -2291,6 +2305,28 @@ impl Eval {
     /// the bare name, so global/prelude ancestors keep resolving).
     fn hoist_ns(&mut self, stmts: &[Stmt], ns: &str) {
         let mut ns = ns.to_string();
+        // collect this scope's `use` aliases up front — declarations register
+        // during hoist (before any Stmt::Use executes), and their bodies must
+        // later run under these aliases (see enter_def_ctx)
+        let mut uses: HashMap<String, String> = HashMap::new();
+        for s in stmts {
+            let s = match s {
+                Stmt::Marked(_, inner) => &**inner,
+                other => other,
+            };
+            if let Stmt::Use(items) = s {
+                for it in items {
+                    let fq = it.name.parts.join("\\");  // declared case preserved: feeds case-sensitive autoloaders
+                    let alias = it
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| it.name.last().to_string())
+                        .to_ascii_lowercase();
+                    uses.insert(alias, fq);
+                }
+            }
+        }
+        let uses = Rc::new(uses);
         for s in stmts {
             let s = match s {
                 Stmt::Marked(_, inner) => &**inner,
@@ -2314,6 +2350,7 @@ impl Eval {
                     if !ns.is_empty() {
                         f.name = format!("{ns}\\{}", f.name);
                     }
+                    self.record_def_ctx(format!("fn:{}", f.name.to_ascii_lowercase()), &ns, &uses);
                     self.funcs.insert(f.name.to_ascii_lowercase(), Rc::new(f));
                 }
                 Stmt::Class(c) => {
@@ -2335,12 +2372,44 @@ impl Eval {
                             prefix(t);
                         }
                     }
+                    self.record_def_ctx(format!("class:{}", c.name.to_ascii_lowercase()), &ns, &uses);
                     self.classes.insert(c.name.to_ascii_lowercase(), Rc::new(c));
                     self.method_cache.borrow_mut().clear();
                 }
                 _ => {}
             }
         }
+    }
+
+    fn record_def_ctx(&mut self, key: String, ns: &str, uses: &Rc<HashMap<String, String>>) {
+        self.def_ctx.insert(
+            key,
+            DefCtx {
+                file: self.cur_file.clone(),
+                ns: ns.to_string(),
+                uses: uses.clone(),
+            },
+        );
+    }
+
+    /// Swap cur_file/cur_ns/use_map to the callee's definition-site context
+    /// for the duration of a call. Returns the previous values to restore, or
+    /// None when unknown (builtins, prelude, closures — keep the caller's).
+    fn enter_def_ctx(
+        &mut self,
+        key: &str,
+    ) -> Option<(Option<PathBuf>, String, HashMap<String, String>)> {
+        let ctx = self.def_ctx.get(key)?;
+        let file = ctx.file.clone();
+        let ns = ctx.ns.clone();
+        let uses = (*ctx.uses).clone();
+        let pf = match file {
+            Some(df) => std::mem::replace(&mut self.cur_file, Some(df)),
+            None => self.cur_file.clone(),
+        };
+        let pns = std::mem::replace(&mut self.cur_ns, ns);
+        let puse = std::mem::replace(&mut self.use_map, uses);
+        Some((pf, pns, puse))
     }
 
     /// find_class through a (possibly qualified) AST Name: the joined form
@@ -2370,7 +2439,9 @@ impl Eval {
             }
             return joined;
         }
-        // use-alias on the first segment
+        // use-alias on the first segment. PHP alias resolution is purely
+        // syntactic — honor it even when the class isn't loaded yet, so the
+        // caller's autoload sees the FQ name (Requests' InputValidator).
         if let Some(fq) = self.use_map.get(&n.parts[0].to_ascii_lowercase()) {
             let mut out = fq.clone();
             for extra in &n.parts[1..] {
@@ -2378,6 +2449,11 @@ impl Eval {
                 out.push_str(extra);
             }
             if self.classes.contains_key(&out.to_ascii_lowercase()) {
+                return out;
+            }
+            // unregistered: still prefer the alias unless the bare name is a
+            // known class (prelude classes reached through stale aliases)
+            if self.find_class(n.last()).is_none() {
                 return out;
             }
         }
@@ -2449,10 +2525,28 @@ impl Eval {
 
     // ---- statements -----------------------------------------------------
     fn exec_block(&mut self, stmts: &[Stmt]) -> R<Flow> {
-        for s in stmts {
-            match self.exec(s)? {
-                Flow::Normal => {}
-                other => return Ok(other),
+        let mut i = 0;
+        while i < stmts.len() {
+            match self.exec(&stmts[i]) {
+                Ok(Flow::Normal) => i += 1,
+                Ok(other) => return Ok(other),
+                Err(e) => {
+                    // goto: if this list holds the target label, resume there;
+                    // otherwise keep unwinding (out of loops, nested blocks…)
+                    if let Some(label) = e.0.strip_prefix("__phargo_goto__") {
+                        if let Some(idx) = stmts.iter().position(|s| {
+                            let s = match s {
+                                Stmt::Marked(_, inner) => &**inner,
+                                other => other,
+                            };
+                            matches!(s, Stmt::Label(l) if l == label)
+                        }) {
+                            i = idx + 1;
+                            continue;
+                        }
+                    }
+                    return Err(e);
+                }
             }
         }
         Ok(Flow::Normal)
@@ -2462,6 +2556,8 @@ impl Eval {
         self.tick()?;
         match s {
             Stmt::InlineHtml(b) => self.out.extend_from_slice(b),
+            Stmt::Label(_) => {}
+            Stmt::Goto(l) => return Err(RunError(format!("__phargo_goto__{l}"))),
             Stmt::Echo(items) => {
                 for e in items {
                     let v = self.eval(e)?;
@@ -2503,6 +2599,8 @@ impl Eval {
                 if !self.cur_ns.is_empty() && !f.name.contains('\\') {
                     f.name = format!("{}\\{}", self.cur_ns, f.name);
                 }
+                let (ns, uses) = (self.cur_ns.clone(), Rc::new(self.use_map.clone()));
+                self.record_def_ctx(format!("fn:{}", f.name.to_ascii_lowercase()), &ns, &uses);
                 self.funcs.insert(f.name.to_ascii_lowercase(), Rc::new(f));
             }
             Stmt::ConstDecl(decls) => {
@@ -2730,10 +2828,23 @@ impl Eval {
                 }
             }
             Stmt::Global(names) => {
-                // copy the global into the local scope (simplified: by value)
+                // Bind by REFERENCE: promote the global slot to a shared Ref
+                // cell that the local name aliases, so a later write to
+                // $GLOBALS['x'] (e.g. by an include) is visible through the
+                // local. WP's require_wp_db checks isset($wpdb) after the
+                // db.php drop-in sets $GLOBALS['wpdb'] — by-value broke it.
                 for n in names {
-                    let v = self.scopes[0].get(n).cloned().unwrap_or(Value::Null);
-                    self.vars().insert(n.clone(), v);
+                    let cell = match self.scopes[0].get(n) {
+                        Some(Value::Ref(c)) => c.clone(),
+                        other => {
+                            let c = Rc::new(RefCell::new(
+                                other.cloned().unwrap_or(Value::Null),
+                            ));
+                            self.scopes[0].insert(n.clone(), Value::Ref(c.clone()));
+                            c
+                        }
+                    };
+                    self.vars().insert(n.clone(), Value::Ref(cell));
                 }
             }
             Stmt::Class(c) => {
@@ -2756,6 +2867,8 @@ impl Eval {
                         prefix(t);
                     }
                 }
+                let (ns, uses) = (self.cur_ns.clone(), Rc::new(self.use_map.clone()));
+                self.record_def_ctx(format!("class:{}", c.name.to_ascii_lowercase()), &ns, &uses);
                 self.classes.insert(c.name.to_ascii_lowercase(), Rc::new(c));
                 self.method_cache.borrow_mut().clear();
             }
@@ -2825,7 +2938,7 @@ impl Eval {
             }
             Stmt::Use(items) => {
                 for it in items {
-                    let fq = it.name.parts.join("\\").to_ascii_lowercase();
+                    let fq = it.name.parts.join("\\");  // declared case preserved: feeds case-sensitive autoloaders
                     let alias = it
                         .alias
                         .clone()
@@ -3531,10 +3644,8 @@ impl Eval {
             }
             Expr::StaticProp(class, name) => {
                 let cname = self.resolve_class_name(class)?;
-                self.static_props
-                    .get(&(cname.to_ascii_lowercase(), name.clone()))
-                    .cloned()
-                    .unwrap_or(Value::Null)
+                let key = self.static_prop_key(&cname, name)?;
+                self.static_props.get(&key).cloned().unwrap_or(Value::Null)
             }
             Expr::Throw(inner) => {
                 let v = self.eval(inner)?;
@@ -4100,7 +4211,14 @@ impl Eval {
                 if let (Expr::Var(n), Some(i)) = (&**base, idx) {
                     if n == "GLOBALS" {
                         let key = String::from_utf8_lossy(&to_bytes(&self.eval(i)?)).into_owned();
-                        self.scopes[0].insert(key, val);
+                        // write through an existing Ref cell so `global $x`
+                        // bindings elsewhere observe the new value
+                        if let Some(Value::Ref(cell)) = self.scopes[0].get(&key) {
+                            let cell = cell.clone();
+                            *cell.borrow_mut() = val;
+                        } else {
+                            self.scopes[0].insert(key, val);
+                        }
                         return Ok(());
                     }
                 }
@@ -4136,8 +4254,8 @@ impl Eval {
             }
             Expr::StaticProp(class, name) => {
                 let cname = self.resolve_class_name(class)?;
-                self.static_props
-                    .insert((cname.to_ascii_lowercase(), name.clone()), val);
+                let key = self.static_prop_key(&cname, name)?;
+                self.static_props.insert(key, val);
             }
             // list/array destructuring: [$a, $b] = ...  and  list($a, $b) = ...
             Expr::Array(_) | Expr::List(_) => {
@@ -4357,6 +4475,27 @@ impl Eval {
                 }
                 Ok(())
             }
+            // `Cls::$prop[...] = v` — read-modify-write the shared static slot.
+            Expr::StaticProp(class, name) => {
+                let cname = self.resolve_class_name(class)?;
+                let skey = self.static_prop_key(&cname, name)?;
+                let mut cur = self
+                    .static_props
+                    .get(&skey)
+                    .cloned()
+                    .unwrap_or(Value::Array(Arr::new()));
+                if !matches!(cur, Value::Array(_)) {
+                    cur = Value::Array(Arr::new());
+                }
+                if let Value::Array(a) = &mut cur {
+                    match key {
+                        Some(k) => a.insert(k, val),
+                        None => a.push(val),
+                    }
+                }
+                self.static_props.insert(skey, cur);
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -4490,6 +4629,12 @@ impl Eval {
                     }
                     return Ok(Value::Int(count));
                 }
+                // 4-arg form: write the replacement count into the by-ref arg
+                "str_replace" | "str_ireplace" if args.len() >= 4 => {
+                    let (v, n) = self.str_replace_full(name == "str_ireplace", &argv);
+                    self.assign_to(&args[3].value, Value::Int(n))?;
+                    return Ok(v);
+                }
                 "array_push" | "array_pop" | "array_shift" | "array_unshift" | "sort" | "rsort"
                 | "asort" | "arsort" | "ksort" | "krsort" | "usort" | "uasort" | "uksort"
                 | "array_splice" | "shuffle"
@@ -4586,10 +4731,15 @@ impl Eval {
     }
 
     fn run_source(&mut self, bytes: &[u8], path: Option<PathBuf>) -> R<Value> {
+        let loc = || {
+            path.as_ref()
+                .map(|p| format!(" in {}", p.display()))
+                .unwrap_or_default()
+        };
         let (toks, lines) = super::lexer::Lexer::tokenize_lines(bytes)
-            .map_err(|e| RunError(format!("Parse error: {}", e.msg)))?;
+            .map_err(|e| RunError(format!("Parse error: {}{}", e.msg, loc())))?;
         let ast = super::parser::Parser::parse_with_lines(toks, lines)
-            .map_err(|e| RunError(format!("Parse error: {}", e.msg)))?;
+            .map_err(|e| RunError(format!("Parse error: {}{}", e.msg, loc())))?;
         let prev_file = std::mem::replace(&mut self.cur_file, path);
         let prev_line = self.cur_line;
         let prev_ns = std::mem::take(&mut self.cur_ns);
@@ -5123,9 +5273,15 @@ impl Eval {
         self.cur_args.push(Rc::new(args.clone()));
         self.cur_fn.push(f.name.clone());
         self.frames.push((f.name.clone(), self.cur_line));
+        let prev_df = self.enter_def_ctx(&format!("fn:{}", f.name.to_ascii_lowercase()));
         let mut scope = HashMap::new();
         let bind = self.bind_params(&mut scope, &f.params, &args, &f.name);
         if let Err(e) = bind {
+            if let Some((pf, pns, puse)) = prev_df {
+                self.cur_file = pf;
+                self.cur_ns = pns;
+                self.use_map = puse;
+            }
             self.cur_args.pop();
             self.cur_fn.pop();
             self.frames.pop();
@@ -5145,6 +5301,11 @@ impl Eval {
         self.byref_ret.pop();
         if quiet_body {
             self.quiet -= 1;
+        }
+        if let Some((pf, pns, puse)) = prev_df {
+            self.cur_file = pf;
+            self.cur_ns = pns;
+            self.use_map = puse;
         }
         self.cur_args.pop();
         self.cur_fn.pop();
@@ -5412,6 +5573,82 @@ impl Eval {
         out
     }
 
+    /// str_replace / str_ireplace with full PHP semantics: search/replace may
+    /// be arrays (pairwise, missing replacement = ""), subject may be an array
+    /// (mapped). Returns the result plus the replacement count for the by-ref
+    /// 4th parameter (WP's _deep_replace loops `while ($count)` on it).
+    fn str_replace_full(&self, ci: bool, argv: &[Value]) -> (Value, i64) {
+        let g = |i: usize| argv.get(i).cloned().unwrap_or(Value::Null);
+        let mut total = 0i64;
+        let mut one = |subject: &[u8]| -> Vec<u8> {
+            match &g(0) {
+                Value::Array(sa) => {
+                    let mut out = subject.to_vec();
+                    for (i, (_, sv)) in sa.entries.iter().enumerate() {
+                        let needle = to_bytes(sv);
+                        let rep = match &g(1) {
+                            Value::Array(ra) => ra
+                                .entries
+                                .get(i)
+                                .map(|(_, v)| to_bytes(v))
+                                .unwrap_or_default(),
+                            other => to_bytes(other),
+                        };
+                        let (o, n) = replace_bytes_ci_n(&out, &needle, &rep, ci);
+                        out = o;
+                        total += n;
+                    }
+                    out
+                }
+                other => {
+                    let (o, n) =
+                        replace_bytes_ci_n(subject, &to_bytes(other), &to_bytes(&g(1)), ci);
+                    total += n;
+                    o
+                }
+            }
+        };
+        let v = match &g(2) {
+            Value::Array(subj) => {
+                let mut out = Arr::new();
+                for (k, v) in &subj.entries {
+                    out.insert(k.clone(), Value::Str(one(&to_bytes(v))));
+                }
+                Value::Array(out)
+            }
+            other => Value::Str(one(&to_bytes(other))),
+        };
+        (v, total)
+    }
+
+    /// Storage slot for a static property. PHP shares a static declared in a
+    /// parent with every subclass, so access canonicalizes to the class that
+    /// already holds (or declares) the property; a declared default is
+    /// materialized on first touch. Before this, static prop *defaults* were a
+    /// silent hole — reads before any write returned NULL (WP's SQL lexer
+    /// read `static::$default_delimiter` as NULL → strlen 0 → infinite loop).
+    fn static_prop_key(&mut self, cname: &str, name: &str) -> R<(String, String)> {
+        let chain = self.ancestry(cname);
+        for c in &chain {
+            let key = (c.name.to_ascii_lowercase(), name.to_string());
+            if self.static_props.contains_key(&key) {
+                return Ok(key);
+            }
+        }
+        for c in &chain {
+            if let Some(p) = c.props.iter().find(|p| p.is_static && p.name == name) {
+                let key = (c.name.to_ascii_lowercase(), name.to_string());
+                let v = match &p.default {
+                    Some(d) => self.eval(d)?,
+                    None => Value::Null,
+                };
+                self.static_props.insert(key.clone(), v);
+                return Ok(key);
+            }
+        }
+        Ok((cname.to_ascii_lowercase(), name.to_string()))
+    }
+
     /// The var_dump visibility annotation for a property: "" (public),
     /// ":protected", or `:"DeclaringClass":private`. Empty if not a declared
     /// property (dynamic props are public).
@@ -5656,7 +5893,13 @@ impl Eval {
         }
         let mfname = format!("{}::{}", display_class(decl_class), m.name);
         self.frames.push((format!("{}->{}", display_class(decl_class), m.name), self.cur_line));
+        let prev_df = self.enter_def_ctx(&format!("class:{}", decl_class.to_ascii_lowercase()));
         if let Err(e) = self.bind_params(&mut scope, &m.params, &args, &mfname) {
+            if let Some((pf, pns, puse)) = prev_df {
+                self.cur_file = pf;
+                self.cur_ns = pns;
+                self.use_map = puse;
+            }
             self.cur_args.pop();
             self.cur_fn.pop();
             self.frames.pop();
@@ -5702,6 +5945,11 @@ impl Eval {
         }
         self.current_class = prev_class;
         self.called_class = prev_called;
+        if let Some((pf, pns, puse)) = prev_df {
+            self.cur_file = pf;
+            self.cur_ns = pns;
+            self.use_map = puse;
+        }
         self.cur_args.pop();
         self.cur_fn.pop();
         self.frames.pop();
@@ -5839,7 +6087,13 @@ impl Eval {
         }
         let mfname = format!("{}::{}", display_class(&decl_class), m.name);
         self.frames.push((mfname.clone(), self.cur_line));
+        let prev_df = self.enter_def_ctx(&format!("class:{}", decl_class.to_ascii_lowercase()));
         if let Err(e) = self.bind_params(&mut scope, &m.params, &args, &mfname) {
+            if let Some((pf, pns, puse)) = prev_df {
+                self.cur_file = pf;
+                self.cur_ns = pns;
+                self.use_map = puse;
+            }
             self.cur_args.pop();
             self.cur_fn.pop();
             self.frames.pop();
@@ -5872,6 +6126,11 @@ impl Eval {
         }
         self.current_class = prev_class;
         self.called_class = prev_called;
+        if let Some((pf, pns, puse)) = prev_df {
+            self.cur_file = pf;
+            self.cur_ns = pns;
+            self.use_map = puse;
+        }
         self.cur_args.pop();
         self.cur_fn.pop();
         self.frames.pop();
@@ -7590,6 +7849,27 @@ impl Eval {
                 Value::Str(out.into_bytes())
             }
             // ---- more array builtins ----
+            "array_intersect_key" | "array_diff_key" => {
+                let keep_present = name == "array_intersect_key";
+                let mut out = Arr::new();
+                if let Value::Array(arr) = a(0) {
+                    let others: Vec<&Arr> = args[1..]
+                        .iter()
+                        .filter_map(|v| match v {
+                            Value::Array(o) => Some(o),
+                            _ => None,
+                        })
+                        .collect();
+                    for (k, v) in &arr.entries {
+                        let in_all = others.iter().all(|o| o.get(k).is_some());
+                        let in_any = others.iter().any(|o| o.get(k).is_some());
+                        if (keep_present && in_all) || (!keep_present && !in_any) {
+                            out.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                Value::Array(out)
+            }
             "array_diff" => {
                 let mut out = Arr::new();
                 if let Value::Array(arr) = a(0) {
@@ -7759,39 +8039,95 @@ impl Eval {
                 Value::Str(s[start..end.max(start)].to_vec())
             }
             "str_replace" | "str_ireplace" => {
-                let ci = name == "str_ireplace";
-                // full PHP semantics: search/replace may be arrays (pairwise,
-                // missing replacement = ""), subject may be an array (mapped)
-                let one = |subject: &[u8]| -> Vec<u8> {
-                    match &a(0) {
-                        Value::Array(sa) => {
-                            let mut out = subject.to_vec();
-                            for (i, (_, sv)) in sa.entries.iter().enumerate() {
-                                let needle = to_bytes(sv);
-                                let rep = match &a(1) {
-                                    Value::Array(ra) => ra
-                                        .entries
-                                        .get(i)
-                                        .map(|(_, v)| to_bytes(v))
-                                        .unwrap_or_default(),
-                                    other => to_bytes(other),
-                                };
-                                out = replace_bytes_ci(&out, &needle, &rep, ci);
-                            }
-                            out
+                self.str_replace_full(name == "str_ireplace", &args).0
+            }
+            "parse_url" => {
+                let url = to_bytes(&a(0));
+                match php_parse_url(&url) {
+                    Some(parts) => {
+                        if args.len() > 1 && !matches!(a(1), Value::Int(-1)) {
+                            let want = to_i64(&a(1));
+                            let key: &[u8] = match want {
+                                0 => b"scheme",
+                                1 => b"host",
+                                2 => b"port",
+                                3 => b"user",
+                                4 => b"pass",
+                                5 => b"path",
+                                6 => b"query",
+                                7 => b"fragment",
+                                _ => b"",
+                            };
+                            parts
+                                .get(&Key::Str(key.to_vec()))
+                                .map(|v| v.deref())
+                                .unwrap_or(Value::Null)
+                        } else {
+                            Value::Array(parts)
                         }
-                        other => replace_bytes_ci(subject, &to_bytes(other), &to_bytes(&a(1)), ci),
                     }
+                    None => Value::Bool(false),
+                }
+            }
+            "substr_replace" => {
+                let s = to_bytes(&a(0));
+                let rep = to_bytes(&a(1));
+                let len = s.len() as i64;
+                let off = to_i64(&a(2));
+                let start = if off < 0 { (len + off).max(0) } else { off.min(len) } as usize;
+                let l = if args.len() > 3 && !matches!(a(3), Value::Null) {
+                    to_i64(&a(3))
+                } else {
+                    len
                 };
-                match &a(2) {
-                    Value::Array(subj) => {
-                        let mut out = Arr::new();
-                        for (k, v) in &subj.entries {
-                            out.insert(k.clone(), Value::Str(one(&to_bytes(v))));
+                let end = if l < 0 {
+                    ((len + l).max(start as i64)) as usize
+                } else {
+                    (start + l as usize).min(s.len())
+                };
+                let mut out = s[..start].to_vec();
+                out.extend_from_slice(&rep);
+                out.extend_from_slice(&s[end.max(start)..]);
+                Value::Str(out)
+            }
+            "strtr" => {
+                let s = to_bytes(&a(0));
+                if let Value::Array(pairs) = a(1) {
+                    // pair form: longest match first at each position, no
+                    // rescanning of replaced text
+                    let mut map: Vec<(Vec<u8>, Vec<u8>)> = pairs
+                        .entries
+                        .iter()
+                        .map(|(k, v)| (to_bytes(&akey_to_value(k)), to_bytes(v)))
+                        .filter(|(k, _)| !k.is_empty())
+                        .collect();
+                    map.sort_by(|x, y| y.0.len().cmp(&x.0.len()));
+                    let mut out = Vec::with_capacity(s.len());
+                    let mut i = 0;
+                    'outer: while i < s.len() {
+                        for (k, v) in &map {
+                            if s[i..].starts_with(k) {
+                                out.extend_from_slice(v);
+                                i += k.len();
+                                continue 'outer;
+                            }
                         }
-                        Value::Array(out)
+                        out.push(s[i]);
+                        i += 1;
                     }
-                    other => Value::Str(one(&to_bytes(other))),
+                    Value::Str(out)
+                } else {
+                    let from = to_bytes(&a(1));
+                    let to = to_bytes(&a(2));
+                    let n = from.len().min(to.len());
+                    let out = s
+                        .iter()
+                        .map(|&b| match from[..n].iter().position(|&f| f == b) {
+                            Some(i) => to[i],
+                            None => b,
+                        })
+                        .collect();
+                    Value::Str(out)
                 }
             }
             "strpos" => {
@@ -9158,6 +9494,22 @@ impl Eval {
                         && d <= crate::days_in_month(y, m),
                 )
             }
+            "uniqid" => {
+                let mut s = if args.is_empty() {
+                    String::new()
+                } else {
+                    String::from_utf8_lossy(&to_bytes(&a(0))).into_owned()
+                };
+                let d = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                s.push_str(&format!("{:08x}{:05x}", d.as_secs(), d.subsec_micros()));
+                if to_bool(&a(1)) {
+                    // more_entropy: PHP appends ".%08d" from php_combined_lcg
+                    s.push_str(&format!("{}.{:08}", d.subsec_nanos() % 10, d.subsec_nanos() % 100_000_000));
+                }
+                Value::Str(s.into_bytes())
+            }
             "microtime" => {
                 if to_bool(&a(0)) {
                     Value::Float(crate::now_unix() as f64)
@@ -9737,6 +10089,32 @@ impl Eval {
                     Err(_) => Value::Bool(false),
                 }
             }
+            "glob" => {
+                let pattern = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let flags = to_i64(&a(1));
+                let onlydir = flags & 8192 != 0; // GLOB_ONLYDIR
+                let mark = flags & 2 != 0; // GLOB_MARK
+                let nosort = flags & 4 != 0; // GLOB_NOSORT
+                let mut hits = php_glob(&pattern);
+                if onlydir {
+                    hits.retain(|p| std::path::Path::new(p).is_dir());
+                }
+                if !nosort {
+                    hits.sort();
+                }
+                if mark {
+                    for p in &mut hits {
+                        if std::path::Path::new(p.as_str()).is_dir() && !p.ends_with('/') {
+                            p.push('/');
+                        }
+                    }
+                }
+                let mut arr = Arr::new();
+                for p in hits {
+                    arr.push(Value::Str(p.into_bytes()));
+                }
+                Value::Array(arr)
+            }
             "scandir" => {
                 let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 match std::fs::read_dir(&path) {
@@ -10187,17 +10565,112 @@ impl Eval {
     }
 }
 
+/// Names the builtin dispatcher actually handles — generated by scanning the
+/// dispatch arms (see DEVLOG). `function_exists` must say yes to these, or
+/// polyfill guards (`if (!function_exists('mb_strlen')) { ... }`) shadow our
+/// builtins with pure-PHP fallbacks that assume a full runtime (WP's
+/// _mb_strlen calls get_option before the DB exists).
+static KNOWN_BUILTINS: &[&str] = &[
+        "__dom_parse", "__pdo_close", "__pdo_lastid", "__pdo_open", "__pdo_query",
+        "__phargo_bcscale_of", "__phargo_createfromformat", "__phargo_cur_file",
+        "__phargo_cur_line", "__phargo_date_tz", "__phargo_mktime_tz", "__phargo_modify",
+        "__phargo_strtotime_tz", "__phargo_trace", "__phargo_tz_offset",
+        "__phargo_tz_transitions", "__phargo_tz_valid", "abs", "addslashes", "array_chunk",
+        "array_column", "array_combine", "array_count_values", "array_diff", "array_diff_key",
+        "array_fill",
+        "array_fill_keys", "array_filter", "array_flip", "array_intersect", "array_intersect_key",
+        "array_is_list",
+        "array_key_exists", "array_key_first", "array_key_last", "array_keys", "array_map",
+        "array_merge", "array_merge_recursive", "array_multisort", "array_pad", "array_pop",
+        "array_product", "array_push", "array_reduce", "array_reverse", "array_search",
+        "array_shift", "array_slice", "array_splice", "array_sum", "array_unique",
+        "array_unshift", "array_values", "array_walk", "array_walk_recursive", "arsort",
+        "asort", "assert", "base64_decode", "base64_encode", "basename", "bcadd", "bcceil",
+        "bccomp", "bcdiv", "bcdivmod", "bcfloor", "bcmod", "bcmul", "bcpow", "bcpowmod",
+        "bcround", "bcscale", "bcsqrt", "bcsub", "bin2hex", "bindec", "boolval",
+        "call_user_func", "call_user_func_array", "ceil", "chdir", "checkdate", "chop", "chr",
+        "chunk_split", "class_alias", "class_exists", "class_implements", "class_parents",
+        "class_uses", "clearstatcache", "closedir", "compact", "constant", "copy", "count",
+        "crc32", "ctype_alnum", "ctype_alpha", "ctype_digit", "ctype_space", "current", "date",
+        "date_default_timezone_get", "date_default_timezone_set", "debug_backtrace",
+        "debug_print_backtrace", "decbin", "dechex", "decoct", "define", "defined", "dirname",
+        "doubleval", "each", "end", "enum_exists", "error_clear_last", "error_get_last",
+        "error_reporting", "escapeshellarg", "escapeshellcmd", "exec", "explode",
+        "extension_loaded", "extract", "fclose", "fdiv", "feof", "fflush", "fgetc", "fgetcsv",
+        "fgets", "file", "file_exists", "file_get_contents", "file_put_contents", "filesize",
+        "filter_var", "floatval", "flock", "floor", "flush", "fopen", "fpassthru", "fputcsv",
+        "fputs", "fread", "fscanf", "fseek", "fsockopen", "ftell", "func_get_arg",
+        "func_get_args", "func_num_args", "function_exists", "fwrite", "gc_collect_cycles",
+        "gc_disable", "gc_enable", "gc_enabled", "get_called_class", "get_class",
+        "get_class_methods", "get_class_vars", "get_declared_classes",
+        "get_declared_interfaces", "get_declared_traits", "get_object_vars",
+        "get_parent_class", "get_resource_id", "get_resource_type", "getcwd", "getdate",
+        "getenv", "getimagesize", "getmypid", "getrandmax", "gettype", "glob", "gmdate", "gmmktime",
+        "gmstrftime", "hash", "header", "headers_sent", "hex2bin", "hexdec", "highlight_file",
+        "highlight_string", "hrtime", "html_entity_decode", "htmlentities", "htmlspecialchars",
+        "htmlspecialchars_decode", "http_build_query", "http_response_code", "idate",
+        "ignore_user_abort", "implode", "in_array", "ini_get", "ini_set", "intdiv",
+        "interface_exists", "intval", "is_a", "is_array", "is_bool", "is_callable", "is_dir",
+        "is_double", "is_file", "is_float", "is_int", "is_integer", "is_iterable", "is_long",
+        "is_null", "is_numeric", "is_object", "is_readable", "is_resource", "is_scalar",
+        "is_string", "is_subclass_of", "is_writable", "is_writeable", "iterator_to_array",
+        "join", "json_decode", "json_encode", "json_last_error", "json_last_error_msg", "key",
+        "key_exists", "krsort", "ksort", "lcfirst", "levenshtein", "ltrim", "max",
+        "mb_check_encoding", "mb_chr", "mb_convert_case", "mb_convert_encoding",
+        "mb_detect_encoding", "mb_http_output", "mb_internal_encoding", "mb_ord", "mb_scrub",
+        "mb_str_split", "mb_strlen", "mb_strpos", "mb_strtolower", "mb_strtoupper",
+        "mb_substitute_character", "mb_substr", "md5", "memory_get_peak_usage",
+        "memory_get_usage", "method_exists", "microtime", "min", "mkdir", "mktime",
+        "mt_getrandmax", "mt_rand", "mt_srand", "natcasesort", "natsort", "next", "nl2br",
+        "number_format", "ob_clean", "ob_end_clean", "ob_end_flush", "ob_flush",
+        "ob_get_clean", "ob_get_contents", "ob_get_length", "ob_get_level", "ob_start",
+        "octdec", "opendir", "openssl_sign", "ord", "pack", "parse_str", "parse_url", "pathinfo",
+        "php_sapi_name", "php_uname", "phpversion", "pos", "pow", "preg_grep", "preg_match",
+        "preg_match_all", "preg_quote", "preg_replace", "preg_replace_callback", "preg_split",
+        "prev", "print_r", "printf", "property_exists", "putenv", "quotemeta", "rand",
+        "random_int", "range", "rawurldecode", "rawurlencode", "readdir", "readfile",
+        "realpath", "register_shutdown_function", "rename", "reset", "restore_error_handler",
+        "restore_exception_handler", "rewind", "rewinddir", "rmdir", "round", "rsort", "rtrim",
+        "scandir", "serialize", "session_abort", "session_cache_expire",
+        "session_cache_limiter", "session_commit", "session_create_id", "session_destroy",
+        "session_get_cookie_params", "session_id", "session_module_name", "session_name",
+        "session_regenerate_id", "session_register_shutdown", "session_reset",
+        "session_save_path", "session_set_cookie_params", "session_set_save_handler",
+        "session_start", "session_status", "session_unset", "session_write_close",
+        "set_error_handler", "set_exception_handler", "set_time_limit", "setlocale", "settype",
+        "sha1", "shuffle", "similar_text", "sizeof", "sleep", "sort", "spl_autoload_functions",
+        "spl_autoload_register", "spl_autoload_unregister", "spl_object_hash", "spl_object_id",
+        "sprintf", "sqrt", "srand", "sscanf", "str_contains", "str_ends_with", "str_getcsv",
+        "str_ireplace", "str_pad", "str_repeat", "str_replace", "str_rot13", "str_split",
+        "str_starts_with", "str_word_count", "strcasecmp", "strchr", "strcmp", "strcspn",
+        "stream_context_create", "stream_context_get_default", "stream_context_set_default",
+        "stream_context_set_option", "stream_context_set_params", "stream_filter_append",
+        "stream_filter_prepend", "stream_filter_remove", "stream_get_contents",
+        "stream_get_line", "stream_get_meta_data", "stream_set_blocking",
+        "stream_set_read_buffer", "stream_set_timeout", "stream_set_write_buffer",
+        "stream_socket_client", "stream_wrapper_register", "stream_wrapper_restore",
+        "stream_wrapper_unregister", "strftime", "strip_tags", "stripos", "stripslashes",
+        "stristr", "strlen", "strncasecmp", "strncmp", "strpbrk", "strpos", "strrchr",
+        "strrev", "strrpos", "strspn", "strstr", "strtolower", "strtotime", "strtoupper", "strtr",
+        "strval", "substr", "substr_compare", "substr_count", "substr_replace",
+        "sys_get_temp_dir", "tempnam",
+        "time", "timezone_identifiers_list", "touch", "trait_exists", "trigger_error", "trim",
+        "uasort", "ucfirst", "ucwords", "uksort", "umask", "uniqid", "unlink", "unpack", "unserialize",
+        "urldecode", "urlencode", "usleep", "usort", "var_dump", "var_export",
+        "version_compare", "vprintf", "vsprintf", "wordwrap", "xml_error_string",
+        "xml_get_current_byte_index", "xml_get_current_column_number",
+        "xml_get_current_line_number", "xml_get_error_code", "xml_parse",
+        "xml_parse_into_struct", "xml_parser_create", "xml_parser_create_ns",
+        "xml_parser_free", "xml_parser_get_option", "xml_parser_set_option",
+        "xml_set_character_data_handler", "xml_set_default_handler", "xml_set_element_handler",
+        "xml_set_end_namespace_decl_handler", "xml_set_external_entity_ref_handler",
+        "xml_set_notation_decl_handler", "xml_set_object",
+        "xml_set_processing_instruction_handler", "xml_set_start_namespace_decl_handler",
+        "xml_set_unparsed_entity_decl_handler",
+];
+
 fn is_known_builtin(n: &str) -> bool {
-    matches!(
-        n,
-        "strlen" | "count" | "var_dump" | "print_r" | "implode" | "explode" | "sprintf"
-            | "printf" | "in_array" | "array_keys" | "array_values" | "array_merge" | "range"
-            | "vsprintf" | "vprintf" | "array_chunk" | "array_merge_recursive" | "strip_tags"
-            | "pack" | "unpack" | "str_rot13" | "escapeshellarg" | "escapeshellcmd"
-            | "array_multisort" | "htmlspecialchars" | "htmlentities" | "html_entity_decode"
-            | "htmlspecialchars_decode" | "urlencode" | "urldecode" | "rawurlencode"
-            | "rawurldecode" | "http_build_query"
-    )
+    KNOWN_BUILTINS.binary_search(&n).is_ok()
 }
 
 fn trim_bytes(s: &[u8], left: bool, right: bool) -> Vec<u8> {
@@ -10639,28 +11112,293 @@ fn find_bytes(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 }
 
 /// replace_bytes with optional ASCII case-insensitive matching (str_ireplace).
+/// glob(): expand the pattern segment-wise. `*`/`?`/`[...]` match within one
+/// path segment; a leading dot is only matched literally (fnmatch rules).
+fn php_glob(pattern: &str) -> Vec<String> {
+    fn seg_match(name: &str, pat: &str) -> bool {
+        // no leading-dot match via wildcards
+        if name.starts_with('.') && !pat.starts_with('.') {
+            return false;
+        }
+        let n: Vec<char> = name.chars().collect();
+        let p: Vec<char> = pat.chars().collect();
+        fn rec(n: &[char], p: &[char]) -> bool {
+            if p.is_empty() {
+                return n.is_empty();
+            }
+            match p[0] {
+                '*' => rec(n, &p[1..]) || (!n.is_empty() && rec(&n[1..], p)),
+                '?' => !n.is_empty() && rec(&n[1..], &p[1..]),
+                '[' => {
+                    if n.is_empty() {
+                        return false;
+                    }
+                    let close = match p.iter().skip(1).position(|&c| c == ']') {
+                        Some(i) => i + 1,
+                        None => return false,
+                    };
+                    let (set, neg) = if p[1] == '!' || p[1] == '^' {
+                        (&p[2..close], true)
+                    } else {
+                        (&p[1..close], false)
+                    };
+                    let mut hit = false;
+                    let mut i = 0;
+                    while i < set.len() {
+                        if i + 2 < set.len() && set[i + 1] == '-' {
+                            if set[i] <= n[0] && n[0] <= set[i + 2] {
+                                hit = true;
+                            }
+                            i += 3;
+                        } else {
+                            if set[i] == n[0] {
+                                hit = true;
+                            }
+                            i += 1;
+                        }
+                    }
+                    (hit != neg) && rec(&n[1..], &p[close + 1..])
+                }
+                c => !n.is_empty() && n[0] == c && rec(&n[1..], &p[1..]),
+            }
+        }
+        rec(&n, &p)
+    }
+    let has_wild = |s: &str| s.contains('*') || s.contains('?') || s.contains('[');
+    let (mut bases, segs): (Vec<String>, Vec<&str>) = if let Some(rest) = pattern.strip_prefix('/')
+    {
+        (vec!["/".to_string()], rest.split('/').collect())
+    } else {
+        (vec![String::new()], pattern.split('/').collect())
+    };
+    for (si, seg) in segs.iter().enumerate() {
+        if seg.is_empty() {
+            continue;
+        }
+        let last = si == segs.len() - 1;
+        let mut next = Vec::new();
+        for b in &bases {
+            let joined = |name: &str| {
+                if b.is_empty() {
+                    name.to_string()
+                } else if b.ends_with('/') {
+                    format!("{b}{name}")
+                } else {
+                    format!("{b}/{name}")
+                }
+            };
+            if !has_wild(seg) {
+                let cand = joined(seg);
+                let dir_for_read = if b.is_empty() { "." } else { b.as_str() };
+                let exists = std::path::Path::new(&cand).exists()
+                    || std::path::Path::new(dir_for_read).join(seg).exists();
+                if exists && (!last || true) {
+                    next.push(cand);
+                }
+                continue;
+            }
+            let dir = if b.is_empty() { ".".to_string() } else { b.clone() };
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if seg_match(&name, seg) && (last || e.path().is_dir()) {
+                        next.push(joined(&name));
+                    }
+                }
+            }
+        }
+        bases = next;
+        if bases.is_empty() {
+            break;
+        }
+    }
+    // final existence filter for fully-literal patterns
+    bases.retain(|p| std::path::Path::new(p).exists());
+    bases
+}
+
+/// PHP's lenient parse_url. Returns None for the cases PHP reports `false`
+/// (empty host after `//`, out-of-range port). Only present components appear
+/// in the array, matching PHP.
+fn php_parse_url(url: &[u8]) -> Option<Arr> {
+    let mut arr = Arr::new();
+    let mut s = url;
+    let mut push = |arr: &mut Arr, k: &[u8], v: Value| arr.insert(Key::Str(k.to_vec()), v);
+    // fragment and query split off the tail first
+    let mut fragment: Option<&[u8]> = None;
+    if let Some(i) = s.iter().position(|&b| b == b'#') {
+        fragment = Some(&s[i + 1..]);
+        s = &s[..i];
+    }
+    let mut query: Option<&[u8]> = None;
+    if let Some(i) = s.iter().position(|&b| b == b'?') {
+        query = Some(&s[i + 1..]);
+        s = &s[..i];
+    }
+    // scheme: [alpha][alnum+.-]* ':'
+    let mut scheme: Option<&[u8]> = None;
+    if let Some(i) = s.iter().position(|&b| b == b':') {
+        let cand = &s[..i];
+        let valid = !cand.is_empty()
+            && cand[0].is_ascii_alphabetic()
+            && cand
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-'));
+        if valid {
+            let rest = &s[i + 1..];
+            // "host:81/x" (port digits, no //) is host:port, not a scheme
+            let port_like = {
+                let digits: &[u8] = match rest.iter().position(|&b| b == b'/') {
+                    Some(j) => &rest[..j],
+                    None => rest,
+                };
+                !digits.is_empty() && digits.iter().all(|b| b.is_ascii_digit())
+            };
+            if !port_like {
+                scheme = Some(cand);
+                s = rest;
+            }
+        }
+    }
+    let has_authority = s.starts_with(b"//");
+    if has_authority {
+        s = &s[2..];
+        let (auth, path) = match s.iter().position(|&b| b == b'/') {
+            Some(i) => (&s[..i], &s[i..]),
+            None => (s, &b""[..]),
+        };
+        // PHP's key order is scheme, host, port, user, pass, path — hold
+        // userinfo until host/port are in
+        let mut hostport = auth;
+        let mut userinfo: Option<&[u8]> = None;
+        if let Some(i) = auth.iter().rposition(|&b| b == b'@') {
+            userinfo = Some(&auth[..i]);
+            hostport = &auth[i + 1..];
+        }
+        if let Some(sc) = scheme.take() {
+            push(&mut arr, b"scheme", Value::Str(sc.to_vec()));
+        }
+        // IPv6 literal keeps its brackets out of the port split
+        let (host, port) = if hostport.starts_with(b"[") {
+            match hostport.iter().position(|&b| b == b']') {
+                Some(i) => {
+                    let rest = &hostport[i + 1..];
+                    match rest.first() {
+                        Some(b':') => (&hostport[..i + 1], Some(&rest[1..])),
+                        _ => (hostport, None),
+                    }
+                }
+                None => (hostport, None),
+            }
+        } else {
+            match hostport.iter().rposition(|&b| b == b':') {
+                Some(i) => (&hostport[..i], Some(&hostport[i + 1..])),
+                None => (hostport, None),
+            }
+        };
+        if host.is_empty() {
+            return None;
+        }
+        push(&mut arr, b"host", Value::Str(host.to_vec()));
+        if let Some(p) = port {
+            if !p.is_empty() {
+                let n: i64 = String::from_utf8_lossy(p).parse().ok()?;
+                if !(0..=65535).contains(&n) {
+                    return None;
+                }
+                push(&mut arr, b"port", Value::Int(n));
+            }
+        }
+        if let Some(ui) = userinfo {
+            match ui.iter().position(|&b| b == b':') {
+                Some(j) => {
+                    push(&mut arr, b"user", Value::Str(ui[..j].to_vec()));
+                    push(&mut arr, b"pass", Value::Str(ui[j + 1..].to_vec()));
+                }
+                None => push(&mut arr, b"user", Value::Str(ui.to_vec())),
+            }
+        }
+        if !path.is_empty() {
+            push(&mut arr, b"path", Value::Str(path.to_vec()));
+        }
+    } else {
+        // host:port with no scheme ("localhost:81/x")
+        let mut done = false;
+        if scheme.is_none() {
+            if let Some(i) = s.iter().position(|&b| b == b':') {
+                let rest = &s[i + 1..];
+                let (digits, path): (&[u8], &[u8]) = match rest.iter().position(|&b| b == b'/') {
+                    Some(j) => (&rest[..j], &rest[j..]),
+                    None => (rest, &b""[..]),
+                };
+                if !digits.is_empty() && digits.iter().all(|b| b.is_ascii_digit()) {
+                    let n: i64 = String::from_utf8_lossy(digits).parse().ok()?;
+                    if !(0..=65535).contains(&n) {
+                        return None;
+                    }
+                    if s[..i].is_empty() {
+                        return None;
+                    }
+                    push(&mut arr, b"host", Value::Str(s[..i].to_vec()));
+                    push(&mut arr, b"port", Value::Int(n));
+                    if !path.is_empty() {
+                        push(&mut arr, b"path", Value::Str(path.to_vec()));
+                    }
+                    done = true;
+                }
+            }
+        }
+        if !done {
+            if let Some(sc) = scheme.take() {
+                push(&mut arr, b"scheme", Value::Str(sc.to_vec()));
+            }
+            if !s.is_empty() {
+                push(&mut arr, b"path", Value::Str(s.to_vec()));
+            }
+        }
+    }
+    if let Some(q) = query {
+        push(&mut arr, b"query", Value::Str(q.to_vec()));
+    }
+    if let Some(f) = fragment {
+        push(&mut arr, b"fragment", Value::Str(f.to_vec()));
+    }
+    if arr.len() == 0 {
+        return None;
+    }
+    Some(arr)
+}
+
 fn replace_bytes_ci(subject: &[u8], search: &[u8], replace: &[u8], ci: bool) -> Vec<u8> {
-    if !ci {
-        return replace_bytes(subject, search, replace);
-    }
+    replace_bytes_ci_n(subject, search, replace, ci).0
+}
+
+/// Counting variant — the count feeds str_replace's by-ref 4th parameter.
+fn replace_bytes_ci_n(subject: &[u8], search: &[u8], replace: &[u8], ci: bool) -> (Vec<u8>, i64) {
     if search.is_empty() {
-        return subject.to_vec();
+        return (subject.to_vec(), 0);
     }
-    let ls = search.to_ascii_lowercase();
+    let ls = if ci { search.to_ascii_lowercase() } else { search.to_vec() };
     let mut out = Vec::new();
+    let mut n = 0i64;
     let mut i = 0;
     while i < subject.len() {
-        if i + ls.len() <= subject.len()
-            && subject[i..i + ls.len()].to_ascii_lowercase() == ls
-        {
+        let hit = i + ls.len() <= subject.len()
+            && if ci {
+                subject[i..i + ls.len()].to_ascii_lowercase() == ls
+            } else {
+                subject[i..i + ls.len()] == ls[..]
+            };
+        if hit {
             out.extend_from_slice(replace);
             i += ls.len();
+            n += 1;
         } else {
             out.push(subject[i]);
             i += 1;
         }
     }
-    out
+    (out, n)
 }
 
 fn replace_bytes(subject: &[u8], search: &[u8], replace: &[u8]) -> Vec<u8> {
@@ -11026,6 +11764,24 @@ fn php_const(n: &str) -> Option<Value> {
         "DATE_COOKIE" => Str(b"l, d-M-Y H:i:s T".to_vec()),
         "DATE_RSS" => Str(b"D, d M Y H:i:s O".to_vec()),
         "DATE_W3C" => Str(b"Y-m-d\\TH:i:sP".to_vec()),
+        // glob() flags (Linux values — the engine emulates PHP-on-Unix)
+        "GLOB_ERR" => Int(1),
+        "GLOB_MARK" => Int(2),
+        "GLOB_NOSORT" => Int(4),
+        "GLOB_NOCHECK" => Int(16),
+        "GLOB_NOESCAPE" => Int(64),
+        "GLOB_BRACE" => Int(1024),
+        "GLOB_ONLYDIR" => Int(8192),
+        "GLOB_AVAILABLE_FLAGS" => Int(9303),
+        // parse_url() component selectors
+        "PHP_URL_SCHEME" => Int(0),
+        "PHP_URL_HOST" => Int(1),
+        "PHP_URL_PORT" => Int(2),
+        "PHP_URL_USER" => Int(3),
+        "PHP_URL_PASS" => Int(4),
+        "PHP_URL_PATH" => Int(5),
+        "PHP_URL_QUERY" => Int(6),
+        "PHP_URL_FRAGMENT" => Int(7),
         "PHP_INT_MAX" => Int(i64::MAX),
         "PHP_INT_MIN" => Int(i64::MIN),
         "PHP_INT_SIZE" => Int(8),
