@@ -79,6 +79,7 @@ static GLOBAL: capped_alloc::Capped = capped_alloc::Capped;
 // date/time math.
 mod bcmath;
 mod datetime;
+pub(crate) mod pdo;
 mod hash;
 mod regex;
 pub(crate) mod tz;

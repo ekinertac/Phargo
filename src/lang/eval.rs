@@ -217,6 +217,115 @@ class UnderflowException extends RuntimeException {}
 class OverflowException extends RuntimeException {}
 class JsonException extends Exception {}
 
+class PDOException extends RuntimeException {
+    public $errorInfo = null;
+}
+class PDO {
+    const FETCH_LAZY = 1; const FETCH_ASSOC = 2; const FETCH_NUM = 3;
+    const FETCH_BOTH = 4; const FETCH_OBJ = 5; const FETCH_COLUMN = 7;
+    const FETCH_KEY_PAIR = 12; const FETCH_DEFAULT = 0;
+    const PARAM_NULL = 0; const PARAM_INT = 1; const PARAM_STR = 2;
+    const PARAM_LOB = 3; const PARAM_BOOL = 5;
+    const ATTR_ERRMODE = 3; const ERRMODE_SILENT = 0; const ERRMODE_WARNING = 1;
+    const ERRMODE_EXCEPTION = 2; const ATTR_DEFAULT_FETCH_MODE = 19;
+    const ATTR_DRIVER_NAME = 16; const ATTR_STRINGIFY_FETCHES = 17;
+    public $__h; public $__fetchmode = 4; public $__attrs = [];
+    public function __construct($dsn, $user = null, $pass = null, $options = null) {
+        if (strpos($dsn, "sqlite:") !== 0) {
+            throw new PDOException("could not find driver");
+        }
+        $this->__h = __pdo_open(substr($dsn, 7));
+    }
+    public function exec($sql) { $r = __pdo_query($this->__h, $sql, []); return $r["affected"]; }
+    public function prepare($sql, $options = []) { return new PDOStatement($this->__h, $sql, $this->__fetchmode); }
+    public function query($sql, $mode = null) {
+        $st = new PDOStatement($this->__h, $sql, $mode ?? $this->__fetchmode);
+        $st->execute();
+        return $st;
+    }
+    public function lastInsertId($name = null) { return (string)__pdo_lastid($this->__h); }
+    public function quote($s, $type = 2) { return "'" . str_replace("'", "''", (string)$s) . "'"; }
+    public function beginTransaction() { $this->exec("BEGIN"); return true; }
+    public function commit() { $this->exec("COMMIT"); return true; }
+    public function rollBack() { $this->exec("ROLLBACK"); return true; }
+    public function inTransaction() { return false; }
+    public function setAttribute($k, $v) {
+        if ($k == self::ATTR_DEFAULT_FETCH_MODE) { $this->__fetchmode = $v; }
+        $this->__attrs[$k] = $v;
+        return true;
+    }
+    public function getAttribute($k) {
+        if ($k == self::ATTR_DRIVER_NAME) { return "sqlite"; }
+        return $this->__attrs[$k] ?? null;
+    }
+    public function errorInfo() { return ["00000", null, null]; }
+    public function errorCode() { return "00000"; }
+    public static function getAvailableDrivers() { return ["sqlite"]; }
+}
+class PDOStatement implements IteratorAggregate {
+    public $queryString;
+    public $__h; public $__mode; public $__cols = []; public $__rows = [];
+    public $__pos = 0; public $__affected = 0; public $__bound = [];
+    public function __construct($h, $sql, $mode = 4) {
+        $this->__h = $h; $this->queryString = $sql; $this->__mode = $mode;
+    }
+    public function bindValue($key, $value, $type = 2) {
+        $this->__bound[is_int($key) ? $key : (int)ltrim($key, ":")] = $value;
+        return true;
+    }
+    public function bindParam($key, &$value, $type = 2) { return $this->bindValue($key, $value, $type); }
+    public function execute($params = null) {
+        $p = [];
+        if (is_array($params)) { foreach ($params as $v) { $p[] = $v; } }
+        else { ksort($this->__bound); foreach ($this->__bound as $v) { $p[] = $v; } }
+        $r = __pdo_query($this->__h, $this->queryString, $p);
+        $this->__cols = $r["cols"]; $this->__rows = $r["rows"];
+        $this->__affected = $r["affected"]; $this->__pos = 0;
+        return true;
+    }
+    private function __shape($row, $mode) {
+        if ($mode == 3) { return $row; }
+        $assoc = [];
+        foreach ($this->__cols as $i => $c) { $assoc[$c] = $row[$i]; }
+        if ($mode == 2) { return $assoc; }
+        if ($mode == 5) { return (object)$assoc; }
+        // FETCH_BOTH
+        $both = $assoc;
+        foreach ($row as $i => $v) { $both[$i] = $v; }
+        return $both;
+    }
+    public function fetch($mode = null) {
+        if ($this->__pos >= count($this->__rows)) { return false; }
+        $row = $this->__rows[$this->__pos]; $this->__pos++;
+        return $this->__shape($row, $mode ?? $this->__mode);
+    }
+    public function fetchAll($mode = null, $arg = null) {
+        $m = $mode ?? $this->__mode;
+        $out = [];
+        while ($this->__pos < count($this->__rows)) {
+            $row = $this->__rows[$this->__pos]; $this->__pos++;
+            if ($m == 7) { $out[] = $row[$arg ?? 0]; }
+            else { $out[] = $this->__shape($row, $m); }
+        }
+        return $out;
+    }
+    public function fetchColumn($n = 0) {
+        if ($this->__pos >= count($this->__rows)) { return false; }
+        $row = $this->__rows[$this->__pos]; $this->__pos++;
+        return $row[$n] ?? false;
+    }
+    public function fetchObject($class = null) { return $this->fetch(5); }
+    public function rowCount() { return $this->__affected; }
+    public function columnCount() { return count($this->__cols); }
+    public function closeCursor() { $this->__pos = count($this->__rows); return true; }
+    public function setFetchMode($mode) { $this->__mode = $mode; return true; }
+    public function getIterator(): Iterator {
+        $out = [];
+        while (($r = $this->fetch()) !== false) { $out[] = $r; }
+        return new ArrayIterator($out);
+    }
+    public function errorInfo() { return ["00000", null, null]; }
+}
 enum RoundingMode {
     case HalfAwayFromZero;
     case HalfTowardsZero;
@@ -2078,6 +2187,7 @@ impl Eval {
         // Internal setup (prelude classes, std streams) is done; number the user
         // program's objects from #1, as PHP does.
         super::value::reset_object_ids();
+        crate::pdo::reset();
         e.hoist(program);
         match e.exec_block(program) {
             Ok(_) => {
@@ -8667,6 +8777,70 @@ impl Eval {
                     .unwrap_or_default()
                     .into_bytes(),
             ),
+            // ---- PDO/SQLite bridge (src/pdo.rs; prelude PDO classes) ----
+            "__pdo_open" => {
+                let path = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                match crate::pdo::open(&path) {
+                    Ok(id) => Value::Int(id),
+                    Err(e) => {
+                        return Err(self.throw_error(
+                            "PDOException",
+                            &format!("SQLSTATE[HY000] [14] {e}"),
+                        ))
+                    }
+                }
+            }
+            "__pdo_query" => {
+                let id = to_i64(&a(0));
+                let sql = String::from_utf8_lossy(&to_bytes(&a(1))).into_owned();
+                let mut params: Vec<crate::pdo::SqlVal> = Vec::new();
+                if let Value::Array(pa) = &a(2) {
+                    for (_, v) in &pa.entries {
+                        params.push(match v {
+                            Value::Null => crate::pdo::SqlVal::Null,
+                            Value::Int(n) => crate::pdo::SqlVal::Int(*n),
+                            Value::Float(f) => crate::pdo::SqlVal::Real(*f),
+                            Value::Bool(b) => crate::pdo::SqlVal::Int(*b as i64),
+                            other => crate::pdo::SqlVal::Text(to_bytes(other)),
+                        });
+                    }
+                }
+                match crate::pdo::query(id, &sql, params) {
+                    Ok((cols, rows, affected)) => {
+                        let mut carr = Arr::new();
+                        for c in cols {
+                            carr.push(Value::Str(c.into_bytes()));
+                        }
+                        let mut rarr = Arr::new();
+                        for row in rows {
+                            let mut r = Arr::new();
+                            for v in row {
+                                r.push(match v {
+                                    crate::pdo::SqlVal::Null => Value::Null,
+                                    crate::pdo::SqlVal::Int(n) => Value::Int(n),
+                                    crate::pdo::SqlVal::Real(f) => Value::Float(f),
+                                    crate::pdo::SqlVal::Text(t) => Value::Str(t),
+                                    crate::pdo::SqlVal::Blob(b) => Value::Str(b),
+                                });
+                            }
+                            rarr.push(Value::Array(r));
+                        }
+                        let mut out = Arr::new();
+                        out.insert(Key::Str(b"cols".to_vec()), Value::Array(carr));
+                        out.insert(Key::Str(b"rows".to_vec()), Value::Array(rarr));
+                        out.insert(Key::Str(b"affected".to_vec()), Value::Int(affected as i64));
+                        Value::Array(out)
+                    }
+                    Err(e) => {
+                        return Err(self.throw_error(
+                            "PDOException",
+                            &format!("SQLSTATE[HY000]: General error: 1 {e}"),
+                        ))
+                    }
+                }
+            }
+            "__pdo_lastid" => Value::Int(crate::pdo::last_insert_id(to_i64(&a(0)))),
+            "__pdo_close" => Value::Bool(crate::pdo::close(to_i64(&a(0)))),
             "__phargo_tz_offset" => {
                 let tzname = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 let ts = to_i64(&a(1));
@@ -9762,6 +9936,7 @@ impl Eval {
             "session_status" => Value::Int(1), // PHP_SESSION_NONE
             "session_save_path" | "session_module_name" => Value::Str(Vec::new()),
             "session_get_cookie_params" => Value::Array(Arr::new()),
+            "php_sapi_name" => Value::Str(b"cli".to_vec()),
             "date_default_timezone_get" => Value::Str(self.default_tz.clone().into_bytes()),
             "debug_backtrace" => Value::Array(Arr::new()),
             "gc_collect_cycles" | "http_response_code" | "getmypid" | "hrtime" => Value::Int(0),
@@ -10725,6 +10900,7 @@ fn php_const(n: &str) -> Option<Value> {
     let sep = if cfg!(windows) { "\\" } else { "/" };
     Some(match n {
         "PHP_EOL" => Str(b"\n".to_vec()),
+        "PHP_SAPI" => Str(b"cli".to_vec()),
         // date() format-string presets (also DateTimeInterface class constants)
         "DATE_ATOM" => Str(b"Y-m-d\\TH:i:sP".to_vec()),
         "DATE_ISO8601" => Str(b"Y-m-d\\TH:i:sO".to_vec()),

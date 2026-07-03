@@ -43,11 +43,13 @@ confirmed by measurement rather than assumed:
 - `preg_*` completeness against WP's regex diet (our from-scratch engine's
   gaps get their own analyzer pass).
 - mbstring subset WP actually calls; `sprintf`/`number_format` exactness.
-- **Database decision (open, needs an explicit call):** Playground's scope
-  is SQLite via `pdo_sqlite`. Options: (a) take `rusqlite` as the one
-  permitted native dependency, (b) target the same SQLite-WASM boundary
-  Playground uses, (c) from-scratch subset (rejected: not worth it).
-  Decide when the WP oracle first hits `wpdb`.
+- **Database decision — RESOLVED 2026-07-07 (user call): Option A.**
+  `rusqlite` (bundled SQLite) is the one permitted native dependency,
+  behind our own PDO/pdo_sqlite/SQLite3 PHP API surface. Rationale:
+  fastest to a rendered WP page; SQLite builds for wasm32 so the choice
+  survives Phase 3; unlocks ext/pdo + ext/sqlite3 corpus tests. The wpdb
+  translation layer comes free via WordPress's own SQLite-integration
+  plugin (pure PHP) through the db.php drop-in.
 - Corpus rungs continue **only** where cheap or WP-overlapping. The
   tokenizer ext (~55 tests) is explicitly *deprioritized*: zero WP value.
 

@@ -5,5 +5,8 @@ edition = "2021"
 description = "Phargo — a from-scratch, memory-safe PHP engine in Rust. AI-assisted, built in public."
 license = "MIT OR Apache-2.0"
 
-# v0 is deliberately dependency-free: fast builds, nothing to explain, easy to audit.
+# One vetted native dependency (ROADMAP decision 2026-07-07, user-approved):
+# bundled SQLite behind our own PDO/SQLite3 PHP API surface. Everything else
+# stays from-scratch: fast builds, nothing to explain, easy to audit.
 [dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }

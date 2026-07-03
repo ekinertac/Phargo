@@ -50,6 +50,18 @@ fn scan() {
     if !cfg.exists() {
         std::fs::write(&cfg, WP_CONFIG).expect("write wp-config");
     }
+    // decision-neutral db.php drop-in: defers the mysqli check (WP's own
+    // escape hatch) so the oracle can surface post-DB blockers while the
+    // real database strategy (ROADMAP open decision) is settled.
+    let dbphp = wp.join("wp-content").join("db.php");
+    if !dbphp.exists() {
+        std::fs::write(
+            &dbphp,
+            "<?php // Phargo oracle stub: real db layer TBD (docs/ROADMAP.md).
+",
+        )
+        .expect("write db.php");
+    }
 
     // the driver script: SAPI fixture + the real WP entry chain
     let driver = format!(

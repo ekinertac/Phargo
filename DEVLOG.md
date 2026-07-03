@@ -27,6 +27,28 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-07 (night) — The database decision, and PDO is born
+
+**Pass rate: 3633 → 3639. The dependency count: 0 → 1.**
+
+The WP oracle marched from `version_compare` through `PHP_SAPI` straight to
+`wpdb->db_connect()` — the wall the roadmap predicted. Decision made (user
+call, recorded in ROADMAP): **rusqlite, bundled, as the one permitted native
+dependency**, wrapped by our own PHP API surface. The reasoning: fastest to
+a rendered WordPress page, SQLite builds for wasm32 so Phase 3 doesn't
+reopen the question, and ext/pdo stops being out-of-scope.
+
+`src/pdo.rs` is the entire native boundary: a thread-local connection
+registry and a query call that prepares, binds positionally, and buffers
+rows (no statement-lifetime gymnastics). Everything above it is prelude PHP:
+`PDO`, `PDOStatement` (fetch modes ASSOC/NUM/BOTH/OBJ/COLUMN, transactions,
+quoting, iteration), `PDOException`. First live query, first
+`lastInsertId()`, first ext/pdo_sqlite passes (2 → 7). Next: WordPress's
+own SQLite-integration plugin as the real db.php drop-in — pure PHP that
+translates wpdb's MySQL onto this PDO.
+
+---
+
 ## 2026-07-07 (later) — The second oracle flies: WordPress meets Phargo
 
 **Pass rate: 3630 → 3633. WP bootstrap: line 0 → past the version gate.**
