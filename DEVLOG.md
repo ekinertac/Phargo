@@ -27,6 +27,26 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-05 (night) — BcMath\Number, and trim() was ignoring its charlist
+
+**Pass rate: 3549 → 3583.**
+
+PHP 8.4's object bcmath API: `BcMath\Number` lives in the prelude as our
+first *namespaced* prelude class (dogfooding the new namespace support), with
+immutable add/sub/mul/div/mod/pow/powmod/sqrt/floor/ceil/round/compare and —
+the fun part — **operator overloading**: `$a + $b` on Number objects routes
+through a dispatch at the top of `apply_bin` into the same decimal-bignum
+core. Plus bcfloor/bcceil/bcround/bcpowmod/bcdivmod. ext/bcmath 43 → 72.
+
+The incidental discovery came from Number's output looking wrong:
+`rtrim("2.5000", "0")` returned "2.5000" — **trim/ltrim/rtrim had ignored
+their charlist argument since forever**, silently trimming whitespace
+instead. Now they take real charlists including PHP's `a..z` range syntax.
+ext/standard +5 from that alone; the fifth silently-hollow builtin this
+climb has surfaced.
+
+---
+
 ## 2026-07-05 (later still) — bcmath from scratch; 16% crossed
 
 **Pass rate: 3497 → 3549 — biggest batch since the harness fix.**

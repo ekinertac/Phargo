@@ -217,6 +217,46 @@ class UnderflowException extends RuntimeException {}
 class OverflowException extends RuntimeException {}
 class JsonException extends Exception {}
 
+namespace BcMath {
+    class Number {
+        public $value;
+        public $scale;
+        public function __construct($num) {
+            if (is_int($num)) { $num = (string)$num; }
+            $this->value = bcadd($num, "0", __phargo_bcscale_of($num));
+            $this->scale = __phargo_bcscale_of($this->value);
+        }
+        private function __wrap($v) { return new \BcMath\Number($v); }
+        private function __sc($other, $extra = 0) {
+            $o = $other instanceof \BcMath\Number ? $other->scale : __phargo_bcscale_of((string)$other);
+            return max($this->scale, $o) + $extra;
+        }
+        private function __val($other) {
+            return $other instanceof \BcMath\Number ? $other->value : (string)$other;
+        }
+        private function __trim($v) {
+            if (strpos($v, ".") !== false) { $v = rtrim(rtrim($v, "0"), "."); }
+            return $v === "" || $v === "-" ? "0" : $v;
+        }
+        public function add($n, $scale = null) { return $this->__wrap(bcadd($this->value, $this->__val($n), $scale ?? $this->__sc($n))); }
+        public function sub($n, $scale = null) { return $this->__wrap(bcsub($this->value, $this->__val($n), $scale ?? $this->__sc($n))); }
+        public function mul($n, $scale = null) {
+            $os = $n instanceof \BcMath\Number ? $n->scale : __phargo_bcscale_of((string)$n);
+            return $this->__wrap(bcmul($this->value, $this->__val($n), $scale ?? ($this->scale + $os)));
+        }
+        public function div($n, $scale = null) { return $this->__wrap($this->__trim(bcdiv($this->value, $this->__val($n), $scale ?? ($this->__sc($n) + 10)))); }
+        public function mod($n, $scale = null) { return $this->__wrap(bcmod($this->value, $this->__val($n), $scale ?? $this->__sc($n))); }
+        public function pow($n, $scale = null) { return $this->__wrap($this->__trim(bcpow($this->value, $this->__val($n), $scale ?? ($this->scale * 4 + 10)))); }
+        public function powmod($e, $m) { return $this->__wrap(bcpowmod($this->value, $this->__val($e), $this->__val($m))); }
+        public function sqrt($scale = null) { return $this->__wrap($this->__trim(bcsqrt($this->value, $scale ?? ($this->scale + 10)))); }
+        public function floor() { return $this->__wrap(bcfloor($this->value)); }
+        public function ceil() { return $this->__wrap(bcceil($this->value)); }
+        public function round($precision = 0) { return $this->__wrap(bcround($this->value, $precision)); }
+        public function compare($n, $scale = null) { return bccomp($this->value, $this->__val($n), $scale ?? $this->__sc($n)); }
+        public function __toString() { return $this->value; }
+    }
+}
+namespace {
 interface DateTimeInterface {
     const ATOM = 'Y-m-d\TH:i:sP';
     const ISO8601 = 'Y-m-d\TH:i:sO';
@@ -1324,6 +1364,8 @@ class SimpleXMLAttrs implements Iterator, ArrayAccess, Countable {
     public function current(): mixed { return $this->__a[$this->__keys[$this->__p]]; }
     public function key(): mixed { return $this->__keys[$this->__p]; }
     public function next(): void { $this->__p = $this->__p + 1; }
+}
+
 }
 "##;
 
@@ -3079,6 +3121,28 @@ impl Eval {
         use BinOp::*;
         // PHP 8: arrays (and non-Stringable objects) are unsupported operands for
         // arithmetic/bitwise ops — TypeError, except array + array (union).
+        // BcMath\Number overloads arithmetic: dispatch to the bc ops and wrap
+        let is_num_obj = |v: &Value| matches!(v, Value::Object(rc) if rc.borrow().class.eq_ignore_ascii_case("BcMath\\Number"));
+        if (is_num_obj(l) || is_num_obj(r)) && matches!(op, Add | Sub | Mul | Div | Mod | Pow) {
+            let method = match op {
+                Add => "add",
+                Sub => "sub",
+                Mul => "mul",
+                Div => "div",
+                Mod => "mod",
+                _ => "pow",
+            };
+            let lift = |ev: &mut Self, v: &Value| -> R<Value> {
+                if is_num_obj(v) {
+                    Ok(v.clone())
+                } else {
+                    ev.instantiate("BcMath\\Number", vec![v.clone()])
+                }
+            };
+            let lo = lift(self, l)?;
+            let ro = lift(self, r)?;
+            return self.call_method(lo, method, vec![ro]);
+        }
         let arith = matches!(op, Add | Sub | Mul | Div | Mod | Pow | BitAnd | BitOr | BitXor | Shl | Shr);
         if arith {
             let bad = |v: &Value| matches!(v, Value::Array(_));
@@ -6067,6 +6131,73 @@ impl Eval {
                     }
                 }
             }
+            "bcfloor" | "bcceil" => {
+                let Some(x) = crate::bc::Dec::parse(&String::from_utf8_lossy(&to_bytes(&a(0)))) else {
+                    return Err(self.throw_error(
+                        "ValueError",
+                        &format!("{name}(): Argument #1 ($num) is not well-formed"),
+                    ));
+                };
+                let r = if name == "bcfloor" { crate::bc::floor(&x) } else { crate::bc::ceil(&x) };
+                Value::Str(r.to_string_scaled(0).into_bytes())
+            }
+            "bcround" => {
+                let Some(x) = crate::bc::Dec::parse(&String::from_utf8_lossy(&to_bytes(&a(0)))) else {
+                    return Err(self.throw_error(
+                        "ValueError",
+                        "bcround(): Argument #1 ($num) is not well-formed",
+                    ));
+                };
+                let prec = if args.len() > 1 { to_i64(&a(1)).max(0) as usize } else { 0 };
+                let r = crate::bc::round(&x, prec.min(100_000));
+                Value::Str(r.to_string_scaled(prec.min(100_000)).into_bytes())
+            }
+            "bcpowmod" => {
+                let parse = |v: &Value| crate::bc::Dec::parse(&String::from_utf8_lossy(&to_bytes(v)));
+                let (Some(b), Some(e), Some(m)) = (parse(&a(0)), parse(&a(1)), parse(&a(2))) else {
+                    return Err(self.throw_error(
+                        "ValueError",
+                        "bcpowmod(): argument is not well-formed",
+                    ));
+                };
+                match crate::bc::powmod(&b, &e, &m) {
+                    Some(r) => Value::Str(r.to_string_scaled(0).into_bytes()),
+                    None => {
+                        return Err(self.throw_error("DivisionByZeroError", "Modulo by zero"))
+                    }
+                }
+            }
+            "bcdivmod" => {
+                let parse = |v: &Value| crate::bc::Dec::parse(&String::from_utf8_lossy(&to_bytes(v)));
+                let (Some(x), Some(y)) = (parse(&a(0)), parse(&a(1))) else {
+                    return Err(self.throw_error(
+                        "ValueError",
+                        "bcdivmod(): argument is not well-formed",
+                    ));
+                };
+                if y.is_zero() {
+                    return Err(self.throw_error("DivisionByZeroError", "Division by zero"));
+                }
+                let scale = if args.len() > 2 { to_i64(&a(2)).max(0) as usize } else { self.bc_scale };
+                let q = crate::bc::div(&x, &y, 0).unwrap_or_else(crate::bc::Dec::zero);
+                let r = crate::bc::modulo(&x, &y, scale).unwrap_or_else(crate::bc::Dec::zero);
+                let mut arr = Arr::new();
+                arr.push(Value::Str(q.to_string_scaled(0).into_bytes()));
+                arr.push(Value::Str(r.to_string_scaled(scale).into_bytes()));
+                Value::Array(arr)
+            }
+            "__phargo_bcscale_of" => {
+                let raw = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                match crate::bc::Dec::parse(&raw) {
+                    Some(d) => Value::Int(d.scale as i64),
+                    None => {
+                        return Err(self.throw_error(
+                            "ValueError",
+                            "BcMath\\Number::__construct(): Argument #1 ($num) is not well-formed",
+                        ))
+                    }
+                }
+            }
             "bcscale" => {
                 let old = self.bc_scale as i64;
                 if !args.is_empty() {
@@ -6188,9 +6319,47 @@ impl Eval {
                 }
                 Value::Str(b)
             }
-            "trim" => Value::Str(trim_bytes(&to_bytes(&a(0)), true, true)),
-            "ltrim" => Value::Str(trim_bytes(&to_bytes(&a(0)), true, false)),
-            "rtrim" | "chop" => Value::Str(trim_bytes(&to_bytes(&a(0)), false, true)),
+            "trim" | "ltrim" | "rtrim" | "chop" => {
+                let (left, right) = match name {
+                    "ltrim" => (true, false),
+                    "rtrim" | "chop" => (false, true),
+                    _ => (true, true),
+                };
+                let sbytes = to_bytes(&a(0));
+                if args.len() > 1 {
+                    // explicit charlist, with PHP's `a..z` range syntax
+                    let list = to_bytes(&a(1));
+                    let mut set = [false; 256];
+                    let mut i = 0;
+                    while i < list.len() {
+                        if i + 3 < list.len() && list[i + 1] == b'.' && list[i + 2] == b'.' {
+                            let (lo, hi) = (list[i], list[i + 3]);
+                            for c in lo..=hi {
+                                set[c as usize] = true;
+                            }
+                            i += 4;
+                        } else {
+                            set[list[i] as usize] = true;
+                            i += 1;
+                        }
+                    }
+                    let mut start = 0;
+                    let mut end = sbytes.len();
+                    if left {
+                        while start < end && set[sbytes[start] as usize] {
+                            start += 1;
+                        }
+                    }
+                    if right {
+                        while end > start && set[sbytes[end - 1] as usize] {
+                            end -= 1;
+                        }
+                    }
+                    Value::Str(sbytes[start..end].to_vec())
+                } else {
+                    Value::Str(trim_bytes(&sbytes, left, right))
+                }
+            }
             "str_repeat" => {
                 let s = to_bytes(&a(0));
                 let n = to_i64(&a(1)).max(0) as usize;

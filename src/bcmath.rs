@@ -434,6 +434,70 @@ pub fn sqrt(a: &Dec, scale: usize) -> Option<Dec> {
     Some(x.with_scale(scale))
 }
 
+/// floor toward -infinity, as an integer (scale 0).
+pub fn floor(a: &Dec) -> Dec {
+    let t = a.with_scale(0); // truncation toward zero
+    if a.neg && cmp(&t, a) != std::cmp::Ordering::Equal {
+        sub(&t, &Dec::parse("1").unwrap())
+    } else {
+        t
+    }
+}
+
+/// ceil toward +infinity, as an integer (scale 0).
+pub fn ceil(a: &Dec) -> Dec {
+    let t = a.with_scale(0);
+    if !a.neg && cmp(&t, a) != std::cmp::Ordering::Equal {
+        add(&t, &Dec::parse("1").unwrap())
+    } else {
+        t
+    }
+}
+
+/// Round half away from zero to `precision` decimals (PHP bcround default).
+pub fn round(a: &Dec, precision: usize) -> Dec {
+    if a.scale <= precision {
+        return a.with_scale(precision);
+    }
+    // add 5 at the digit position after the cut, in the operand's sign
+    let mut nudge = Dec { neg: a.neg, digits: vec![5], scale: precision + 1 };
+    nudge.trim();
+    add(a, &nudge).with_scale(precision)
+}
+
+/// (base^exp) mod m over integers — modular exponentiation with reduction at
+/// each step so intermediate values stay bounded.
+pub fn powmod(base: &Dec, exp: &Dec, m: &Dec) -> Option<Dec> {
+    if m.is_zero() {
+        return None;
+    }
+    let (b0, e0, m0) = (base.with_scale(0), exp.with_scale(0), m.with_scale(0));
+    if e0.neg {
+        return None;
+    }
+    let mut result = Dec::parse("1").unwrap();
+    let mut b = modulo(&b0, &m0, 0)?;
+    // walk exponent bits by repeated halving
+    let mut e = e0;
+    let two = Dec::parse("2").unwrap();
+    let mut guard = 0;
+    while !e.is_zero() {
+        guard += 1;
+        if guard > 10_000 {
+            return None;
+        }
+        let half = div(&e, &two, 0)?;
+        let dbl = mul(&half, &two)?;
+        let odd = cmp(&dbl, &e) != std::cmp::Ordering::Equal;
+        if odd {
+            result = modulo(&mul(&result, &b)?, &m0, 0)?;
+        }
+        b = modulo(&mul(&b, &b)?, &m0, 0)?;
+        e = half;
+    }
+    Some(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,5 +516,13 @@ mod tests {
         assert_eq!(sqrt(&s("9"), 3).unwrap().to_string_scaled(3), "3.000");
         assert_eq!(sqrt(&s("2"), 10).unwrap().to_string_scaled(10), "1.4142135623");
         assert_eq!(cmp(&s("1.0"), &s("1")), std::cmp::Ordering::Equal);
+        assert_eq!(floor(&s("3.7")).to_string_scaled(0), "3");
+        assert_eq!(floor(&s("-3.2")).to_string_scaled(0), "-4");
+        assert_eq!(ceil(&s("3.2")).to_string_scaled(0), "4");
+        assert_eq!(ceil(&s("-3.7")).to_string_scaled(0), "-3");
+        assert_eq!(round(&s("2.5"), 0).to_string_scaled(0), "3");
+        assert_eq!(round(&s("-2.5"), 0).to_string_scaled(0), "-3");
+        assert_eq!(round(&s("1.2345"), 2).to_string_scaled(2), "1.23");
+        assert_eq!(powmod(&s("4"), &s("13"), &s("497")).unwrap().to_string_scaled(0), "445");
     }
 }
