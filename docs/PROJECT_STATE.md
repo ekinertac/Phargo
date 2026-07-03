@@ -156,13 +156,14 @@ is feature-priced:
    drifts (109), bool flips (30), int drifts (33). Singles, ~1-3 tests each.
 5. **Perf follow-up**: foreach_016 + phpdbg match grind minutes in the
    live-append/step-limit path.
-**WP oracle status (2026-07-07 night):** bootstrap runs from line 0 through
-version checks, SAPI fixup, the SQLite plugin's full load, PDO connection,
-MySQL-shim SQL functions — then burns 139 s / 20M steps inside real query
-translation. The blocker is now PERFORMANCE, not features: ~144k steps/sec
-on WP code vs ~5M steps/sec on corpus code. Profile the hot path (likely
-char-indexed string loops in the plugin's SQL lexer hitting O(n) string_char,
-or preg on long queries) before adding more surface.
+**WP oracle status (2026-07-08):** perf wall demolished — the
+arrayaccess_obj property-clone fix took bootstrap 136s → 2.8s (48×). Next
+blocker, precisely localized: the SQLite plugin's SQL LEXER spins without
+net-advancing (class-wp-sqlite-lexer.php, backtracking via $this->last —
+some string builtin we return wrong makes parse* never consume). Repro:
+PHARGO_STEP_LIMIT=100000000 cargo run --release --example wpscan → death
+diagnoses itself at db.php:1489 in lex(). Probe the lexer in isolation on
+a trivial query first.
 
 Delegation notes: agents run clean off specs with file scope + literal
 expected outputs + numeric baselines (12 successful tasks so far, zero

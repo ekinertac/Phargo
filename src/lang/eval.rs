@@ -77,6 +77,8 @@ pub struct Eval {
     cur_line: u32,
     /// bcscale() default decimal precision for the bc* builtins.
     bc_scale: usize,
+    /// (class, method) → resolved Rc'd declaration; cleared on class changes.
+    method_cache: RefCell<HashMap<(String, String), Option<(String, Rc<MethodDecl>)>>>,
     /// Current namespace (lowercased, "" = global) and `use` alias map
     /// (alias-lower → FQ-lower). File-scoped: saved/restored across includes.
     cur_ns: String,
@@ -103,7 +105,7 @@ pub struct Eval {
     /// Classes currently being autoloaded (recursion guard, lowercased).
     autoload_active: HashSet<String>,
     /// Per-call argument stack, for func_get_args()/func_num_args().
-    cur_args: Vec<Vec<Value>>,
+    cur_args: Vec<Rc<Vec<Value>>>,
     /// Per-call function/method name stack, for __FUNCTION__/__METHOD__.
     cur_fn: Vec<String>,
     /// xorshift RNG state for rand()/mt_rand() (deterministic; tests rarely depend
@@ -1911,7 +1913,18 @@ class SimpleXMLAttrs implements Iterator, ArrayAccess, Countable {
 }
 "##;
 
-const STEP_LIMIT: u64 = 20_000_000;
+const STEP_LIMIT_DEFAULT: u64 = 20_000_000;
+thread_local! {
+    /// Overridable per-process (PHARGO_STEP_LIMIT env) — the WP oracle needs
+    /// far more than corpus tests; the default guard stays for the scoreboard.
+    static STEP_LIMIT_TL: u64 = std::env::var("PHARGO_STEP_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(STEP_LIMIT_DEFAULT);
+}
+fn step_limit() -> u64 {
+    STEP_LIMIT_TL.with(|v| *v)
+}
 /// Cap on single string allocations (concat, str_repeat) — stops memory bombs
 /// from pathological corpus tests (huge `.=` / `str_repeat` / `range`).
 const MAX_STR: usize = 64 * 1024 * 1024;
@@ -1951,6 +1964,7 @@ impl Eval {
             cur_ns: String::new(),
             use_map: HashMap::new(),
             bc_scale: 0,
+            method_cache: RefCell::new(HashMap::new()),
             frames: Vec::new(),
             prelude_fns: HashSet::new(),
             prelude_classes: HashSet::new(),
@@ -2322,6 +2336,7 @@ impl Eval {
                         }
                     }
                     self.classes.insert(c.name.to_ascii_lowercase(), Rc::new(c));
+                    self.method_cache.borrow_mut().clear();
                 }
                 _ => {}
             }
@@ -2409,8 +2424,18 @@ impl Eval {
 
     fn tick(&mut self) -> R<()> {
         self.steps += 1;
-        if self.steps > STEP_LIMIT {
-            return Err(RunError("step limit exceeded".into()));
+        if self.steps > step_limit() {
+            // self-diagnosing: where was execution when the budget died?
+            let fname = self.cur_fn.last().cloned().unwrap_or_default();
+            let file = self
+                .cur_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            return Err(RunError(format!(
+                "step limit exceeded at {file}:{} in {fname}()",
+                self.cur_line
+            )));
         }
         // Runaway-output guard: a loop that echoes/var_dumps without bound (e.g.
         // gh13178_4: var_dump in a never-terminating loop) would otherwise grind to
@@ -2732,6 +2757,7 @@ impl Eval {
                     }
                 }
                 self.classes.insert(c.name.to_ascii_lowercase(), Rc::new(c));
+                self.method_cache.borrow_mut().clear();
             }
             Stmt::Throw(e) => {
                 let v = self.eval(e)?;
@@ -3381,7 +3407,7 @@ impl Eval {
                     if named.is_empty() {
                         pos
                     } else {
-                        let params = self.find_method(&cname, "__construct").map(|(_, m)| m.params);
+                        let params = self.find_method(&cname, "__construct").map(|(_, m)| m.params.clone());
                         self.merge_named(pos, named, params.as_deref())?
                     }
                 };
@@ -3405,7 +3431,7 @@ impl Eval {
                     if named.is_empty() {
                         pos
                     } else {
-                        let params = self.find_method(&cname, "__construct").map(|(_, m)| m.params);
+                        let params = self.find_method(&cname, "__construct").map(|(_, m)| m.params.clone());
                         self.merge_named(pos, named, params.as_deref())?
                     }
                 };
@@ -3464,7 +3490,7 @@ impl Eval {
                         let params = match &o {
                             Value::Object(rc) => {
                                 let cls = rc.borrow().class.clone();
-                                self.find_method(&cls, &mname).map(|(_, m)| m.params)
+                                self.find_method(&cls, &mname).map(|(_, m)| m.params.clone())
                             }
                             _ => None,
                         };
@@ -3484,7 +3510,7 @@ impl Eval {
                     if named.is_empty() {
                         pos
                     } else {
-                        let params = self.find_method(&cname, &mname).map(|(_, m)| m.params);
+                        let params = self.find_method(&cname, &mname).map(|(_, m)| m.params.clone());
                         self.merge_named(pos, named, params.as_deref())?
                     }
                 };
@@ -4187,7 +4213,25 @@ impl Eval {
                 },
                 _ => return None,
             },
-            Expr::Prop(..) | Expr::StaticProp(..) => self.eval(base).ok()?,
+            // Property base: peek the slot WITHOUT cloning its value — for a
+            // big array property, eval() here cloned the whole array on every
+            // indexed write ($this->arr[$k] = v → O(n²); 70% of WordPress's
+            // bootstrap time before this fix).
+            Expr::Prop(obj, pn, _) => {
+                let o = self.eval(obj).ok()?;
+                let pname = self.prop_name_str(pn).ok()?;
+                match o {
+                    Value::Object(rc) => {
+                        let b = rc.borrow();
+                        match b.get(&pname) {
+                            Some(Value::Object(inner)) => Value::Object(inner.clone()),
+                            _ => return None,
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            Expr::StaticProp(..) => self.eval(base).ok()?,
             _ => return None,
         };
         if let Value::Object(rc) = &obj {
@@ -4988,7 +5032,7 @@ impl Eval {
 
     fn call_closure(&mut self, c: &ClosureVal, args: Vec<Value>) -> R<Value> {
         self.enter_call()?;
-        self.cur_args.push(args.clone());
+        self.cur_args.push(Rc::new(args.clone()));
         self.cur_fn.push("{closure}".to_string());
         self.frames.push(("{closure}".to_string(), self.cur_line));
         let mut scope = HashMap::new();
@@ -5076,7 +5120,7 @@ impl Eval {
 
     fn call_user(&mut self, f: &FuncDecl, args: Vec<Value>, byref: Option<&[Arg]>) -> R<Value> {
         self.enter_call()?;
-        self.cur_args.push(args.clone());
+        self.cur_args.push(Rc::new(args.clone()));
         self.cur_fn.push(f.name.clone());
         self.frames.push((f.name.clone(), self.cur_line));
         let mut scope = HashMap::new();
@@ -5335,7 +5379,7 @@ impl Eval {
             }
             Value::Object(rc) => {
                 let class = rc.borrow().class.clone();
-                self.find_method(&class, "__invoke").map(|(_, m)| m.params)
+                self.find_method(&class, "__invoke").map(|(_, m)| m.params.clone())
             }
             Value::Array(a) if a.len() == 2 => {
                 let recv = a.get(&Key::Int(0)).cloned()?;
@@ -5346,7 +5390,7 @@ impl Eval {
                     Value::Str(s) => String::from_utf8_lossy(&s).into_owned(),
                     _ => return None,
                 };
-                self.find_method(&cls, &mname).map(|(_, m)| m.params)
+                self.find_method(&cls, &mname).map(|(_, m)| m.params.clone())
             }
             _ => None,
         }
@@ -5453,22 +5497,35 @@ impl Eval {
     }
 
     /// Find a method (and its declaring class) walking up the hierarchy.
-    fn find_method(&self, class: &str, method: &str) -> Option<(String, MethodDecl)> {
-        let m = method.to_ascii_lowercase();
-        for c in self.ancestry(class) {
+    /// Method lookup with an Rc memo: profiling WordPress showed whole
+    /// MethodDecl bodies (Vec<Stmt>) being CLONED on every method call — the
+    /// single hottest allocation site. The memo clones once per unique
+    /// (class, method) and hands out Rc thereafter; class (re)registration
+    /// clears it.
+    fn find_method(&self, class: &str, method: &str) -> Option<(String, Rc<MethodDecl>)> {
+        let key = (class.to_ascii_lowercase(), method.to_ascii_lowercase());
+        if let Some(hit) = self.method_cache.borrow().get(&key) {
+            return hit.clone();
+        }
+        let m = &key.1;
+        let mut found: Option<(String, Rc<MethodDecl>)> = None;
+        'outer: for c in self.ancestry(class) {
             // traits first (declared in the class), then own methods
             for t in &c.uses_traits {
                 if let Some(tc) = self.find_class_n(t) {
-                    if let Some(md) = tc.methods.iter().find(|x| x.name.to_ascii_lowercase() == m) {
-                        return Some((c.name.clone(), md.clone()));
+                    if let Some(md) = tc.methods.iter().find(|x| x.name.to_ascii_lowercase() == *m) {
+                        found = Some((c.name.clone(), Rc::new(md.clone())));
+                        break 'outer;
                     }
                 }
             }
-            if let Some(md) = c.methods.iter().find(|x| x.name.to_ascii_lowercase() == m) {
-                return Some((c.name.clone(), md.clone()));
+            if let Some(md) = c.methods.iter().find(|x| x.name.to_ascii_lowercase() == *m) {
+                found = Some((c.name.clone(), Rc::new(md.clone())));
+                break;
             }
         }
-        None
+        self.method_cache.borrow_mut().insert(key, found.clone());
+        found
     }
 
     fn instantiate(&mut self, class: &str, args: Vec<Value>) -> R<Value> {
@@ -5591,7 +5648,7 @@ impl Eval {
             None => return Ok(Value::Null),
         };
         self.enter_call()?;
-        self.cur_args.push(args.clone());
+        self.cur_args.push(Rc::new(args.clone()));
         self.cur_fn.push(m.name.clone());
         let mut scope = HashMap::new();
         if !m.is_static {
@@ -5771,7 +5828,7 @@ impl Eval {
             None => return Ok(Value::Null),
         };
         self.enter_call()?;
-        self.cur_args.push(args.clone());
+        self.cur_args.push(Rc::new(args.clone()));
         self.cur_fn.push(m.name.clone());
         let mut scope = HashMap::new();
         // a non-static method reached via parent::/self:: keeps $this
@@ -6933,7 +6990,7 @@ impl Eval {
             "func_get_args" => {
                 let mut arr = Arr::new();
                 if let Some(cur) = self.cur_args.last() {
-                    for v in cur.clone() {
+                    for v in cur.iter().cloned() {
                         arr.push(v);
                     }
                 }

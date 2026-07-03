@@ -27,6 +27,33 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-08 (later) — 136 seconds to 2.8: the one-line wall
+
+**Pass rate: flat at 3645 (zero regressions). WP bootstrap: 48× faster.**
+
+Profiled the WordPress grind with a native sampler: 81% of all samples were
+`Value::clone` and array drops. Three fixes, in escalating impact:
+
+- Method lookups now hand out `Rc<MethodDecl>` from a memo — whole method
+  *bodies* had been cloned on every single call since v2 began.
+- `func_get_args` storage is Rc-shared instead of deep-copying every call's
+  arguments.
+- And the wall itself: `arrayaccess_obj` — the "is this an ArrayAccess
+  object?" probe on indexed writes — evaluated `$this->arr` to answer,
+  **cloning the entire property array on every `$this->arr[$k] = v`**.
+  WordPress's SQL translator does exactly that in its hot loop. One
+  peek-don't-clone rewrite: 136 s → 2.8 s. It is bug40261's twin, six months
+  later, in the property arm — the corpus taught this lesson once; WordPress
+  re-taught it at scale.
+
+Step limits are now env-tunable (`PHARGO_STEP_LIMIT`) so the oracle can run
+deep without touching corpus guards, and step-limit deaths self-diagnose
+(`at file:line in fn()`). Which immediately localized the next blocker: the
+SQLite plugin's SQL lexer never net-advances under our engine — an isolated,
+reproducible semantic bug, queued with a name and address.
+
+---
+
 ## 2026-07-08 — WordPress executes: the wall moves from features to speed
 
 **Pass rate: 3639 → 3645. WP oracle: db_connect → 139 seconds of real execution.**
