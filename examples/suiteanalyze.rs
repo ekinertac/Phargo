@@ -68,9 +68,9 @@ fn classify(out_res: &Result<Result<String, phargo::EngineError>, ()>, expect: &
         }
         Ok(Ok(got)) => {
             let got = lf(got);
-            let g = got.trim_end();
+            let g = got.trim();
             let e = lf(expect);
-            let e = e.trim_end();
+            let e = e.trim();
             if g == e {
                 ("PASS", String::new())
             } else if g.is_empty() {
@@ -116,7 +116,7 @@ fn classify(out_res: &Result<Result<String, phargo::EngineError>, ()>, expect: &
 /// difference, return (signature, sample). The signature abstracts digits so
 /// like-shaped diffs cluster (e.g. trailing-newline, "int(N)" off-by, ".0" tail).
 fn diff_close(got: &str, expect: &str, file: &str) -> (String, String) {
-    let g = got.trim_end();
+    let g = got.trim();
     let e = expect.trim_end();
     // trailing-whitespace-only difference (before trim they differ)
     if g == e {
@@ -229,7 +229,7 @@ fn cap200(s: &str) -> String {
 /// prefix so that large, uninteresting noise clusters visibly instead of
 /// diluting the top-N table with near-duplicates.
 fn diff_other(got: &str, expect: &str, file: &str) -> (String, String) {
-    let g = got.trim_end();
+    let g = got.trim();
     let e = expect.trim_end();
     let g_lines: Vec<&str> = g.lines().collect();
     let e_lines: Vec<&str> = e.lines().collect();

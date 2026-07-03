@@ -1690,7 +1690,13 @@ class XMLReader {
 function simplexml_load_string($xml, $class = null, $opts = 0) {
     $tree = __dom_parse($xml);
     if ($tree === false) { return false; }
-    return new SimpleXMLElement($tree);
+    $sx = new SimpleXMLElement($tree);
+    $enc = "";
+    if (preg_match('/<\?xml[^>]*encoding=["\x27]([^"\x27]+)["\x27]/', $xml, $m)) { $enc = " encoding=\"" . $m[1] . "\""; }
+    $ver = "1.0";
+    if (preg_match('/<\?xml[^>]*version=["\x27]([^"\x27]+)["\x27]/', $xml, $m)) { $ver = $m[1]; }
+    $sx->__decl = "<?xml version=\"" . $ver . "\"" . $enc . "?>\n";
+    return $sx;
 }
 function simplexml_load_file($file, $class = null, $opts = 0) {
     $xml = file_get_contents($file);
@@ -1735,6 +1741,10 @@ class SimpleXMLElement implements Iterator, ArrayAccess, Countable {
     }
     public function asXML($filename = null) {
         $out = __sxml_ser($this->__node);
+        // only the loaded document root carries __decl (set by the loader)
+        if (isset($this->__decl)) {
+            $out = $this->__decl . $out . "\n";
+        }
         if ($filename !== null) { file_put_contents($filename, $out); return true; }
         return $out;
     }
@@ -8307,10 +8317,20 @@ impl Eval {
                     Value::Object(rc) => rc.borrow().class.clone(),
                     v => String::from_utf8_lossy(&to_bytes(&v)).into_owned(),
                 };
+                // visibility depends on the calling scope: outside the class
+                // only public methods are listed; inside, everything is
+                let inside = self
+                    .current_class
+                    .as_deref()
+                    .map(|cc| self.instance_of_name(&cn, cc) || cc.eq_ignore_ascii_case(&cn))
+                    .unwrap_or(false);
                 let mut arr = Arr::new();
                 let mut seen = HashSet::new();
                 for c in self.ancestry(&cn) {
                     for m in &c.methods {
+                        if !inside && !matches!(m.visibility, Visibility::Public) {
+                            continue;
+                        }
                         if seen.insert(m.name.to_ascii_lowercase()) {
                             arr.push(Value::Str(m.name.as_bytes().to_vec()));
                         }

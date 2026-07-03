@@ -27,6 +27,22 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-07 — Small-bore: asXML declarations, method visibility, honest rulers
+
+**Pass rate: 3629 → 3630.**
+
+A deliberately thin batch of sampler follow-ups: SimpleXML's `asXML()` now
+round-trips the XML declaration (sniffed at load, emitted only from the
+document root), `get_class_methods()` filters to public when called from
+outside the class, and suiteanalyze learned the both-sides trim the real
+harness uses — which revealed that part of the "332-test truncation cluster"
+was the analyzer's own stale ruler, not the engine. The remaining diffs in
+that pool are genuine mid-test drifts, one content bug at a time. The
+easy-vein era of this climb is visibly ending; what's left is priced in
+features, not fixes.
+
+---
+
 ## 2026-07-06 (night) — DOMXPath, and the sampler earns its keep
 
 **Pass rate: 3604 → 3629.**
