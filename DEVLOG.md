@@ -27,6 +27,25 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-05 — Hello world!
+
+**The front page renders its post.** `<a href="http://localhost/?p=1">Hello
+world!</a>` followed by "Welcome to WordPress…" — a 26 KB page, twenty-
+twentyfive block theme, content out of SQLite, served by a PHP engine with
+zero C dependencies beyond the bundled SQLite itself.
+
+The last blocker was exactly where the previous entry left it: the SQLite
+plugin's translator converts every SQL literal to a named parameter
+(`:param0`) and calls `PDOStatement::execute([':param0' => …])` — an
+assoc array. Our PDO bridge flattened parameters positionally and, worse,
+`bindValue(':param0')` cast the name to `(int)` — zero for everything.
+rusqlite's `raw_bind_parameter` + `parameter_index` now bind named
+parameters properly; positional `?` still works by order.
+
+wpscan saves each response to `target/wp_page.html`. Remaining known
+noise: a handful of block-tree warnings on serialized template parts.
+Next: chase those, then point wpscan at `/?p=1` and wp-admin.
+
 ## 2026-07-04 (night) — `<title>Phargo Test Site</title>`
 
 **WordPress serves a page.** The full front-controller lifecycle — index.php →

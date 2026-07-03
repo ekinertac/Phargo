@@ -179,12 +179,20 @@ bug was preg_split ignoring PREG_SPLIT_DELIM_CAPTURE inside wpdb::prepare),
 and the full front-controller lifecycle renders a 23 KB HTML page:
 `<title>Phargo Test Site</title>`, block-library CSS, twentytwentyfive
 template parts, clean `</html>`. wpscan now runs the real index.php path
-and saves the response to target/wp_page.html. **The one visible gap: the
-posts loop renders "no results" — the main query's NAMED SQL parameters
-(:param0, assoc-array PDOStatement::execute) are dropped by our PDO
-bridge, which only forwards positional params (rusqlite error "Got 0,
-needed 2"). Fix in src/pdo.rs + PDO prelude: bind named params.** After
-that: "Hello world!" on the page, then wp-admin.
+and saves the response to target/wp_page.html.
+
+**UPDATE (2026-07-05): "Hello world!" RENDERS.** Named SQL parameters now
+bind via rusqlite raw_bind_parameter/parameter_index (the PDO prelude's
+bindValue had cast ":param0" to int 0; execute() flattened assoc arrays).
+The front page is a full 26 KB twentytwentyfive page with the post title,
+permalink (?p=1) and content from SQLite. Remaining noise: ~7 block-tree
+warnings (serialized template parts hitting undefined "attrs"/"blockName"
+keys in blocks.php render path — likely another small parser/shape gap).
+Next candidates: those warnings, single-post view (?p=1), wp-admin pages,
+REST API. Repro: PHARGO_STEP_LIMIT=3000000000 cargo run --release
+--example wpscan (needs vendor/wordpress + installed DB; installer probe
+lives in the session history — wp_install() via wp-admin/includes/
+upgrade.php with WP_INSTALLING defined).
 
 Delegation notes: agents run clean off specs with file scope + literal
 expected outputs + numeric baselines (12 successful tasks so far, zero

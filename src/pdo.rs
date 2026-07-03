@@ -243,7 +243,7 @@ pub fn reset() {
 pub fn query(
     id: i64,
     sql: &str,
-    params: Vec<SqlVal>,
+    params: Vec<(Option<String>, SqlVal)>,
 ) -> Result<(Vec<String>, Vec<Vec<SqlVal>>, usize), String> {
     CONNS.with(|c| {
         let conns = c.borrow();
@@ -251,17 +251,30 @@ pub fn query(
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
         let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let ncols = cols.len();
+        // bind: named parameters (":param0" — the SQLite plugin's translator
+        // emits these) via parameter_index; positional by order
+        let named = params.iter().any(|(n, _)| n.is_some());
+        if named {
+            for (n, v) in &params {
+                if let Some(n) = n {
+                    let name = if n.starts_with(':') { n.clone() } else { format!(":{n}") };
+                    if let Ok(Some(idx)) = stmt.parameter_index(&name) {
+                        stmt.raw_bind_parameter(idx, v).map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+        } else {
+            for (i, (_, v)) in params.iter().enumerate() {
+                stmt.raw_bind_parameter(i + 1, v).map_err(|e| e.to_string())?;
+            }
+        }
         if ncols == 0 {
             // DML / DDL
-            let affected = stmt
-                .execute(rusqlite::params_from_iter(params.iter()))
-                .map_err(|e| e.to_string())?;
+            let affected = stmt.raw_execute().map_err(|e| e.to_string())?;
             return Ok((cols, Vec::new(), affected));
         }
         let mut rows_out: Vec<Vec<SqlVal>> = Vec::new();
-        let mut rows = stmt
-            .query(rusqlite::params_from_iter(params.iter()))
-            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.raw_query();
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             let mut r = Vec::with_capacity(ncols);
             for i in 0..ncols {

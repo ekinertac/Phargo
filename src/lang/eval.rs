@@ -305,14 +305,16 @@ class PDOStatement implements IteratorAggregate {
         $this->__h = $h; $this->queryString = $sql; $this->__mode = $mode;
     }
     public function bindValue($key, $value, $type = 2) {
-        $this->__bound[is_int($key) ? $key : (int)ltrim($key, ":")] = $value;
+        if (is_int($key)) { $this->__bound[$key] = $value; }
+        else { $this->__bound[":" . ltrim($key, ":")] = $value; }
         return true;
     }
     public function bindParam($key, &$value, $type = 2) { return $this->bindValue($key, $value, $type); }
     public function execute($params = null) {
-        $p = [];
-        if (is_array($params)) { foreach ($params as $v) { $p[] = $v; } }
-        else { ksort($this->__bound); foreach ($this->__bound as $v) { $p[] = $v; } }
+        // keys pass through: string keys bind as named parameters, int keys
+        // positionally (in ksort order for pre-bound values)
+        if (is_array($params)) { $p = $params; }
+        else { $p = $this->__bound; ksort($p); }
         $r = __pdo_query($this->__h, $this->queryString, $p);
         $this->__cols = $r["cols"]; $this->__rows = $r["rows"];
         $this->__affected = $r["affected"]; $this->__pos = 0;
@@ -9647,16 +9649,24 @@ impl Eval {
             "__pdo_query" => {
                 let id = to_i64(&a(0));
                 let sql = String::from_utf8_lossy(&to_bytes(&a(1))).into_owned();
-                let mut params: Vec<crate::pdo::SqlVal> = Vec::new();
+                let mut params: Vec<(Option<String>, crate::pdo::SqlVal)> = Vec::new();
                 if let Value::Array(pa) = &a(2) {
-                    for (_, v) in &pa.entries {
-                        params.push(match v {
-                            Value::Null => crate::pdo::SqlVal::Null,
-                            Value::Int(n) => crate::pdo::SqlVal::Int(*n),
-                            Value::Float(f) => crate::pdo::SqlVal::Real(*f),
-                            Value::Bool(b) => crate::pdo::SqlVal::Int(*b as i64),
-                            other => crate::pdo::SqlVal::Text(to_bytes(other)),
-                        });
+                    for (k, v) in &pa.entries {
+                        // string keys are NAMED parameters (":param0")
+                        let name = match k {
+                            Key::Str(s) => Some(String::from_utf8_lossy(s).into_owned()),
+                            Key::Int(_) => None,
+                        };
+                        params.push((
+                            name,
+                            match v {
+                                Value::Null => crate::pdo::SqlVal::Null,
+                                Value::Int(n) => crate::pdo::SqlVal::Int(*n),
+                                Value::Float(f) => crate::pdo::SqlVal::Real(*f),
+                                Value::Bool(b) => crate::pdo::SqlVal::Int(*b as i64),
+                                other => crate::pdo::SqlVal::Text(to_bytes(other)),
+                            },
+                        ));
                     }
                 }
                 match crate::pdo::query(id, &sql, params) {
