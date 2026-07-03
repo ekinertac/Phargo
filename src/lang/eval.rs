@@ -1265,7 +1265,71 @@ class DOMDocument extends DOMNode {
         }
         return $this->__ser($node);
     }
-    public function saveHTML($node = null) { if ($node === null) { $s = ""; foreach ($this->__kids as $k) { $s .= $this->__ser($k); } return $s . "\n"; } return $this->__ser($node); }
+    // ---- HTML loading/saving ----
+    // Real libxml's HTML parser tolerates unclosed void tags, unescaped `&`,
+    // missing <html>/<body> wrappers, and a missing/whatever DOCTYPE. Our
+    // __dom_parse is a strict XML parser, so loadHTML runs a lenient PHP
+    // pre-pass that rewrites the source into well-formed XML before handing
+    // it to __dom_parse, then reuses __build (same as loadXML) to make the tree.
+    public $__had_doctype = false;
+    public $__html = false;
+    const __VOID_ELEMENTS = "area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr";
+    public function loadHTML($source, $options = 0) {
+        $this->__had_doctype = preg_match('/<!DOCTYPE[^>]*>/i', $source) === 1;
+        $source = preg_replace('/<!DOCTYPE[^>]*>/i', '', $source);
+        // Self-close void elements (<br>, <img src="...">, ...) so the strict
+        // parser doesn't treat them as unclosed containers swallowing siblings.
+        $source = preg_replace('/<(' . self::__VOID_ELEMENTS . ')([^>]*?)\/?>/i', '<$1$2 />', $source);
+        // Bare "&" (not part of a known/entity-shaped reference) must be escaped
+        // or the XML parser's attribute/text scanning gets confused.
+        $source = preg_replace('/&(?![a-zA-Z]+;|#[0-9]+;|#x[0-9a-fA-F]+;)/i', '&amp;', $source);
+        $trimmed = trim($source);
+        if (stripos($trimmed, '<html') !== 0) {
+            if (stripos($trimmed, '<head') === 0 || stripos($trimmed, '<body') === 0) {
+                $source = '<html>' . $source . '</html>';
+            } else {
+                $source = '<html><body>' . $source . '</body></html>';
+            }
+        } else {
+            $source = $trimmed;
+        }
+        $tree = __dom_parse($source);
+        if ($tree === false) { return false; }
+        $root = $this->__build($tree); $root->__parent = $this;
+        $this->__kids = [$root]; $this->documentElement = $root;
+        $this->__html = true;
+        return true;
+    }
+    public function loadHTMLFile($uri, $options = 0) {
+        $s = file_get_contents($uri);
+        if ($s === false) { return false; }
+        return $this->loadHTML($s, $options);
+    }
+    public function saveHTML($node = null) {
+        if ($node !== null) { return $this->__serHTML($node); }
+        // libxml emits this exact DOCTYPE for HTML documents it didn't itself
+        // read a doctype from (and we don't bother reconstructing an original
+        // one even when __had_doctype is true - close enough for the corpus).
+        $s = "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\" \"http://www.w3.org/TR/REC-html40/loose.dtd\">\n";
+        foreach ($this->__kids as $k) { $s .= $this->__serHTML($k); }
+        return $s . "\n";
+    }
+    public function saveHTMLFile($uri) { return file_put_contents($uri, $this->saveHTML()); }
+    // HTML-flavored serializer: void elements never get a closing tag (and
+    // never self-close with "/>"), other empty elements always get an explicit
+    // "</tag>" (HTML has no self-closing syntax outside the void set).
+    public function __serHTML($n) {
+        if ($n->nodeType == 3) { return __dom_escape_text($n->__nv); }
+        if ($n->nodeType == 4) { return "<![CDATA[" . $n->__nv . "]]>"; }
+        if ($n->nodeType == 8) { return "<!--" . $n->__nv . "-->"; }
+        $isVoid = in_array(strtolower($n->nodeName), explode("|", self::__VOID_ELEMENTS));
+        $s = "<" . $n->nodeName;
+        foreach ($n->__attrs as $k => $v) { $s .= " " . $k . "=\"" . __dom_escape_attr($v) . "\""; }
+        if ($isVoid) { return $s . ">"; }
+        $s .= ">";
+        foreach ($n->__kids as $c) { $s .= $this->__serHTML($c); }
+        return $s . "</" . $n->nodeName . ">";
+    }
     public function __ser($n) {
         if ($n->nodeType == 3) { return __dom_escape_text($n->__nv); }
         if ($n->nodeType == 4) { return "<![CDATA[" . $n->__nv . "]]>"; }
@@ -7246,11 +7310,41 @@ impl Eval {
                 };
                 Value::Str(s[start..end.max(start)].to_vec())
             }
-            "str_replace" => {
-                let search = to_bytes(&a(0));
-                let replace = to_bytes(&a(1));
-                let subject = to_bytes(&a(2));
-                Value::Str(replace_bytes(&subject, &search, &replace))
+            "str_replace" | "str_ireplace" => {
+                let ci = name == "str_ireplace";
+                // full PHP semantics: search/replace may be arrays (pairwise,
+                // missing replacement = ""), subject may be an array (mapped)
+                let one = |subject: &[u8]| -> Vec<u8> {
+                    match &a(0) {
+                        Value::Array(sa) => {
+                            let mut out = subject.to_vec();
+                            for (i, (_, sv)) in sa.entries.iter().enumerate() {
+                                let needle = to_bytes(sv);
+                                let rep = match &a(1) {
+                                    Value::Array(ra) => ra
+                                        .entries
+                                        .get(i)
+                                        .map(|(_, v)| to_bytes(v))
+                                        .unwrap_or_default(),
+                                    other => to_bytes(other),
+                                };
+                                out = replace_bytes_ci(&out, &needle, &rep, ci);
+                            }
+                            out
+                        }
+                        other => replace_bytes_ci(subject, &to_bytes(other), &to_bytes(&a(1)), ci),
+                    }
+                };
+                match &a(2) {
+                    Value::Array(subj) => {
+                        let mut out = Arr::new();
+                        for (k, v) in &subj.entries {
+                            out.insert(k.clone(), Value::Str(one(&to_bytes(v))));
+                        }
+                        Value::Array(out)
+                    }
+                    other => Value::Str(one(&to_bytes(other))),
+                }
             }
             "strpos" => {
                 let hay = to_bytes(&a(0));
@@ -9983,6 +10077,31 @@ fn find_bytes(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .windows(needle.len())
         .position(|w| w == needle)
         .map(|p| p + from)
+}
+
+/// replace_bytes with optional ASCII case-insensitive matching (str_ireplace).
+fn replace_bytes_ci(subject: &[u8], search: &[u8], replace: &[u8], ci: bool) -> Vec<u8> {
+    if !ci {
+        return replace_bytes(subject, search, replace);
+    }
+    if search.is_empty() {
+        return subject.to_vec();
+    }
+    let ls = search.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < subject.len() {
+        if i + ls.len() <= subject.len()
+            && subject[i..i + ls.len()].to_ascii_lowercase() == ls
+        {
+            out.extend_from_slice(replace);
+            i += ls.len();
+        } else {
+            out.push(subject[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn replace_bytes(subject: &[u8], search: &[u8], replace: &[u8]) -> Vec<u8> {

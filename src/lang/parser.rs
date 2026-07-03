@@ -1292,6 +1292,12 @@ impl Parser {
 
     // ---- primary --------------------------------------------------------
     fn primary(&mut self) -> R<Expr> {
+        // `#[Attr]` in expression position (before closures / arrow fns /
+        // `new class` / first-class callables) — attributes carry no runtime
+        // semantics here, so skip them and parse the annotated expression.
+        while matches!(self.kind(), Kind::AttrStart) {
+            self.skip_attributes();
+        }
         match self.kind().clone() {
             Kind::Int(n) => {
                 self.bump();
@@ -1465,6 +1471,10 @@ impl Parser {
 
     fn parse_new(&mut self) -> R<Expr> {
         self.bump(); // new
+        // `new #[Attr] class { ... }` — attributes on anonymous classes
+        while matches!(self.kind(), Kind::AttrStart) {
+            self.skip_attributes();
+        }
         if self.at_kw("class") {
             // anonymous class
             self.bump();

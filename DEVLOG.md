@@ -27,6 +27,26 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-06 (later) — loadHTML, attributes-as-expressions, and hollow builtin #6
+
+**Pass rate: 3595 → 3604.**
+
+Three-part batch. A subagent delivered `DOMDocument::loadHTML`/`saveHTML` —
+a lenient pre-pass (void-element closing, bare-`&` escaping, html/body
+wrapping) feeding the strict XML parser, plus an HTML-flavored serializer
+(`<br>`, never `<tag/>`). The orchestrator fixed `#[Attr]` in expression
+position (closures, arrow fns, `new #[C] class` — 11 parse errors gone).
+
+And the agent's best contribution wasn't in its task at all: while tracing
+entity escaping it proved that **`str_replace` with array arguments was a
+complete no-op** — `to_bytes` on the array made it search for the literal
+string "Array". Six hollow builtins found this climb (clone, $$x, static
+vars, spl_autoload_register, trim charlists, str_replace arrays); every one
+was found by an actual behavioral trace rather than reading the code. Now
+str_replace/str_ireplace do full pairwise/mapped PHP semantics.
+
+---
+
 ## 2026-07-06 — XMLReader + all eight rounding modes
 
 **Pass rate: 3583 → 3595.**
