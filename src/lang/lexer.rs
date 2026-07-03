@@ -50,6 +50,28 @@ impl<'a> Lexer<'a> {
         Ok(out)
     }
 
+    /// Like [`tokenize`], but also returns each token's 1-based source line
+    /// (parallel to the token vec) — the parser stamps these onto statements
+    /// so runtime errors/warnings can report real line numbers.
+    pub fn tokenize_lines(src: &'a [u8]) -> R<(Vec<Token>, Vec<u32>)> {
+        let toks = Self::tokenize(src)?;
+        // two-pointer sweep: newline offsets are visited once
+        let mut lines = Vec::with_capacity(toks.len());
+        let mut line: u32 = 1;
+        let mut pos = 0usize;
+        for t in &toks {
+            let stop = t.span.start.min(src.len());
+            while pos < stop {
+                if src[pos] == b'\n' {
+                    line += 1;
+                }
+                pos += 1;
+            }
+            lines.push(line);
+        }
+        Ok((toks, lines))
+    }
+
     #[inline]
     fn peek(&self) -> Option<u8> {
         self.src.get(self.pos).copied()

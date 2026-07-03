@@ -71,6 +71,8 @@ pub struct Eval {
     quiet: u32,
     /// set_error_handler() is active: warnings are intercepted (not printed).
     has_error_handler: bool,
+    /// 1-based source line of the statement currently executing (0 = unknown).
+    cur_line: u32,
     /// Function/class names registered by the PRELUDE — they emulate C
     /// internals, so their bodies never emit engine warnings (lowercased).
     prelude_fns: HashSet<String>,
@@ -130,16 +132,20 @@ class Exception implements Throwable {
     protected $message = "";
     protected $code = 0;
     protected $previous = null;
+    protected $file = "";
+    protected $line = 0;
     public function __construct($message = "", $code = 0, $previous = null) {
         $this->message = $message; $this->code = $code; $this->previous = $previous;
+        $this->file = __phargo_cur_file();
+        $this->line = __phargo_cur_line();
     }
     public function getMessage() { return $this->message; }
     public function getCode() { return $this->code; }
     public function getPrevious() { return $this->previous; }
     public function getTrace() { return []; }
     public function getTraceAsString() { return "#0 {main}"; }
-    public function getFile() { return ""; }
-    public function getLine() { return 0; }
+    public function getFile() { return $this->file; }
+    public function getLine() { return $this->line; }
     public function __toString() { return $this->message; }
 }
 class ErrorException extends Exception {}
@@ -147,16 +153,20 @@ class Error implements Throwable {
     protected $message = "";
     protected $code = 0;
     protected $previous = null;
+    protected $file = "";
+    protected $line = 0;
     public function __construct($message = "", $code = 0, $previous = null) {
         $this->message = $message; $this->code = $code; $this->previous = $previous;
+        $this->file = __phargo_cur_file();
+        $this->line = __phargo_cur_line();
     }
     public function getMessage() { return $this->message; }
     public function getCode() { return $this->code; }
     public function getPrevious() { return $this->previous; }
     public function getTrace() { return []; }
     public function getTraceAsString() { return "#0 {main}"; }
-    public function getFile() { return ""; }
-    public function getLine() { return 0; }
+    public function getFile() { return $this->file; }
+    public function getLine() { return $this->line; }
     public function __toString() { return $this->message; }
 }
 class TypeError extends Error {}
@@ -1323,6 +1333,7 @@ impl Eval {
             strict_types: false,
             quiet: 0,
             has_error_handler: false,
+            cur_line: 0,
             prelude_fns: HashSet::new(),
             prelude_classes: HashSet::new(),
             byref_ret: Vec::new(),
@@ -1594,13 +1605,18 @@ impl Eval {
                 // histogram stays useful.
                 if let Some(exc) = e.thrown.take() {
                     let (cls, msg) = e.exception_info(&exc);
-                    let file = e
-                        .cur_file
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default();
+                    let (file, line) = match &exc {
+                        Value::Object(rc) => {
+                            let b = rc.borrow();
+                            (
+                                b.get("file").map(|v| String::from_utf8_lossy(&to_bytes(v)).into_owned()).unwrap_or_default(),
+                                b.get("line").map(to_i64).unwrap_or(0),
+                            )
+                        }
+                        _ => (String::new(), 0),
+                    };
                     let s = format!(
-                        "\nFatal error: Uncaught {cls}: {msg} in {file}:0\nStack trace:\n#0 {{main}}\n  thrown in {file} on line 0\n"
+                        "\nFatal error: Uncaught {cls}: {msg} in {file}:{line}\nStack trace:\n#0 {{main}}\n  thrown in {file} on line {line}\n"
                     );
                     e.out.extend_from_slice(s.as_bytes());
                     // PHP runs shutdown functions after an uncaught exception too
@@ -1629,6 +1645,10 @@ impl Eval {
     /// Hoist top-level function declarations so call-before-definition works.
     fn hoist(&mut self, stmts: &[Stmt]) {
         for s in stmts {
+            let s = match s {
+                Stmt::Marked(_, inner) => &**inner,
+                other => other,
+            };
             match s {
                 Stmt::Func(f) => {
                     self.funcs.insert(f.name.to_ascii_lowercase(), Rc::new(f.clone()));
@@ -1973,6 +1993,10 @@ impl Eval {
                 }
                 return Ok(result);
             }
+            Stmt::Marked(line, inner) => {
+                self.cur_line = *line;
+                return self.exec(inner);
+            }
             // `static $x = init;` — persistent per-function storage. The scope
             // var becomes a Ref to a cell kept in static_vars, so writes persist
             // across calls. Keyed by declaring class + function name (inherited
@@ -2036,7 +2060,7 @@ impl Eval {
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let s = format!("\nWarning: {msg} in {file} on line 0\n");
+        let s = format!("\nWarning: {msg} in {file} on line {}\n", self.cur_line);
         self.out.extend_from_slice(s.as_bytes());
     }
 
@@ -2312,6 +2336,7 @@ impl Eval {
                 }
             },
             Expr::MagicConst(name) => match name.to_ascii_uppercase().as_str() {
+                "__LINE__" => Value::Int(self.cur_line as i64),
                 "__FILE__" => Value::Str(
                     self.cur_file
                         .as_ref()
@@ -3664,14 +3689,16 @@ impl Eval {
     }
 
     fn run_source(&mut self, bytes: &[u8], path: Option<PathBuf>) -> R<Value> {
-        let toks = super::lexer::Lexer::tokenize(bytes)
+        let (toks, lines) = super::lexer::Lexer::tokenize_lines(bytes)
             .map_err(|e| RunError(format!("Parse error: {}", e.msg)))?;
-        let ast = super::parser::Parser::parse(toks)
+        let ast = super::parser::Parser::parse_with_lines(toks, lines)
             .map_err(|e| RunError(format!("Parse error: {}", e.msg)))?;
         let prev_file = std::mem::replace(&mut self.cur_file, path);
+        let prev_line = self.cur_line;
         self.hoist(&ast);
         let r = self.exec_block(&ast);
         self.cur_file = prev_file;
+        self.cur_line = prev_line;
         match r? {
             Flow::Return(v) => Ok(v),
             _ => Ok(Value::Int(1)), // include/eval default return value
@@ -4143,6 +4170,13 @@ impl Eval {
     /// body contains `yield`, run it as an (eager) generator and return a
     /// Generator object; otherwise return the `return` value.
     fn run_fn_body(&mut self, body: &[Stmt]) -> R<Value> {
+        let caller_line = self.cur_line;
+        let r = self.run_fn_body_inner(body);
+        self.cur_line = caller_line;
+        return r;
+    }
+
+    fn run_fn_body_inner(&mut self, body: &[Stmt]) -> R<Value> {
         if has_yield(body) {
             let prev = self.gen_buf.take();
             let prev_nodes = self.gen_nodes;
@@ -7394,6 +7428,14 @@ impl Eval {
                 let zone = if crate::tz::is_utc_name(&tzname) { None } else { crate::tz::lookup(&tzname) };
                 Value::Str(crate::php_date_tz(&fmt, ts, zone.as_deref()).into_bytes())
             }
+            "__phargo_cur_line" => Value::Int(self.cur_line as i64),
+            "__phargo_cur_file" => Value::Str(
+                self.cur_file
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+                    .into_bytes(),
+            ),
             "__phargo_tz_offset" => {
                 let tzname = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 let ts = to_i64(&a(1));
@@ -10011,6 +10053,7 @@ fn has_yield(stmts: &[Stmt]) -> bool {
 
 fn stmt_has_yield(s: &Stmt) -> bool {
     match s {
+        Stmt::Marked(_, inner) => stmt_has_yield(inner),
         Stmt::Expr(e) | Stmt::Throw(e) => expr_has_yield(e),
         Stmt::Echo(es) => es.iter().any(expr_has_yield),
         Stmt::Return(Some(e)) => expr_has_yield(e),

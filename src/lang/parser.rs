@@ -16,6 +16,9 @@ type R<T> = Result<T, ParseError>;
 
 pub struct Parser {
     toks: Vec<Token>,
+    /// 1-based source line per token (parallel to `toks`); empty when the
+    /// caller used the line-less API (statements then carry line 0).
+    lines: Vec<u32>,
     pos: usize,
     depth: usize,
 }
@@ -24,12 +27,24 @@ const MAX_DEPTH: usize = 2500;
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, pos: 0, depth: 0 }
+        Parser { toks, lines: Vec::new(), pos: 0, depth: 0 }
     }
 
     pub fn parse(toks: Vec<Token>) -> R<Vec<Stmt>> {
         let mut p = Parser::new(toks);
         p.program()
+    }
+
+    /// Parse with per-token line info (from `Lexer::tokenize_lines`); each
+    /// statement is wrapped in `Stmt::Marked(line, …)` for runtime diagnostics.
+    pub fn parse_with_lines(toks: Vec<Token>, lines: Vec<u32>) -> R<Vec<Stmt>> {
+        let mut p = Parser::new(toks);
+        p.lines = lines;
+        p.program()
+    }
+
+    fn cur_line(&self) -> u32 {
+        self.lines.get(self.pos).copied().unwrap_or(0)
     }
 
     // ---- token helpers --------------------------------------------------
@@ -180,9 +195,14 @@ impl Parser {
             self.depth -= 1;
             return Err(self.err("nesting too deep"));
         }
+        let line = self.cur_line();
         let r = self.statement_inner();
         self.depth -= 1;
-        r
+        // stamp the statement's starting line for runtime error reporting
+        match r {
+            Ok(s) if line > 0 => Ok(Stmt::Marked(line, Box::new(s))),
+            other => other,
+        }
     }
 
     fn statement_inner(&mut self) -> R<Stmt> {

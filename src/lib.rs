@@ -115,9 +115,9 @@ pub fn set_default_timezone(tz: Option<String>) {
 /// Like [`run`], but records the script's file path so `__FILE__`/`__DIR__` and
 /// relative `include`/`require` resolve against it.
 pub fn run_with_path(source: &str, path: Option<PathBuf>) -> R<String> {
-    let toks = lang::lexer::Lexer::tokenize(source.as_bytes())
+    let (toks, lines) = lang::lexer::Lexer::tokenize_lines(source.as_bytes())
         .map_err(|e| EngineError(format!("Parse error: {}", e.msg)))?;
-    let ast = lang::parser::Parser::parse(toks)
+    let ast = lang::parser::Parser::parse_with_lines(toks, lines)
         .map_err(|e| EngineError(format!("Parse error: {}", e.msg)))?;
     let out = lang::eval::Eval::run_with_path(&ast, path).map_err(|e| EngineError(e.0))?;
     Ok(String::from_utf8_lossy(&out).into_owned())

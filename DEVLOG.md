@@ -27,6 +27,28 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-04 (night) — Line numbers are real
+
+**Pass rate: 3423 → 3430.**
+
+The engine finally knows what line it's on. The design goal was to avoid the
+obvious trap — threading spans through every AST node — and it worked out
+surgical: the lexer computes a per-token line table in one two-pointer
+post-pass (tokens themselves untouched); the parser stamps each statement
+through its existing `statement()` choke point (`Stmt::Marked(line, …)`, one
+new variant); the evaluator tracks `cur_line` with a save/restore at the
+single shared `run_fn_body` boundary so a caller's line survives calls into
+functions. Exceptions capture file+line at construction like PHP; uncaught
+fatals print `in /file.php:12 … thrown on line 12`; warnings say `on line 3`;
+and `__LINE__` — which had simply never been implemented — returns the truth.
+
+The +7 is honest but modest: it turns out the remaining fatal-test gap is
+mostly stack-trace *content* (PHP prints `#0 file(line): func()` frames; we
+print `#0 {main}`), not the line numbers. That's the next rung this
+infrastructure was built for.
+
+---
+
 ## 2026-07-04 (later still) — Property and foreach warnings, with engine-honest limits
 
 **Pass rate: 3414 → 3423.**

@@ -244,6 +244,9 @@ pub enum Stmt {
     Use(Vec<UseItem>),
     /// declare(...) — only strict_types is meaningful to the evaluator.
     Declare { strict_types: bool },
+    /// A statement stamped with its 1-based source line (parser wraps every
+    /// statement when line info is available) — powers error/warning lines.
+    Marked(u32, Box<Stmt>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
