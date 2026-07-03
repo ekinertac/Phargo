@@ -27,6 +27,23 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-04 (later still) — Property and foreach warnings, with engine-honest limits
+
+**Pass rate: 3414 → 3423.**
+
+Extended the warning surface: `Attempt to read property "x" on string/int/…`
+and `foreach() argument must be of type array|object, int given`. The triage
+loop surfaced a principle worth writing down: **only warn where the engine is
+sure the user erred.** Property reads on null and array stay silent here —
+in this engine those bases are as likely artifacts of an unimplemented API
+(DOM props we don't model, SimpleXML namespaces) as user mistakes, and one
+spurious warning in a passing test costs more than three missed warnings in
+failing ones. Closures count as objects; eager generator pre-execution never
+warns (PHP's lazy bodies only run when iterated). Bonus correctness:
+`DOMElement::setAttribute` now returns the `DOMAttr` like real PHP.
+
+---
+
 ## 2026-07-04 (later) — Warnings exist now
 
 **Pass rate: 3387 → 3414.**

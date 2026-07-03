@@ -1071,7 +1071,7 @@ class DOMElement extends DOMNode {
         if ($value !== null && $value !== "") { $t = new DOMText($value); $t->__parent = $this; $this->__kids[] = $t; }
     }
     public function getAttribute($n) { return $this->__attrs[$n] ?? ""; }
-    public function setAttribute($n, $v) { $this->__attrs[$n] = (string)$v; }
+    public function setAttribute($n, $v) { $this->__attrs[$n] = (string)$v; return new DOMAttr($n, (string)$v); }
     public function hasAttribute($n) { return isset($this->__attrs[$n]); }
     public function removeAttribute($n) { unset($this->__attrs[$n]); }
     public function getAttributeNode($n) { return isset($this->__attrs[$n]) ? new DOMAttr($n, $this->__attrs[$n]) : false; }
@@ -1809,6 +1809,10 @@ impl Eval {
                     }
                 }
                 let arr = self.eval(array)?;
+                if !matches!(arr, Value::Array(_) | Value::Object(_) | Value::Closure(_)) {
+                    let t = self.given_type(&arr);
+                    self.warn(&format!("foreach() argument must be of type array|object, {t} given"));
+                }
                 match arr {
                     Value::Array(a) => {
                         for (k, v) in a.entries.clone() {
@@ -2017,8 +2021,11 @@ impl Eval {
     /// honoring @/isset-style suppression and the error_reporting level.
     fn warn(&mut self, msg: &str) {
         const E_WARNING: i64 = 2;
+        // gen_buf: our generators run eagerly; PHP's run lazily and a body that
+        // is never iterated never warns — so eager pre-execution stays silent.
         if self.quiet > 0
             || self.has_error_handler
+            || self.gen_buf.is_some()
             || self.error_level & E_WARNING == 0
             || self.out.len() > MAX_OUTPUT
         {
@@ -2597,7 +2604,17 @@ impl Eval {
                             }
                         }
                     }
-                    _ => Value::Null,
+                    // closures are objects: property reads are silent nulls.
+                    // Null bases stay silent too — in this engine a null is as
+                    // likely an unimplemented-API artifact (DOM/SimpleXML gaps)
+                    // as a user error, and spurious warnings cost more than
+                    // missed ones.
+                    Value::Closure(_) | Value::Null | Value::Array(_) => Value::Null,
+                    other => {
+                        let t = self.given_type(other);
+                        self.warn(&format!("Attempt to read property \"{pname}\" on {t}"));
+                        Value::Null
+                    }
                 }
             }
             Expr::MethodCall(obj, name, args, nullsafe) => {

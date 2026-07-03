@@ -100,16 +100,23 @@ the shipping number on the same suite. Then deleted the legacy engine (`lib.rs`
   path; check `git status --porcelain` before every add.
 - **`git add -A` once swept in a corpus-generated junk file.** Always inspect first.
 
-## Current state (2026-07-04)
+## Current state (2026-07-04, end of session)
 
-- **3387 / 21970 gradeable (15.4%).** Ten batches on 07-02→04 took 3007 → 3387
-  (+380). Batches 8–10 were the error-semantics vein: parameter/return type
-  enforcement (weak + strict_types, PHP-exact TypeError messages), typed +
-  readonly properties (readonly approximated as class-scoped writability —
-  init-once isn't representable; see DEVLOG), array-operand TypeErrors,
-  DivisionByZeroError, negative-shift ArithmeticError. Also: function
-  `static` vars were a parsed no-op (third missing keyword after clone and
-  $$x) — now persistent Ref cells keyed by declaring class + function.
+- **3423 / 21970 gradeable (15.6%).** Twelve batches on 07-02→04: 3007 → 3423
+  (+416). Batches 8–12 were the error-semantics vein: parameter/return type
+  enforcement (weak + strict_types), typed + readonly properties, arithmetic
+  TypeErrors/DivisionByZeroError, and **runtime warnings** (undefined
+  variable/array key, property-on-scalar, foreach-arg) with the full silence
+  map (isset/empty/??/@; by-ref out-params on all call shapes — see the
+  builtin table in eval_call; nested index-assign reads; [&$x]; =&; by-ref
+  returns; prelude bodies; set_error_handler; eager generators). Warn policy:
+  only where the engine is SURE it's user error — null/array prop-bases stay
+  silent because our nulls are often unimplemented-API artifacts.
+- Known accepted losses: Zend autoload/bug78868 (static-init + autoload
+  corner), one readonly init-once approximation test.
+- `static` vars, clone, $$x, spl_autoload were all silently-missing features
+  found this session; suspect more remain — grep eval.rs for "not yet
+  implemented" and check the catch-all arms when output is inexplicably NULL.
 - **Realistic ceiling ~40–45%** — the rest is out-of-scope C extensions.
 - Landed this session: named args; foreach-by-ref (real Ref cells in elements,
   live-append iteration with cursor+cap guard); LSB; undefined-const Error;
