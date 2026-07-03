@@ -8,6 +8,10 @@ Rust→WASM). You are continuing that climb.
 > **Also read [`docs/PROJECT_STATE.md`](docs/PROJECT_STATE.md)** — the portable
 > project memory: mission, milestone history, hard-won lessons, current state, and
 > next targets. This file is the *how*; that file is the *what/why/where-we-are*.
+> **And [`docs/ROADMAP.md`](docs/ROADMAP.md)** — the phased plan to the north star
+> (WP oracle → WP-informed climb → Path C VM → WASM). Two-oracle policy: when the
+> corpus scoreboard and the WordPress-progress harness disagree on what to build
+> next, WordPress wins.
 
 ## The number that matters
 

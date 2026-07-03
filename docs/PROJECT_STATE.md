@@ -1,7 +1,8 @@
 # Phargo — project state & history
 
 Portable working memory for continuing the project on any machine. Pairs with
-`CLAUDE.md` (workflow + rules) at the repo root. This file is the durable
+`CLAUDE.md` (workflow + rules) at the repo root and `ROADMAP.md` (the phased
+plan to the north star; Phase 0 — the WordPress-progress oracle — is next). This file is the durable
 project context: mission, milestone arc, hard-won lessons, current state, and
 next targets. Update it at meaningful milestones.
 
