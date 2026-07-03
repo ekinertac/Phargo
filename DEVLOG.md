@@ -27,6 +27,25 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-05 (later still) — Three pages.
+
+**The single-post view (`?p=1`, 38 KB, comments section and all) and the
+login page (`wp-login.php`, form rendered) both complete with zero
+warnings.** Alongside the front page, that's the three basic faces of a
+WordPress site — anonymous reading and the door to wp-admin.
+
+Two small exactness fixes on the way:
+- `htmlspecialchars(..., double_encode: false)` — the 4th argument was
+  ignored, so WP's `esc_html` double-escaped pre-encoded entities:
+  `<title>Hello world! &amp;#8211; …</title>`. Now numeric entities and
+  the HTML 4.01 named set pass through untouched, and `&x;` (not a real
+  entity) still encodes — byte-matched against PHP 8.
+- `setcookie`/`setrawcookie` accepted as no-ops (no response channel in
+  the harness) — wp-login sets its test cookie before printing anything.
+
+Next stop, wp-admin — which means auth cookies through wp_signon, a
+proper session, and the dashboard's admin bootstrap (admin.php).
+
 ## 2026-07-05 (later) — A clean page.
 
 **Zero warnings.** The front page renders 25.7 KB of WordPress with no

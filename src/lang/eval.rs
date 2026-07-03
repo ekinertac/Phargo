@@ -8035,10 +8035,45 @@ impl Eval {
                 let flags = if args.len() > 1 { to_i64(&a(1)) } else { 11 };
                 let dq = flags & 2 != 0;
                 let sq = flags & 1 != 0;
+                // 4th arg double_encode=false: leave existing entities alone
+                // (WP's esc_html/_wp_specialchars relies on it — a pre-encoded
+                // &#8211; separator must not become &amp;#8211;)
+                let double_encode = args.len() < 4 || to_bool(&a(3));
+                let is_entity_at = |i: usize| -> bool {
+                    // numeric entities (&#123; / &#xAB;) always count; named
+                    // ones only if PHP's HTML table knows them (&x; re-encodes)
+                    let mut j = i + 1;
+                    let numeric = j < s.len() && s[j] == b'#';
+                    if numeric {
+                        j += 1;
+                        if j < s.len() && (s[j] == b'x' || s[j] == b'X') {
+                            j += 1;
+                        }
+                    }
+                    let start = j;
+                    while j < s.len() && s[j].is_ascii_alphanumeric() {
+                        j += 1;
+                    }
+                    if !(j > start && j < s.len() && s[j] == b';') {
+                        return false;
+                    }
+                    if numeric {
+                        return true;
+                    }
+                    HTML_ENTITY_NAMES
+                        .binary_search(&std::str::from_utf8(&s[start..j]).unwrap_or(""))
+                        .is_ok()
+                };
                 let mut out = Vec::with_capacity(s.len());
-                for &b in &s {
+                for (i, &b) in s.iter().enumerate() {
                     match b {
-                        b'&' => out.extend_from_slice(b"&amp;"),
+                        b'&' => {
+                            if !double_encode && is_entity_at(i) {
+                                out.push(b'&');
+                            } else {
+                                out.extend_from_slice(b"&amp;");
+                            }
+                        }
                         b'<' => out.extend_from_slice(b"&lt;"),
                         b'>' => out.extend_from_slice(b"&gt;"),
                         b'"' if dq => out.extend_from_slice(b"&quot;"),
@@ -10930,6 +10965,8 @@ impl Eval {
             "error_get_last" => Value::Null,
             // error_log: accepted and discarded (no log sink in the harness)
             "error_log" => Value::Bool(true),
+            // no HTTP response channel in the harness — accepted and dropped
+            "setcookie" | "setrawcookie" => Value::Bool(true),
             _ => {
                 return Err(
                     self.throw_error("Error", &format!("Call to undefined function {name}()"))
@@ -11133,7 +11170,7 @@ static KNOWN_BUILTINS: &[&str] = &[
         "session_regenerate_id", "session_register_shutdown", "session_reset",
         "session_save_path", "session_set_cookie_params", "session_set_save_handler",
         "session_start", "session_status", "session_unset", "session_write_close",
-        "set_error_handler", "set_exception_handler", "set_time_limit", "setlocale", "settype",
+        "set_error_handler", "set_exception_handler", "set_time_limit", "setcookie", "setlocale", "setrawcookie", "settype",
         "sha1", "shuffle", "similar_text", "sizeof", "sleep", "sort", "spl_autoload_functions",
         "spl_autoload_register", "spl_autoload_unregister", "spl_object_hash", "spl_object_id",
         "sprintf", "sqrt", "srand", "sscanf", "str_contains", "str_ends_with", "str_getcsv",
@@ -11346,6 +11383,36 @@ fn urlencode_form(s: &[u8]) -> Vec<u8> {
 }
 
 /// Decode the predefined HTML entities + numeric (`&#NN;` / `&#xNN;`) references.
+/// HTML 4.01 named entities (sorted for binary_search) — the set PHP's
+/// htmlspecialchars(double_encode: false) treats as already-encoded.
+static HTML_ENTITY_NAMES: &[&str] = &[
+    "AElig", "Aacute", "Acirc", "Agrave", "Alpha", "Aring", "Atilde", "Auml", "Beta", "Ccedil",
+    "Chi", "Dagger", "Delta", "ETH", "Eacute", "Ecirc", "Egrave", "Epsilon", "Eta", "Euml",
+    "Gamma", "Iacute", "Icirc", "Igrave", "Iota", "Iuml", "Kappa", "Lambda", "Mu", "Ntilde",
+    "Nu", "OElig", "Oacute", "Ocirc", "Ograve", "Omega", "Omicron", "Oslash", "Otilde", "Ouml",
+    "Phi", "Pi", "Prime", "Psi", "Rho", "Scaron", "Sigma", "THORN", "Tau", "Theta", "Uacute",
+    "Ucirc", "Ugrave", "Upsilon", "Uuml", "Xi", "Yacute", "Yuml", "Zeta", "aacute", "acirc",
+    "acute", "aelig", "agrave", "alefsym", "alpha", "amp", "and", "ang", "apos", "aring",
+    "asymp", "atilde", "auml", "bdquo", "beta", "brvbar", "bull", "cap", "ccedil", "cedil",
+    "cent", "chi", "circ", "clubs", "cong", "copy", "crarr", "cup", "curren", "dArr", "dagger",
+    "darr", "deg", "delta", "diams", "divide", "eacute", "ecirc", "egrave", "empty", "emsp",
+    "ensp", "epsilon", "equiv", "eta", "eth", "euml", "euro", "exist", "fnof", "forall",
+    "frac12", "frac14", "frac34", "frasl", "gamma", "ge", "gt", "hArr", "harr", "hearts",
+    "hellip", "iacute", "icirc", "iexcl", "igrave", "image", "infin", "int", "iota", "iquest",
+    "isin", "iuml", "kappa", "lArr", "lambda", "lang", "laquo", "larr", "lceil", "ldquo", "le",
+    "lfloor", "lowast", "loz", "lrm", "lsaquo", "lsquo", "lt", "macr", "mdash", "micro",
+    "middot", "minus", "mu", "nabla", "nbsp", "ndash", "ne", "ni", "not", "notin", "nsub",
+    "ntilde", "nu", "oacute", "ocirc", "oelig", "ograve", "oline", "omega", "omicron", "oplus",
+    "or", "ordf", "ordm", "oslash", "otilde", "otimes", "ouml", "para", "part", "permil",
+    "perp", "phi", "pi", "piv", "plusmn", "pound", "prime", "prod", "prop", "psi", "quot",
+    "rArr", "radic", "rang", "raquo", "rarr", "rceil", "rdquo", "real", "reg", "rfloor", "rho",
+    "rlm", "rsaquo", "rsquo", "sbquo", "scaron", "sdot", "sect", "shy", "sigma", "sigmaf",
+    "sim", "spades", "sub", "sube", "sum", "sup", "sup1", "sup2", "sup3", "supe", "szlig",
+    "tau", "there4", "theta", "thetasym", "thinsp", "thorn", "tilde", "times", "trade", "uArr",
+    "uacute", "uarr", "ucirc", "ugrave", "uml", "upsih", "upsilon", "uuml", "weierp", "xi",
+    "yacute", "yen", "yuml", "zeta", "zwj", "zwnj",
+];
+
 fn decode_html_entities(s: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
     let mut i = 0;

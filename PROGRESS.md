@@ -4,13 +4,13 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 3788 / 22037  (17.19% of the entire PHP test suite)**
+**`.phpt` pass rate: 3792 / 22037  (17.21% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21970): 17.24%. The 67 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21970): 17.26%. The 67 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 3788 | 18182 | 67 | 22037 |
+| 3792 | 18178 | 67 | 22037 |
 
 _Curated smoke tests (dev guards, **not** in the number above): 88/93 passing._
 
@@ -19,12 +19,12 @@ _Curated smoke tests (dev guards, **not** in the number above): 88/93 passing._
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
 | `Zend` | 1358 | 5336 | 25.4% |
-| `ext/standard` | 877 | 3919 | 22.4% |
+| `ext/standard` | 882 | 3919 | 22.5% |
 | `ext/opcache` | 463 | 925 | 50.1% |
 | `ext/dom` | 64 | 870 | 7.4% |
 | `core` | 253 | 869 | 29.1% |
 | `ext/spl` | 153 | 805 | 19.0% |
-| `ext/date` | 193 | 689 | 28.0% |
+| `ext/date` | 192 | 689 | 27.9% |
 | `ext/soap` | 0 | 597 | 0.0% |
 | `ext/phar` | 13 | 576 | 2.3% |
 | `ext/reflection` | 65 | 521 | 12.5% |
