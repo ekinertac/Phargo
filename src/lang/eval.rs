@@ -66,6 +66,18 @@ pub struct Eval {
     /// declare(strict_types=1): scalar params/returns must match exactly
     /// (int→float widening excepted) instead of weak-mode coercion.
     strict_types: bool,
+    /// Warning-suppression depth: >0 inside isset()/empty()/??-lhs/@/by-ref
+    /// out-args, where PHP stays silent about undefined variables/keys.
+    quiet: u32,
+    /// set_error_handler() is active: warnings are intercepted (not printed).
+    has_error_handler: bool,
+    /// Function/class names registered by the PRELUDE — they emulate C
+    /// internals, so their bodies never emit engine warnings (lowercased).
+    prelude_fns: HashSet<String>,
+    prelude_classes: HashSet<String>,
+    /// Per-call stack: is the current function a by-ref return (`function &f`)?
+    /// `return $undef` in those creates the variable silently.
+    byref_ret: Vec<bool>,
     /// Per-class: does the hierarchy declare any typed/readonly instance prop?
     /// (Fast path: property writes skip declaration lookup entirely when false.)
     typed_props_cache: HashMap<String, bool>,
@@ -1309,6 +1321,11 @@ impl Eval {
             next_res_id: 1,
             shutdown_fns: Vec::new(),
             strict_types: false,
+            quiet: 0,
+            has_error_handler: false,
+            prelude_fns: HashSet::new(),
+            prelude_classes: HashSet::new(),
+            byref_ret: Vec::new(),
             typed_props_cache: HashMap::new(),
             static_vars: HashMap::new(),
             autoloaders: Vec::new(),
@@ -1357,6 +1374,8 @@ impl Eval {
                 .unwrap_or_default();
         }
         PRELUDE_AST.with(|ast| self.hoist(ast));
+        self.prelude_fns = self.funcs.keys().cloned().collect();
+        self.prelude_classes = self.classes.keys().cloned().collect();
     }
 
     /// Run a parsed program and return everything it printed.
@@ -1880,6 +1899,10 @@ impl Eval {
             Stmt::Continue(n) => return Ok(Flow::Continue(*n)),
             Stmt::Return(e) => {
                 let v = match e {
+                    // `function &f() { return $undef; }` creates silently
+                    Some(e) if self.byref_ret.last().copied().unwrap_or(false) => {
+                        self.eval_quiet(e)?
+                    }
                     Some(e) => self.eval(e)?,
                     None => Value::Null,
                 };
@@ -1990,6 +2013,34 @@ impl Eval {
 
     /// One foreach iteration: bind key/value, run the body. Returns `Some(flow)`
     /// if the loop must stop (break/return propagation), `None` to continue.
+    /// Emit a PHP runtime warning to the output stream (display_errors style),
+    /// honoring @/isset-style suppression and the error_reporting level.
+    fn warn(&mut self, msg: &str) {
+        const E_WARNING: i64 = 2;
+        if self.quiet > 0
+            || self.has_error_handler
+            || self.error_level & E_WARNING == 0
+            || self.out.len() > MAX_OUTPUT
+        {
+            return;
+        }
+        let file = self
+            .cur_file
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let s = format!("\nWarning: {msg} in {file} on line 0\n");
+        self.out.extend_from_slice(s.as_bytes());
+    }
+
+    /// Evaluate with undefined-variable/key warnings suppressed (isset/empty/??/@).
+    fn eval_quiet(&mut self, e: &Expr) -> R<Value> {
+        self.quiet += 1;
+        let r = self.eval(e);
+        self.quiet -= 1;
+        r
+    }
+
     /// The engine-default timezone as parsed TZif data (None = UTC).
     fn cur_tz(&self) -> Option<Rc<crate::tz::TzData>> {
         if crate::tz::is_utc_name(&self.default_tz) {
@@ -2210,7 +2261,8 @@ impl Eval {
                         }
                         continue;
                     }
-                    let val = self.eval(&it.value)?;
+                    // `[&$x]`: a by-ref item creates $x silently if fresh
+                    let val = if it.by_ref { self.eval_quiet(&it.value)? } else { self.eval(&it.value)? };
                     match &it.key {
                         Some(ke) => {
                             let kv = self.eval(ke)?;
@@ -2225,7 +2277,16 @@ impl Eval {
                 if is_superglobal(name) {
                     self.scopes[0].get(name).map(|v| v.deref()).unwrap_or(Value::Null)
                 } else {
-                    self.vars().get(name).map(|v| v.deref()).unwrap_or(Value::Null)
+                    match self.vars().get(name).map(|v| v.deref()) {
+                        Some(v) => v,
+                        None => {
+                            // "this" reads outside objects stay silent (engine paths probe it)
+                            if name != "this" {
+                                self.warn(&format!("Undefined variable ${name}"));
+                            }
+                            Value::Null
+                        }
+                    }
                 }
             }
             // variable variables: $$x / ${expr} — the inner value names the slot
@@ -2304,7 +2365,9 @@ impl Eval {
                         v
                     }
                     _ => {
-                        let v = self.eval(rhs)?;
+                        // `$x[0] =& $y` fallback (value copy): `=&` creates fresh
+                        // variables silently in PHP, so the read side stays quiet
+                        let v = self.eval_quiet(rhs)?;
                         self.assign_to(lhs, v.clone())?;
                         v
                     }
@@ -2377,17 +2440,26 @@ impl Eval {
             Expr::Index(base, idx) => self.read_index(base, idx)?,
             Expr::Call(callee, args) => self.eval_call(callee, args)?,
             Expr::Isset(items) => {
+                self.quiet += 1;
                 let mut all = true;
                 for it in items {
-                    if !self.isset_one(it)? {
-                        all = false;
-                        break;
+                    match self.isset_one(it) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            all = false;
+                            break;
+                        }
+                        Err(e) => {
+                            self.quiet -= 1;
+                            return Err(e);
+                        }
                     }
                 }
+                self.quiet -= 1;
                 Value::Bool(all)
             }
-            Expr::Empty(e) => Value::Bool(!to_bool(&self.eval(e)?)),
-            Expr::ErrorSuppress(e) => self.eval(e).unwrap_or(Value::Null),
+            Expr::Empty(e) => Value::Bool(!to_bool(&self.eval_quiet(e)?)),
+            Expr::ErrorSuppress(e) => self.eval_quiet(e).unwrap_or(Value::Null),
             Expr::Print(e) => {
                 let v = self.eval(e)?;
                 self.out.extend_from_slice(&to_bytes(&v));
@@ -2534,8 +2606,13 @@ impl Eval {
                     return Ok(Value::Null);
                 }
                 let mname = self.prop_name_str(name)?;
+                // args evaluate quietly: the callee may declare by-ref out-params
+                // (PHP doesn't warn about fresh vars passed to those)
+                self.quiet += 1;
+                let evaled = self.eval_args2(args);
+                self.quiet -= 1;
                 let argv = {
-                    let (pos, named) = self.eval_args2(args)?;
+                    let (pos, named) = evaled?;
                     if named.is_empty() {
                         pos
                     } else {
@@ -2554,8 +2631,11 @@ impl Eval {
             Expr::StaticCall(class, name, args) => {
                 let cname = self.resolve_class_name(class)?;
                 let mname = self.prop_name_str(name)?;
+                self.quiet += 1;
+                let evaled = self.eval_args2(args);
+                self.quiet -= 1;
                 let argv = {
-                    let (pos, named) = self.eval_args2(args)?;
+                    let (pos, named) = evaled?;
                     if named.is_empty() {
                         pos
                     } else {
@@ -2716,7 +2796,7 @@ impl Eval {
                 return Ok(Value::Bool(to_bool(&lv) || to_bool(&self.eval(r)?)));
             }
             BinOp::Coalesce => {
-                let lv = self.eval(l)?;
+                let lv = self.eval_quiet(l)?;
                 return Ok(if matches!(lv, Value::Null) { self.eval(r)? } else { lv });
             }
             BinOp::Concat => {
@@ -2977,40 +3057,74 @@ impl Eval {
             Expr::Var(n) => n.clone(),
             _ => unreachable!(),
         };
-        // Navigate by reference (keys already evaluated — no &mut self needed here).
+        // Navigate by reference (keys already evaluated — no &mut self needed for
+        // the walk itself; warnings are recorded and emitted after the borrow ends).
         // Superglobals resolve against the global scope.
-        let scope = if is_superglobal(&name) {
-            &self.scopes[0]
-        } else {
-            self.scopes.last().unwrap()
-        };
-        let mut v = match scope.get(&name) {
-            Some(v) => v,
-            None => return Ok(Value::Null),
-        };
-        // Deref a reference-backed variable before navigating.
-        if let Value::Ref(cell) = v {
-            let inner = cell.borrow().clone();
-            return Ok(read_index_value(&inner, &keys));
-        }
-        for (i, k) in keys.iter().enumerate() {
-            match v {
-                Value::Array(a) => {
-                    v = match a.get(k) {
-                        Some(x) => x,
-                        None => return Ok(Value::Null),
-                    };
-                    // Reference element mid-path: continue inside the cell.
-                    if let Value::Ref(cell) = v {
-                        let inner = cell.borrow().clone();
-                        return Ok(read_index_value(&inner, &keys[i + 1..]));
+        let mut warn_msg: Option<String> = None;
+        let result = 'walk: {
+            let scope = if is_superglobal(&name) {
+                &self.scopes[0]
+            } else {
+                self.scopes.last().unwrap()
+            };
+            let mut v = match scope.get(&name) {
+                Some(v) => v,
+                None => {
+                    if !is_superglobal(&name) && name != "this" {
+                        warn_msg = Some(format!("Undefined variable ${name}"));
+                    }
+                    break 'walk Value::Null;
+                }
+            };
+            // Deref a reference-backed variable before navigating.
+            if let Value::Ref(cell) = v {
+                let inner = cell.borrow().clone();
+                break 'walk read_index_value(&inner, &keys);
+            }
+            let mut out = Value::Null;
+            let mut done = false;
+            for (i, k) in keys.iter().enumerate() {
+                match v {
+                    Value::Array(a) => {
+                        v = match a.get(k) {
+                            Some(x) => x,
+                            None => {
+                                warn_msg = Some(match k {
+                                    Key::Int(n) => format!("Undefined array key {n}"),
+                                    Key::Str(sk) => format!(
+                                        "Undefined array key \"{}\"",
+                                        String::from_utf8_lossy(sk)
+                                    ),
+                                });
+                                done = true;
+                                break;
+                            }
+                        };
+                        // Reference element mid-path: continue inside the cell.
+                        if let Value::Ref(cell) = v {
+                            let inner = cell.borrow().clone();
+                            out = read_index_value(&inner, &keys[i + 1..]);
+                            done = true;
+                            break;
+                        }
+                    }
+                    Value::Str(sv) => {
+                        out = string_char(sv, k);
+                        done = true;
+                        break;
+                    }
+                    _ => {
+                        done = true;
+                        break;
                     }
                 }
-                Value::Str(s) => return Ok(string_char(s, k)),
-                _ => return Ok(Value::Null),
             }
+            if done { out } else { v.deref() }
+        };
+        if let Some(m) = warn_msg {
+            self.warn(&m);
         }
-        Ok(v.deref())
+        Ok(result)
     }
 
     fn index_get_key(&self, base: &Value, k: &Key) -> Value {
@@ -3156,7 +3270,7 @@ impl Eval {
             Expr::Index(inner, Some(iidx)) => {
                 // nested $a[x][y]: read-modify-write the inner container
                 let ikey = Arr::norm_key(&self.eval(iidx)?);
-                let mut cur = self.eval(base).unwrap_or(Value::Null);
+                let mut cur = self.eval_quiet(base).unwrap_or(Value::Null);
                 if let Value::Array(a) = &mut cur {
                     a.remove(key);
                     self.assign_index(inner, Some(ikey), cur)?;
@@ -3280,12 +3394,14 @@ impl Eval {
                 Ok(())
             }
             Expr::Index(inner, iidx) => {
-                // nested: evaluate current, mutate, write back
+                // nested: evaluate current, mutate, write back. The read half of
+                // this read-modify-write must not warn — PHP creates the
+                // intermediate dimensions silently.
                 let ikey = match iidx {
                     Some(i) => Some(Arr::norm_key(&self.eval(i)?)),
                     None => None,
                 };
-                let mut cur = self.eval(base).unwrap_or(Value::Array(Arr::new()));
+                let mut cur = self.eval_quiet(base).unwrap_or(Value::Array(Arr::new()));
                 if !matches!(cur, Value::Array(_)) {
                     cur = Value::Array(Arr::new());
                 }
@@ -3344,6 +3460,11 @@ impl Eval {
                     idx += 1;
                 }
             }
+        } else {
+            // list() from a non-array assigns NULL to every target (silently)
+            for it in items.into_iter().flatten() {
+                self.assign_to(&it.value, Value::Null)?;
+            }
         }
         Ok(())
     }
@@ -3366,8 +3487,30 @@ impl Eval {
                 return self.array_pointer(&name, args);
             }
             let fdecl = self.funcs.get(&name).cloned();
+            // By-ref out-params (user fns with &$p; builtins like preg_match's
+            // $matches) receive fresh variables by design — PHP does not warn
+            // about them being undefined, so evaluate those calls' args quietly.
+            let has_byref_out = fdecl
+                .as_ref()
+                .map(|f| f.params.iter().any(|p| p.by_ref))
+                .unwrap_or(false)
+                || matches!(
+                    name.as_str(),
+                    "preg_match" | "preg_match_all" | "preg_replace" | "preg_replace_callback"
+                        | "str_replace" | "str_ireplace" | "similar_text" | "parse_str"
+                        | "sscanf" | "settype" | "array_multisort" | "xml_parse_into_struct"
+                        | "is_callable" | "fscanf" | "fsockopen" | "stream_socket_client"
+                        | "flock" | "openssl_sign" | "exec" | "getimagesize"
+                );
             let argv = {
-                let (pos, named) = self.eval_args2(args)?;
+                if has_byref_out {
+                    self.quiet += 1;
+                }
+                let r = self.eval_args2(args);
+                if has_byref_out {
+                    self.quiet -= 1;
+                }
+                let (pos, named) = r?;
                 if named.is_empty() {
                     pos
                 } else {
@@ -3455,8 +3598,11 @@ impl Eval {
         }
         // dynamic callee: $f(...), expr(...) — evaluate to a callable value
         let cv = self.eval(callee)?;
+        self.quiet += 1;
+        let evaled = self.eval_args2(args);
+        self.quiet -= 1;
         let argv = {
-            let (pos, named) = self.eval_args2(args)?;
+            let (pos, named) = evaled?;
             if named.is_empty() {
                 pos
             } else {
@@ -3953,16 +4099,20 @@ impl Eval {
         let r = match &c.kind {
             ClosureKind::Full(f) => {
                 self.bind_params(&mut scope, &f.params, &args, "{closure}")?;
+                self.byref_ret.push(f.by_ref_return);
                 self.scopes.push(scope);
                 let r = self.run_fn_body(&f.body);
                 self.scopes.pop();
+                self.byref_ret.pop();
                 r
             }
             ClosureKind::Arrow(f) => {
                 self.bind_params(&mut scope, &f.params, &args, "{closure}")?;
+                self.byref_ret.push(false);
                 self.scopes.push(scope);
                 let r = self.eval(&f.body);
                 self.scopes.pop();
+                self.byref_ret.pop();
                 r
             }
         };
@@ -4026,10 +4176,20 @@ impl Eval {
             self.call_depth -= 1;
             return Err(e);
         }
+        // prelude functions emulate C internals — no engine warnings inside
+        let quiet_body = self.prelude_fns.contains(&f.name.to_ascii_lowercase());
+        if quiet_body {
+            self.quiet += 1;
+        }
+        self.byref_ret.push(f.by_ref_return);
         self.scopes.push(scope);
         let r = self.run_fn_body(&f.body);
         let wb = self.capture_byref(&f.params, byref);
         self.scopes.pop();
+        self.byref_ret.pop();
+        if quiet_body {
+            self.quiet -= 1;
+        }
         self.cur_args.pop();
         self.cur_fn.pop();
         self.call_depth -= 1;
@@ -4545,10 +4705,19 @@ impl Eval {
                 _ => decl_class.to_string(),
             }),
         );
+        let quiet_body = self.prelude_classes.contains(&decl_class.to_ascii_lowercase());
+        if quiet_body {
+            self.quiet += 1;
+        }
+        self.byref_ret.push(m.by_ref_return);
         self.scopes.push(scope);
         let r = self.run_fn_body(&body);
         let wb = self.capture_byref(&m.params, byref);
         self.scopes.pop();
+        self.byref_ret.pop();
+        if quiet_body {
+            self.quiet -= 1;
+        }
         self.current_class = prev_class;
         self.called_class = prev_called;
         self.cur_args.pop();
@@ -4693,10 +4862,19 @@ impl Eval {
         .or_else(|| self.find_class(class).map(|c| c.name.clone()))
         .or_else(|| Some(class.to_string()));
         let prev_called = std::mem::replace(&mut self.called_class, called);
+        let quiet_body = self.prelude_classes.contains(&decl_class.to_ascii_lowercase());
+        if quiet_body {
+            self.quiet += 1;
+        }
+        self.byref_ret.push(m.by_ref_return);
         self.scopes.push(scope);
         let r = self.run_fn_body(&body);
         let wb = self.capture_byref(&m.params, byref);
         self.scopes.pop();
+        self.byref_ret.pop();
+        if quiet_body {
+            self.quiet -= 1;
+        }
         self.current_class = prev_class;
         self.called_class = prev_called;
         self.cur_args.pop();
@@ -8144,7 +8322,17 @@ impl Eval {
                 }
                 Value::Int(old)
             }
-            "set_error_handler" | "restore_error_handler" | "set_exception_handler"
+            "set_error_handler" => {
+                // registered handlers intercept warnings; we don't invoke the
+                // callback but we do stop printing (closest observable behavior)
+                self.has_error_handler = !matches!(a(0), Value::Null);
+                Value::Null
+            }
+            "restore_error_handler" => {
+                self.has_error_handler = false;
+                Value::Null
+            }
+            "set_exception_handler"
             | "restore_exception_handler" | "error_clear_last" | "debug_print_backtrace"
             | "gc_enable" | "gc_disable" | "header" | "clearstatcache" | "usleep" | "sleep" => {
                 Value::Null

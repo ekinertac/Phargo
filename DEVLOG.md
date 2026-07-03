@@ -27,6 +27,38 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-04 (later) — Warnings exist now
+
+**Pass rate: 3387 → 3414.**
+
+The most delicate rung yet: the engine now emits PHP's runtime warnings —
+`Warning: Undefined variable $x` and `Undefined array key "k"` — in PHP's
+display_errors format. Emitting text is trivial; the hard 90% is everywhere
+PHP *stays silent*, because every missed quiet context is a spurious warning
+that breaks a passing test:
+
+- `isset()` / `empty()` / `??`-left-hand-side / `@` (the quiet-evaluation contexts)
+- by-ref out-params on **every** call shape (`preg_match($p,$s,$m)` must not
+  complain about a fresh `$m` — nor may `$obj->method($fresh)` when the method
+  declares `&$out`, nor `$closure($fresh)`)
+- the read half of nested index *assignments* (`$a['b']['c'] = 1` creates
+  dimensions silently)
+- `[&$x]` array literals and `=&` (reference creation)
+- `return $x` inside `function &f()` (by-ref returns create silently)
+- the entire PHP prelude (it emulates C internals — the corpus doesn't expect
+  DateTime's internals to warn)
+- an active `set_error_handler` (intercepts; we suppress printing)
+
+Method: implement, stash-diff the Zend failure set against the no-warnings
+baseline, fix the top cause, repeat — 15 spurious-warning regressions down to
+1 accepted corner (an autoload/static-init interaction). One of our own
+curated smoke tests turned out to assert PHP-7 silence and got corrected to
+PHP 8 reality. The wins live mostly in EXPECTF tests (`in %s on line %d`
+tolerates our line-0), which the quick EXPECT-only scans can't even see —
+another reminder that each measurement tool has a blind spot.
+
+---
+
 ## 2026-07-04 — Arithmetic learns to throw
 
 **Pass rate: 3364 → 3387.**
