@@ -27,6 +27,25 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-06 (night) — DOMXPath, and the sampler earns its keep
+
+**Pass rate: 3604 → 3629.**
+
+Two subagents: an XPath 1.0 subset (`//tag`, paths, `[N]`/`[@attr="v"]`/
+`[last()]` predicates with per-parent position semantics, `@attr` nodes,
+`count()`/`string()`) — ext/dom 41 → 53 EXPECT-only — and a MISMATCH_OTHER
+sampler mode for suiteanalyze, opening the 2 800-test multi-line-diff pool
+the close sampler couldn't see.
+
+The sampler's first run immediately paid twice: `object(bcmath\Number)` —
+the namespace-lowercasing in hoist was leaking into *display* names (keys
+should be lowercase, names never) — and `<?xml version="1.1"?>` — saveXML
+dropped the encoding attribute; DOMDocument now sniffs the declared encoding
+from the source and round-trips it. Next investigation it queued: a 332-test
+cluster where our output simply *ends early*.
+
+---
+
 ## 2026-07-06 (later) — loadHTML, attributes-as-expressions, and hollow builtin #6
 
 **Pass rate: 3595 → 3604.**

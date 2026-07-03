@@ -189,7 +189,10 @@ fn undefined_thing(text: &str) -> Option<(&'static str, String, String)> {
     None
 }
 
-fn abstract_digits(s: &str) -> String {
+/// Abstract runs of ASCII digits to a single `#` so like-shaped lines (differing
+/// only by a number: line numbers, counts, ids) collapse into one signature.
+/// No truncation here — callers decide how much of the result they keep.
+fn abstract_digits_full(s: &str) -> String {
     let mut out = String::new();
     let mut last_digit = false;
     for c in s.chars() {
@@ -201,7 +204,56 @@ fn abstract_digits(s: &str) -> String {
             last_digit = false;
         }
     }
-    out.chars().take(40).collect()
+    out
+}
+
+fn abstract_digits(s: &str) -> String {
+    abstract_digits_full(s).chars().take(40).collect()
+}
+
+/// Cap a line to 200 chars for sample display (untruncated below that).
+fn cap200(s: &str) -> String {
+    if s.chars().count() > 200 {
+        format!("{}...", s.chars().take(200).collect::<String>())
+    } else {
+        s.to_string()
+    }
+}
+
+/// Characterize a MISMATCH_OTHER (multi-token diff, the ~2800-test pool `close`
+/// mode doesn't cover): find the first *line* where expected and actual diverge
+/// (rather than close's first-byte approach — multi-token diffs are usually
+/// whole-line shaped) and build a signature from that pair of lines, digits
+/// abstracted so e.g. differing line numbers/counts collapse together.
+/// Error-shaped diffs (fatal-only-on-one-side, warning-only-on-one-side) get a
+/// prefix so that large, uninteresting noise clusters visibly instead of
+/// diluting the top-N table with near-duplicates.
+fn diff_other(got: &str, expect: &str, file: &str) -> (String, String) {
+    let g = got.trim_end();
+    let e = expect.trim_end();
+    let g_lines: Vec<&str> = g.lines().collect();
+    let e_lines: Vec<&str> = e.lines().collect();
+    let mut idx = 0;
+    while idx < g_lines.len() && idx < e_lines.len() && g_lines[idx] == e_lines[idx] {
+        idx += 1;
+    }
+    let e_line = e_lines.get(idx).copied().unwrap_or("");
+    let g_line = g_lines.get(idx).copied().unwrap_or("");
+
+    let e_sig: String = abstract_digits_full(e_line).chars().take(50).collect();
+    let g_sig: String = abstract_digits_full(g_line).chars().take(50).collect();
+    let mut sig = format!("EXPLINE[{e_sig}] GOTLINE[{g_sig}]");
+
+    if g.contains("Fatal error:") && !e.contains("Fatal error:") {
+        sig = format!("FATAL: {sig}");
+    } else if e_line.contains("Warning:") && !g_line.contains("Warning:") {
+        sig = format!("MISSING-WARN: {sig}");
+    } else if g_line.contains("Warning:") && !e_line.contains("Warning:") {
+        sig = format!("EXTRA-WARN: {sig}");
+    }
+
+    let sample = format!("{file}\n  EXP: {}\n  GOT: {}", cap200(e_line), cap200(g_line));
+    (sig, sample)
 }
 
 fn normalize(m: &str) -> String {
@@ -230,7 +282,7 @@ fn run() {
     let mut files = Vec::new();
     collect(&dir, &mut files);
 
-    let mode = std::env::args().nth(1); // "close" → dump close-mismatch diffs
+    let mode = std::env::args().nth(1); // "close" → dump close-mismatch diffs; "other" → dump MISMATCH_OTHER diffs
 
     // area -> category -> count
     let mut by_area: HashMap<String, HashMap<&'static str, usize>> = HashMap::new();
@@ -239,6 +291,8 @@ fn run() {
     let mut cat_total: HashMap<&'static str, usize> = HashMap::new();
     let mut close_diffs: HashMap<String, usize> = HashMap::new(); // diff signature -> count
     let mut close_samples: Vec<String> = Vec::new();
+    let mut other_diffs: HashMap<String, usize> = HashMap::new(); // diff signature -> count
+    let mut other_sample: HashMap<String, String> = HashMap::new(); // signature -> first sample seen
     let mut gradeable = 0usize;
 
     for f in &files {
@@ -265,6 +319,14 @@ fn run() {
                 }
             }
         }
+        if mode.as_deref() == Some("other") && cat == "MISMATCH_OTHER" {
+            if let Ok(Ok(got)) = &res {
+                let fname = f.strip_prefix(root).unwrap_or(f).to_string_lossy().into_owned();
+                let (sig, sample) = diff_other(&lf(got), &lf(&expect), &fname);
+                *other_diffs.entry(sig.clone()).or_insert(0) += 1;
+                other_sample.entry(sig).or_insert(sample); // first occurrence only
+            }
+        }
     }
 
     if mode.as_deref() == Some("close") {
@@ -274,6 +336,21 @@ fn run() {
         for (k, n) in v.into_iter().take(30) { println!("{:>5}  {k}", n); }
         println!("\n=== samples (EXP vs GOT, first divergence) ===");
         for s in &close_samples { println!("{s}"); }
+        println!("\ndone");
+        return;
+    }
+
+    if mode.as_deref() == Some("other") {
+        println!("=== MISMATCH_OTHER diff signatures (total {}) ===", cat_total.get("MISMATCH_OTHER").unwrap_or(&0));
+        let mut v: Vec<_> = other_diffs.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        for (k, n) in v.iter().take(40) { println!("{:>5}  {k}", n); }
+        println!("\n=== samples (EXP vs GOT, first divergent line; top 25 signatures) ===");
+        for (k, _n) in v.iter().take(25) {
+            if let Some(s) = other_sample.get(*k) {
+                println!("[{k}]\n{s}\n");
+            }
+        }
         println!("\ndone");
         return;
     }

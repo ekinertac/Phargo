@@ -1224,9 +1224,11 @@ class DOMNamedNodeMap implements Countable {
     public function __get($n) { return $n === "length" ? count($this->__a) : null; }
 }
 class DOMDocument extends DOMNode {
-    public $documentElement = null; public $encoding = "UTF-8"; public $version = "1.0"; public $formatOutput = false; public $preserveWhiteSpace = true;
+    public $documentElement = null; public $encoding = ""; public $version = "1.0"; public $formatOutput = false; public $preserveWhiteSpace = true;
     public function __construct($version = "1.0", $encoding = "") { $this->nodeType = 9; $this->nodeName = "#document"; $this->version = $version; if ($encoding !== "") { $this->encoding = $encoding; } }
     public function loadXML($xml, $opts = 0) {
+        if (preg_match('/<\?xml[^>]*encoding=["\x27]([^"\x27]+)["\x27]/', $xml, $m)) { $this->encoding = $m[1]; }
+        if (preg_match('/<\?xml[^>]*version=["\x27]([^"\x27]+)["\x27]/', $xml, $m)) { $this->version = $m[1]; }
         $tree = __dom_parse($xml);
         if ($tree === false) { return false; }
         $root = $this->__build($tree); $root->__parent = $this;
@@ -1259,7 +1261,7 @@ class DOMDocument extends DOMNode {
     }
     public function saveXML($node = null) {
         if ($node === null) {
-            $s = "<?xml version=\"" . $this->version . "\"?>\n";
+            $s = "<?xml version=\"" . $this->version . "\"" . ($this->encoding !== null && $this->encoding !== "" ? " encoding=\"" . $this->encoding . "\"" : "") . "?>\n";
             foreach ($this->__kids as $k) { $s .= $this->__ser($k); }
             return $s . "\n";
         }
@@ -1353,6 +1355,150 @@ class HTMLDocument extends DOMDocument {
     public static function createFromString($source, $options = 0, $overrideEncoding = null) { $d = new HTMLDocument(); $d->loadXML($source); return $d; }
     public static function createFromFile($path, $options = 0, $overrideEncoding = null) { $d = new HTMLDocument(); $d->load($path); return $d; }
     public static function createEmpty($encoding = "UTF-8") { $d = new HTMLDocument(); $d->encoding = $encoding; return $d; }
+}
+
+// ---- DOMXPath (XPath 1.0 subset over the DOM tree above) ----
+// Only the fragment of XPath the php-src corpus actually exercises: absolute
+// (/a/b) and "//" descendant paths, "*"/"text()"/"@attr" node tests, and the
+// predicates [N], [last()], [@attr], [@attr="v"]. Everything is implemented as
+// free functions (prefixed __xp_) operating on plain DOMNode object references,
+// then wrapped by the DOMXPath class methods query()/evaluate(). Grouping for
+// position()/last() is "per immediate parent", matching XPath's per-context-node
+// semantics for the simple non-nested-predicate case this subset supports.
+function __xp_parse_step($p) {
+    $b = strpos($p, "[");
+    if ($b === false) { return [$p, null]; }
+    $close = strrpos($p, "]");
+    $test = substr($p, 0, $b);
+    $pred = substr($p, $b + 1, $close - $b - 1);
+    return [$test, $pred];
+}
+function __xp_tokenize($expr) {
+    $s = $expr;
+    if (str_starts_with($s, "//")) { $absolute = true; $s = substr($s, 2); $axis = "descendant"; }
+    elseif (str_starts_with($s, "/")) { $absolute = true; $s = substr($s, 1); $axis = "child"; }
+    else { $absolute = false; $axis = "child"; }
+    $parts = explode("/", $s);
+    $steps = [];
+    foreach ($parts as $p) {
+        if ($p === "") { $axis = "descendant"; continue; }
+        [$test, $pred] = __xp_parse_step($p);
+        $steps[] = ["axis" => $axis, "test" => $test, "pred" => $pred];
+        $axis = "child";
+    }
+    return ["absolute" => $absolute, "steps" => $steps];
+}
+function __xp_parent_key($n) { return $n->__parent === null ? "__root__" : (string) spl_object_id($n->__parent); }
+function __xp_group_by_parent($nodes) {
+    $groups = [];
+    foreach ($nodes as $n) { $groups[__xp_parent_key($n)][] = $n; }
+    return $groups;
+}
+function __xp_apply_pred($nodes, $pred) {
+    $pred = trim($pred);
+    if ($pred === "") { return $nodes; }
+    if ($pred === "last()") {
+        $groups = __xp_group_by_parent($nodes);
+        $out = [];
+        foreach ($nodes as $n) {
+            $grp = $groups[__xp_parent_key($n)];
+            if (count($grp) > 0 && $grp[count($grp) - 1] === $n) { $out[] = $n; }
+        }
+        return $out;
+    }
+    if (is_numeric($pred)) {
+        $idx = (int) $pred - 1;
+        $groups = __xp_group_by_parent($nodes);
+        $out = []; $seen = [];
+        foreach ($nodes as $n) {
+            $key = __xp_parent_key($n);
+            if (isset($seen[$key])) { continue; }
+            $seen[$key] = true;
+            $grp = $groups[$key];
+            if (isset($grp[$idx])) { $out[] = $grp[$idx]; }
+        }
+        return $out;
+    }
+    if (preg_match('/^@([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*"([^"]*)"$/', $pred, $m) ||
+        preg_match("/^@([A-Za-z_][A-Za-z0-9_-]*)\\s*=\\s*'([^']*)'\$/", $pred, $m)) {
+        $attr = $m[1]; $val = $m[2];
+        $out = [];
+        foreach ($nodes as $n) { if (($n->__attrs[$attr] ?? null) === $val) { $out[] = $n; } }
+        return $out;
+    }
+    if (preg_match('/^@([A-Za-z_][A-Za-z0-9_-]*)$/', $pred, $m)) {
+        $attr = $m[1];
+        $out = [];
+        foreach ($nodes as $n) { if (isset($n->__attrs[$attr])) { $out[] = $n; } }
+        return $out;
+    }
+    return $nodes;
+}
+function __xp_eval($doc, $steps, $absolute, $contextNode) {
+    $current = [$absolute ? $doc : ($contextNode ?? $doc)];
+    foreach ($steps as $step) {
+        $axis = $step["axis"]; $test = $step["test"]; $pred = $step["pred"];
+        $next = [];
+        if (str_starts_with($test, "@")) {
+            $attr = substr($test, 1);
+            foreach ($current as $node) {
+                if ($node->nodeType == 1 && isset($node->__attrs[$attr])) { $next[] = new DOMAttr($attr, $node->__attrs[$attr]); }
+            }
+        } elseif ($test === ".") {
+            $next = $current;
+        } elseif ($test === "..") {
+            foreach ($current as $node) { if ($node->__parent !== null) { $next[] = $node->__parent; } }
+        } elseif ($test === "text()") {
+            foreach ($current as $node) {
+                foreach ($node->__kids as $k) { if ($k->nodeType == 3) { $next[] = $k; } }
+            }
+        } else {
+            foreach ($current as $node) {
+                if ($axis === "descendant") {
+                    foreach ($node->__collect($test) as $d) { $next[] = $d; }
+                } else {
+                    foreach ($node->__kids as $k) {
+                        if ($k->nodeType == 1 && ($test === "*" || $k->nodeName === $test)) { $next[] = $k; }
+                    }
+                }
+            }
+        }
+        if ($pred !== null) { $next = __xp_apply_pred($next, $pred); }
+        $current = $next;
+    }
+    return $current;
+}
+function __xp_dedupe($nodes) {
+    $out = []; $seen = [];
+    foreach ($nodes as $n) {
+        $id = spl_object_id($n);
+        if (!isset($seen[$id])) { $seen[$id] = true; $out[] = $n; }
+    }
+    return $out;
+}
+class DOMXPath {
+    private $__doc;
+    public function __construct($doc) { $this->__doc = $doc; }
+    public function query($expr, $contextNode = null) {
+        $tok = __xp_tokenize(trim($expr));
+        $nodes = __xp_eval($this->__doc, $tok["steps"], $tok["absolute"], $contextNode);
+        return new DOMNodeList(__xp_dedupe($nodes));
+    }
+    public function evaluate($expr, $contextNode = null) {
+        $expr = trim($expr);
+        if (str_starts_with($expr, "count(") && str_ends_with($expr, ")")) {
+            $inner = substr($expr, 6, -1);
+            return (float) $this->query($inner, $contextNode)->length;
+        }
+        if (str_starts_with($expr, "string(") && str_ends_with($expr, ")")) {
+            $inner = substr($expr, 7, -1);
+            $r = $this->query($inner, $contextNode);
+            return $r->length > 0 ? $r->item(0)->textContent : "";
+        }
+        return $this->query($expr, $contextNode);
+    }
+    public function registerNamespace($prefix, $uri) { return true; }
+    public function registerPhpFunctions($restrict = null) { return null; }
 }
 
 // ---- XMLReader (a pull parser built by flattening the __dom_parse tree) ----
@@ -2000,9 +2146,11 @@ impl Eval {
             };
             match s {
                 Stmt::Namespace { name, body } => {
+                    // keep the namespace's declared case: it becomes part of the
+                    // class's display name (keys are lowercased at insert)
                     let inner_ns = name
                         .as_ref()
-                        .map(|n| n.parts.join("\\").to_ascii_lowercase())
+                        .map(|n| n.parts.join("\\"))
                         .unwrap_or_default();
                     match body {
                         Some(b) => self.hoist_ns(b, &inner_ns),
@@ -2495,7 +2643,7 @@ impl Eval {
                 }
             }
             Stmt::Namespace { name, body } => {
-                let ns = name.as_ref().map(|n| n.parts.join("\\").to_ascii_lowercase()).unwrap_or_default();
+                let ns = name.as_ref().map(|n| n.parts.join("\\")).unwrap_or_default();
                 match body {
                     // block form: scoped to the braces
                     Some(b) => {
@@ -4078,9 +4226,9 @@ impl Eval {
                 if n.fully_qualified {
                     joined
                 } else if !self.cur_ns.is_empty()
-                    && self.funcs.contains_key(&format!("{}\\{joined}", self.cur_ns))
+                    && self.funcs.contains_key(&format!("{}\\{joined}", self.cur_ns).to_ascii_lowercase())
                 {
-                    format!("{}\\{joined}", self.cur_ns)
+                    format!("{}\\{joined}", self.cur_ns).to_ascii_lowercase()
                 } else if n.parts.len() > 1 && self.funcs.contains_key(&joined) {
                     joined
                 } else {
