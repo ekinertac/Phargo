@@ -16,6 +16,12 @@ use std::rc::Rc;
 #[derive(Debug)]
 pub struct RunError(pub String);
 
+/// Where a foreach-by-ref array lives: a local variable or an object property.
+enum ArrPlace {
+    Var(String),
+    Prop(Rc<RefCell<Obj>>, String),
+}
+
 /// Definition-site context for a function or class: the file it was declared
 /// in plus that file's namespace and `use` aliases (see Eval::def_ctx).
 struct DefCtx {
@@ -2773,9 +2779,22 @@ impl Eval {
                 // By-reference iteration over a plain array variable: elements are
                 // promoted to shared Ref cells so writes through the loop var stick.
                 if *by_ref {
-                    if let (Expr::Var(aname), Expr::Var(vname)) = (array, value) {
-                        if !is_superglobal(aname) {
-                            return self.foreach_by_ref(aname, vname, key, body);
+                    if let Expr::Var(vname) = value {
+                        match array {
+                            Expr::Var(aname) if !is_superglobal(aname) => {
+                                let place = ArrPlace::Var(aname.clone());
+                                return self.foreach_by_ref(&place, vname, key, body);
+                            }
+                            // by-ref over an object property: write through
+                            Expr::Prop(objexpr, pname, _) => {
+                                let o = self.eval(objexpr)?;
+                                let pname = self.prop_name_str(pname)?;
+                                if let Value::Object(rc) = o {
+                                    let place = ArrPlace::Prop(rc, pname);
+                                    return self.foreach_by_ref(&place, vname, key, body);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -3132,6 +3151,31 @@ impl Eval {
         }
     }
 
+    /// In-place mutable access to an array living either in a local variable
+    /// or in an object property (foreach-by-ref over `$this->arr` must write
+    /// through — WP_Hook::resort_active_iterations).
+    fn with_place_mut<T>(&mut self, place: &ArrPlace, f: impl FnOnce(&mut Arr) -> T) -> Option<T> {
+        match place {
+            ArrPlace::Var(name) => self.with_array_mut(name, f),
+            ArrPlace::Prop(rc, pname) => {
+                let mut b = rc.borrow_mut();
+                match b.get_mut(pname) {
+                    Some(Value::Array(a)) => Some(f(a)),
+                    Some(Value::Ref(cell)) => {
+                        let cell = cell.clone();
+                        drop(b);
+                        let mut cb = cell.borrow_mut();
+                        match &mut *cb {
+                            Value::Array(a) => Some(f(a)),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }
+        }
+    }
+
     /// `foreach ($arr as [$k =>] &$v)`: promote each visited element to a shared
     /// Ref cell in place and bind $v to that cell, so writes through $v (and
     /// writes to $arr[$k]) alias. After moving on, an element whose cell has no
@@ -3140,12 +3184,12 @@ impl Eval {
     /// Keys are snapshotted up front (append-during-iteration isn't modeled).
     fn foreach_by_ref(
         &mut self,
-        aname: &str,
+        place: &ArrPlace,
         vname: &str,
         key: &Option<Expr>,
         body: &[Stmt],
     ) -> R<Flow> {
-        let keys: Vec<Key> = match self.with_array_mut(aname, |a| {
+        let keys: Vec<Key> = match self.with_place_mut(place, |a| {
             a.entries.iter().map(|(k, _)| k.clone()).collect()
         }) {
             Some(ks) => ks,
@@ -3171,7 +3215,7 @@ impl Eval {
                     if appended >= MAX_LIVE_APPENDS {
                         break;
                     }
-                    let fresh: Vec<Key> = match self.with_array_mut(aname, |a| {
+                    let fresh: Vec<Key> = match self.with_place_mut(place, |a| {
                         let start = scan_pos.min(a.entries.len());
                         let f: Vec<Key> = a.entries[start..]
                             .iter()
@@ -3195,7 +3239,7 @@ impl Eval {
             visited.insert(k.clone());
             self.tick()?;
             // promote the element to a Ref cell (in place, no array clone)
-            let cell = match self.with_array_mut(aname, |a| {
+            let cell = match self.with_place_mut(place, |a| {
                 a.get_mut(&k).map(|slot| match slot {
                     Value::Ref(c) => c.clone(),
                     other => {
@@ -3215,7 +3259,7 @@ impl Eval {
             self.vars().insert(vname.to_string(), Value::Ref(cell.clone()));
             // now that $v moved off the previous cell, unwrap it if unaliased
             if let Some((pk, pc)) = prev.take() {
-                self.unwrap_element(aname, &pk, &pc);
+                self.unwrap_element(place, &pk, &pc);
             }
             match self.exec_block(body)? {
                 Flow::Break(n) => {
@@ -3233,11 +3277,11 @@ impl Eval {
 
     /// Demote a foreach-by-ref element back to a plain value once nothing but
     /// the array (and our transient handle) holds its cell.
-    fn unwrap_element(&mut self, aname: &str, k: &Key, cell: &Rc<RefCell<Value>>) {
+    fn unwrap_element(&mut self, place: &ArrPlace, k: &Key, cell: &Rc<RefCell<Value>>) {
         if Rc::strong_count(cell) != 2 {
             return; // still aliased (closure capture, =&, …) — keep the ref
         }
-        self.with_array_mut(aname, |a| {
+        self.with_place_mut(place, |a| {
             if let Some(slot) = a.get_mut(k) {
                 if let Value::Ref(c) = slot {
                     if Rc::ptr_eq(c, cell) {
@@ -4756,6 +4800,12 @@ impl Eval {
                         return Ok(Value::Bool(false));
                     }
                     return Ok(Value::Int(count));
+                }
+                // 5-arg form: write the replacement count into the by-ref arg
+                "preg_replace" if args.len() >= 5 => {
+                    let (v, n) = preg_replace_full(&argv);
+                    self.assign_to(&args[4].value, Value::Int(n))?;
+                    return Ok(v);
                 }
                 // by-ref out-param: decode the query string into args[1]
                 "parse_str" if args.len() >= 2 => {
@@ -9979,33 +10029,7 @@ impl Eval {
                 };
                 Value::Str(crate::rx_quote(&s, delim).into_bytes())
             }
-            "preg_replace" => {
-                let subject = String::from_utf8_lossy(&to_bytes(&a(2))).into_owned();
-                let limit = if args.len() > 3 { to_i64(&a(3)) } else { -1 };
-                let pats: Vec<Vec<u8>> = match a(0) {
-                    Value::Array(arr) => arr.entries.into_iter().map(|(_, v)| to_bytes(&v)).collect(),
-                    v => vec![to_bytes(&v)],
-                };
-                let rep_is_arr = matches!(a(1), Value::Array(_));
-                let reps: Vec<Vec<u8>> = match a(1) {
-                    Value::Array(arr) => arr.entries.into_iter().map(|(_, v)| to_bytes(&v)).collect(),
-                    v => vec![to_bytes(&v)],
-                };
-                let mut result = subject;
-                let mut count = 0i64;
-                for (i, p) in pats.iter().enumerate() {
-                    let pattern = String::from_utf8_lossy(p).into_owned();
-                    let repl = if rep_is_arr {
-                        reps.get(i).map(|r| String::from_utf8_lossy(r).into_owned()).unwrap_or_default()
-                    } else {
-                        String::from_utf8_lossy(&reps[0]).into_owned()
-                    };
-                    if let Some(rx) = crate::rx_compile(&pattern) {
-                        result = crate::rx_replace_str(&rx, &repl, &result, limit, &mut count);
-                    }
-                }
-                Value::Str(result.into_bytes())
-            }
+            "preg_replace" => preg_replace_full(&args).0,
             "preg_replace_callback" => {
                 let pattern = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 let cb = a(1);
@@ -11688,6 +11712,38 @@ fn php_glob(pattern: &str) -> Vec<String> {
     // final existence filter for fully-literal patterns
     bases.retain(|p| std::path::Path::new(p).exists());
     bases
+}
+
+/// preg_replace core, returning (result, replacement count) — the count
+/// feeds the by-ref 5th parameter (WP's formatting.php Vulcan-quote logic
+/// branches on it).
+fn preg_replace_full(argv: &[Value]) -> (Value, i64) {
+    let g = |i: usize| argv.get(i).cloned().unwrap_or(Value::Null);
+    let subject = String::from_utf8_lossy(&to_bytes(&g(2))).into_owned();
+    let limit = if argv.len() > 3 { to_i64(&g(3)) } else { -1 };
+    let pats: Vec<Vec<u8>> = match g(0) {
+        Value::Array(arr) => arr.entries.into_iter().map(|(_, v)| to_bytes(&v)).collect(),
+        v => vec![to_bytes(&v)],
+    };
+    let rep_is_arr = matches!(g(1), Value::Array(_));
+    let reps: Vec<Vec<u8>> = match g(1) {
+        Value::Array(arr) => arr.entries.into_iter().map(|(_, v)| to_bytes(&v)).collect(),
+        v => vec![to_bytes(&v)],
+    };
+    let mut result = subject;
+    let mut count = 0i64;
+    for (i, p) in pats.iter().enumerate() {
+        let pattern = String::from_utf8_lossy(p).into_owned();
+        let repl = if rep_is_arr {
+            reps.get(i).map(|r| String::from_utf8_lossy(r).into_owned()).unwrap_or_default()
+        } else {
+            String::from_utf8_lossy(&reps[0]).into_owned()
+        };
+        if let Some(rx) = crate::rx_compile(&pattern) {
+            result = crate::rx_replace_str(&rx, &repl, &result, limit, &mut count);
+        }
+    }
+    (Value::Str(result.into_bytes()), count)
 }
 
 /// parse_str(): decode a query string into a (possibly nested) array.

@@ -27,6 +27,27 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-05 (later) — A clean page.
+
+**Zero warnings.** The front page renders 25.7 KB of WordPress with no
+diagnostics at all. The last two:
+
+- `preg_replace`'s by-ref 5th `$count` parameter (formatting.php's
+  curly-quote "Vulcan logic" branches on it) — same shape as the
+  str_replace count fixed two days ago; the builtin core now returns the
+  count and a dispatch arm writes it through.
+- **foreach-by-ref over an object property didn't write back.**
+  `foreach ($this->iterations as &$iteration)` in
+  WP_Hook::resort_active_iterations silently iterated a copy — hook
+  priorities went stale whenever a filter was added mid-dispatch. The
+  by-ref foreach now abstracts over its storage (local variable or object
+  property) and mutates the property array in place, same Ref-cell
+  promotion, same live-append semantics.
+
+Also promoted the installer to a tracked tool (`examples/wpinstall.rs`):
+fetch-wp.sh → wpinstall → wpscan is now the full reproducible pipeline
+from nothing to a rendered page.
+
 ## 2026-07-05 — Hello world!
 
 **The front page renders its post.** `<a href="http://localhost/?p=1">Hello
