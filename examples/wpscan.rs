@@ -1,0 +1,91 @@
+//! The second oracle: how far does WordPress get on this engine?
+//!
+//! Synthesizes a minimal wp-config.php (untracked, inside vendor/wordpress/),
+//! sets up a CLI-ish SAPI fixture ($_SERVER etc.), and runs WordPress's
+//! bootstrap chain under the engine. Reports the first death: the error, and
+//! the tail of whatever output was produced before it.
+//!
+//! Per docs/ROADMAP.md Phase 0, this harness's blocker ranking outranks the
+//! corpus scoreboard when the two disagree about what to build next.
+
+use std::path::PathBuf;
+
+const WP_CONFIG: &str = r#"<?php
+define('DB_NAME', 'wordpress');
+define('DB_USER', 'wp');
+define('DB_PASSWORD', 'wp');
+define('DB_HOST', 'localhost');
+define('DB_CHARSET', 'utf8');
+define('DB_COLLATE', '');
+$table_prefix = 'wp_';
+define('WP_DEBUG', false);
+define('AUTH_KEY', 'k'); define('SECURE_AUTH_KEY', 'k'); define('LOGGED_IN_KEY', 'k');
+define('NONCE_KEY', 'k'); define('AUTH_SALT', 'k'); define('SECURE_AUTH_SALT', 'k');
+define('LOGGED_IN_SALT', 'k'); define('NONCE_SALT', 'k');
+if ( ! defined( 'ABSPATH' ) ) {
+    define( 'ABSPATH', __DIR__ . '/' );
+}
+require_once ABSPATH . 'wp-settings.php';
+"#;
+
+fn main() {
+    std::panic::set_hook(Box::new(|_| {}));
+    std::thread::Builder::new()
+        .stack_size(1024 * 1024 * 1024)
+        .spawn(scan)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn scan() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let wp = root.join("vendor").join("wordpress");
+    if !wp.join("wp-settings.php").exists() {
+        eprintln!("run scripts/fetch-wp.sh first");
+        return;
+    }
+    // synthesize wp-config.php (vendor/ is untracked)
+    let cfg = wp.join("wp-config.php");
+    if !cfg.exists() {
+        std::fs::write(&cfg, WP_CONFIG).expect("write wp-config");
+    }
+
+    // the driver script: SAPI fixture + the real WP entry chain
+    let driver = format!(
+        r#"<?php
+$_SERVER['HTTP_HOST'] = 'localhost';
+$_SERVER['REQUEST_URI'] = '/';
+$_SERVER['REQUEST_METHOD'] = 'GET';
+$_SERVER['SERVER_PROTOCOL'] = 'HTTP/1.1';
+$_SERVER['SERVER_NAME'] = 'localhost';
+$_SERVER['SCRIPT_NAME'] = '/index.php';
+$_SERVER['PHP_SELF'] = '/index.php';
+$_SERVER['DOCUMENT_ROOT'] = '{wp}';
+$_SERVER['REMOTE_ADDR'] = '127.0.0.1';
+require '{wp}/wp-load.php';
+echo "\n=== WP BOOTSTRAP COMPLETED ===\n";
+"#,
+        wp = wp.display()
+    );
+
+    let t = std::time::Instant::now();
+    let result = std::panic::catch_unwind(|| {
+        phargo::run_with_path(&driver, Some(wp.join("index.php")))
+    });
+    let ms = t.elapsed().as_millis();
+
+    println!("=== wpscan: WordPress 6.7.x bootstrap under Phargo ===");
+    println!("elapsed: {ms} ms");
+    match result {
+        Ok(Ok(out)) => {
+            println!("run returned OK; output {} bytes", out.len());
+            let tail: String = out.chars().rev().take(1200).collect::<String>().chars().rev().collect();
+            println!("--- output tail ---\n{tail}");
+        }
+        Ok(Err(e)) => {
+            println!("DIED (engine error): {e}");
+        }
+        Err(_) => println!("DIED (panic)"),
+    }
+}
