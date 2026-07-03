@@ -173,6 +173,19 @@ array_intersect_key/array_diff_key, alt-syntax switch templates.
 **Next: run the WP installer (wp-admin/install.php?step=2 equivalent) to
 populate the SQLite DB, then render the front page.**
 
+**UPDATE (2026-07-04, night): WordPress SERVES A PAGE.** `wp_install()`
+completes (admin user #1, 100 options, 3 posts in SQLite — the corrupting
+bug was preg_split ignoring PREG_SPLIT_DELIM_CAPTURE inside wpdb::prepare),
+and the full front-controller lifecycle renders a 23 KB HTML page:
+`<title>Phargo Test Site</title>`, block-library CSS, twentytwentyfive
+template parts, clean `</html>`. wpscan now runs the real index.php path
+and saves the response to target/wp_page.html. **The one visible gap: the
+posts loop renders "no results" — the main query's NAMED SQL parameters
+(:param0, assoc-array PDOStatement::execute) are dropped by our PDO
+bridge, which only forwards positional params (rusqlite error "Got 0,
+needed 2"). Fix in src/pdo.rs + PDO prelude: bind named params.** After
+that: "Hello world!" on the page, then wp-admin.
+
 Delegation notes: agents run clean off specs with file scope + literal
 expected outputs + numeric baselines (12 successful tasks so far, zero
 first-try failures). eval.rs is single-writer — never two agents in it.

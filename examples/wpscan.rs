@@ -78,8 +78,11 @@ $_SERVER['SCRIPT_FILENAME'] = '{wp}/index.php';
 $_SERVER['PHP_SELF'] = '/index.php';
 $_SERVER['DOCUMENT_ROOT'] = '{wp}';
 $_SERVER['REMOTE_ADDR'] = '127.0.0.1';
-require '{wp}/wp-load.php';
-echo "\n=== WP BOOTSTRAP COMPLETED ===\n";
+// the real front-controller request lifecycle (mirrors WP's index.php):
+// wp-blog-header requires wp-load, runs wp(), then the template loader.
+define('WP_USE_THEMES', true);
+require '{wp}/wp-blog-header.php';
+echo "\n=== WP PAGE RENDER COMPLETED ===\n";
 "#,
         wp = wp.display()
     );
@@ -95,6 +98,8 @@ echo "\n=== WP BOOTSTRAP COMPLETED ===\n";
     match result {
         Ok(Ok(out)) => {
             println!("run returned OK; output {} bytes", out.len());
+            // keep the full response for inspection (target/ is untracked)
+            let _ = std::fs::write(root.join("target").join("wp_page.html"), &out);
             // the blocker line, untruncated
             if let Some(i) = out.find("Fatal error") {
                 let line: String = out[i..].lines().next().unwrap_or("").to_string();

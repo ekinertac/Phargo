@@ -995,6 +995,10 @@ impl Parser {
                 } else if self.at_kw("readonly") {
                     self.bump();
                     readonly = true;
+                } else if self.at_kw("var") && matches!(self.at(1), Kind::Variable(_)) {
+                    // PHP4-style `var $x;` — visibility, never a type hint
+                    self.bump();
+                    visibility = Visibility::Public;
                 } else {
                     break;
                 }

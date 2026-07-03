@@ -27,6 +27,83 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-04 (night) — `<title>Phargo Test Site</title>`
+
+**WordPress serves a page.** The full front-controller lifecycle — index.php →
+wp-blog-header → `wp()` → main query → template loader → twentytwentyfive block
+theme → `wp_head` — runs to `=== WP PAGE RENDER COMPLETED ===`, emitting a
+23 KB HTML document with the site title from the SQLite database, the block
+library's inline CSS, rendered template parts, and a proper `</html>`. The
+sole gap left on the page: the posts loop says "no results" because the main
+query's named SQL parameters (`:param0`) get dropped at our PDO bridge —
+rusqlite wants named binding, we forward positional. Next batch's first fix.
+
+The rungs between "installed" and "page":
+
+- **`(array) $object` didn't extract properties** — it wrapped the object in
+  `[0 => $obj]`. WP's block parser casts `WP_Block_Parser_Block` to array;
+  every block came out with no `blockName`. Now PHP-exact including the
+  NUL-mangled `\0Class\0prop` / `\0*\0prop` private/protected keys.
+- **`PREG_OFFSET_CAPTURE` and preg_match's 5th `$offset` argument** were
+  ignored — the block parser advances through the document by match offset,
+  so it saw offsets made of garbage. preg_run now returns byte offsets
+  (computed from the char-indexed matcher), honors `PREG_SET_ORDER`, omits
+  trailing unmatched groups like PHP, and returns `false` for out-of-range
+  offsets. All verified byte-identical against PHP 8.
+- **Parameter defaults evaluate before the class scope was set** —
+  `WP_Theme_JSON::__construct($theme_json = array('version' =>
+  self::LATEST_SCHEMA))` resolved `self::` to the *caller's* class. bind_params
+  now runs under the callee's class + definition context.
+- **SPL filesystem iterators** (`FilesystemIterator`,
+  `RecursiveDirectoryIterator`, `RegexIterator`, `RecursiveRegexIterator`) —
+  the theme scanner is a RecursiveIteratorIterator/RegexIterator stack.
+- Honest gaps: `strtok` (stateful), `parse_str` (bracket-nested query
+  strings), `array_replace(_recursive)`, `hash_equals`, and the
+  `ENT_XML1`/`JSON_HEX_*` constant families.
+
+Corpus along the way: 3739 → 3752 (installer batch) → 3784 (+45 total today
+so far), smoke 88/93. Not bad for a day that started with an "infinite loop".
+
+## 2026-07-04 (later) — WordPress installs itself.
+
+**`wp_install()` runs end-to-end: admin user created (ID 1), 100 options,
+3 posts, all in a real SQLite file. A normal front-page request then
+bootstraps against that database to completion.**
+
+The blocker chain after "bootstrap completes" was the installer's, and the
+final boss was a beauty: every INSERT the installer issued came out as
+`VALUES ,:param0 ), ,:param1 )…` — tables created, zero rows written, and
+WordPress soft-continues past failed inserts, so the "installed" site died
+later with *"One or more database tables are unavailable."* The trail led
+through the SQLite plugin's translator (innocent), its query rewriter
+(innocent, verified in isolation), and finally to `wpdb::prepare()` — which
+uses `preg_split(..., PREG_SPLIT_DELIM_CAPTURE)` to interleave format
+specifiers with query text. Our preg_split ignored DELIM_CAPTURE entirely:
+4 pieces instead of 10, and sprintf reassembled a query with the tuples'
+guts missing. One flag, the whole installer.
+
+Also in the chain, each verified byte-identical against PHP 8:
+- **sha256 + hash_hmac from scratch** — WP's `placeholder_escape()` wants
+  `hash_hmac('sha256', …)`; the compat polyfill only does md5/sha1 and
+  returns false, which would have poisoned every `%` escape.
+- **`var $x;` parsed as a typed property** of type `var` — phpass's PHP4
+  declarations made every password hasher write throw TypeError.
+- **Property defaults now evaluate in definition context** — `self::CONST`
+  (PHPMailer) and use-aliased classes (`Port::ACAP` in Requests' Iri) both
+  appear in property initializers.
+- **find_method now autoloads missing ancestors** — `WP_HTTP_Requests_Hooks
+  extends WpOrg\Requests\Hooks` where the parent arrives via PSR-4 later.
+- **Stack traces carry per-frame callsite files** — no more "everything
+  thrown in wp-settings.php"; the frames finally name the real files.
+- Sockets (`fsockopen`/`stream_socket_client`) fail like a refused
+  connection with by-ref errno/errstr, so Requests raises its catchable
+  exception and WP falls back to WP_Error — no network layer, no fatal.
+- Small honest gaps: `stripcslashes`/`addcslashes`, `error_log`,
+  `hash_equals`, CRYPT_*/STREAM_CLIENT_* constants.
+
+wpscan now runs the real front-controller lifecycle (wp-blog-header.php →
+`wp()` → template loader). Next: make it print a rendered page.
+
 ## 2026-07-04 — WordPress boots.
 
 **`=== BOOTSTRAP COMPLETED ===` — the whole wp-load → wp-settings chain runs

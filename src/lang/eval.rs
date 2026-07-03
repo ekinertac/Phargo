@@ -85,6 +85,8 @@ pub struct Eval {
     cur_line: u32,
     /// bcscale() default decimal precision for the bc* builtins.
     bc_scale: usize,
+    /// strtok() resumable state: (subject, cursor).
+    strtok_state: Option<(Vec<u8>, usize)>,
     /// (class, method) → resolved Rc'd declaration; cleared on class changes.
     method_cache: RefCell<HashMap<(String, String), Option<(String, Rc<MethodDecl>)>>>,
     /// `fn:<name>` / `class:<name>` (lowercase) → definition-site context.
@@ -98,7 +100,7 @@ pub struct Eval {
     use_map: HashMap<String, String>,
     /// Call-frame stack for exception traces: (display name like "f" or
     /// "Class->m", caller's line at the call site). Parallel to cur_fn pushes.
-    frames: Vec<(String, u32)>,
+    frames: Vec<(String, u32, String)>,  // (callable, callsite line, callsite file)
     /// Function/class names registered by the PRELUDE — they emulate C
     /// internals, so their bodies never emit engine warnings (lowercased).
     prelude_fns: HashSet<String>,
@@ -1022,6 +1024,85 @@ class DirectoryIterator implements Iterator {
     public function isFile() { return is_file($this->getPathname()); }
     public function getBasename($suffix = "") { $f = $this->__d[$this->__p]; if ($suffix !== "" && str_ends_with($f, $suffix)) { $f = substr($f, 0, strlen($f) - strlen($suffix)); } return $f; }
     public function __toString() { return $this->__d[$this->__p]; }
+}
+class FilesystemIterator implements Iterator {
+    const CURRENT_AS_PATHNAME = 32; const CURRENT_AS_FILEINFO = 0; const CURRENT_AS_SELF = 16;
+    const KEY_AS_PATHNAME = 0; const KEY_AS_FILENAME = 256; const NEW_CURRENT_AND_KEY = 256;
+    const FOLLOW_SYMLINKS = 512; const SKIP_DOTS = 4096; const UNIX_PATHS = 8192;
+    protected $__fspath; protected $__fsflags; protected $__fsitems; protected $__fsp = 0;
+    public function __construct($path, $flags = 4096) {
+        $this->__fspath = rtrim($path, "/");
+        $this->__fsflags = $flags;
+        $items = @scandir($path);
+        if ($items === false) { throw new UnexpectedValueException("FilesystemIterator::__construct(" . $path . "): failed to open dir"); }
+        if ($flags & 4096) { $items = array_values(array_diff($items, [".", ".."])); }
+        $this->__fsitems = $items;
+    }
+    public function rewind(): void { $this->__fsp = 0; }
+    public function valid(): bool { return $this->__fsp < count($this->__fsitems); }
+    public function next(): void { $this->__fsp = $this->__fsp + 1; }
+    public function getFilename() { return $this->__fsitems[$this->__fsp]; }
+    public function getPathname() { return $this->__fspath . "/" . $this->__fsitems[$this->__fsp]; }
+    public function getPath() { return $this->__fspath; }
+    public function isDot() { $f = $this->getFilename(); return $f === "." || $f === ".."; }
+    public function isDir() { return is_dir($this->getPathname()); }
+    public function isFile() { return is_file($this->getPathname()); }
+    public function isLink() { return false; }
+    public function isReadable() { return is_readable($this->getPathname()); }
+    public function getExtension() { return pathinfo($this->getPathname(), PATHINFO_EXTENSION); }
+    public function getBasename($suffix = "") { return basename($this->getPathname(), $suffix); }
+    public function getSize() { return filesize($this->getPathname()); }
+    public function getMTime() { return @filemtime($this->getPathname()); }
+    public function key(): mixed { return ($this->__fsflags & 256) ? $this->getFilename() : $this->getPathname(); }
+    public function current(): mixed {
+        if ($this->__fsflags & 32) { return $this->getPathname(); }
+        if ($this->__fsflags & 16) { return $this; }
+        return new SplFileInfo($this->getPathname());
+    }
+    public function setFlags($flags) { $this->__fsflags = $flags; }
+    public function getFlags() { return $this->__fsflags; }
+    public function __toString() { return $this->getFilename(); }
+}
+class RecursiveDirectoryIterator extends FilesystemIterator {
+    public function hasChildren($allow_links = false) { return !$this->isDot() && $this->isDir(); }
+    public function getChildren() { return new RecursiveDirectoryIterator($this->getPathname(), $this->__fsflags); }
+    public function getSubPath() { return ""; }
+    public function getSubPathname() { return $this->getFilename(); }
+}
+class RegexIterator implements Iterator {
+    const MATCH = 0; const GET_MATCH = 1; const ALL_MATCHES = 2; const SPLIT = 3; const REPLACE = 4;
+    const USE_KEY = 1; const INVERT_MATCH = 2;
+    protected $__rit; protected $__rre; protected $__rmode; protected $__rflags; protected $__rcur;
+    public function __construct($it, $regex, $mode = 0, $flags = 0, $preg_flags = 0) {
+        if ($it instanceof IteratorAggregate) { $it = $it->getIterator(); }
+        $this->__rit = $it; $this->__rre = $regex; $this->__rmode = $mode; $this->__rflags = $flags;
+    }
+    public function rewind(): void { $this->__rit->rewind(); $this->__rgxadvance(); }
+    public function valid(): bool { return $this->__rit->valid(); }
+    public function key(): mixed { return $this->__rit->key(); }
+    public function current(): mixed { return $this->__rcur; }
+    public function next(): void { $this->__rit->next(); $this->__rgxadvance(); }
+    public function getInnerIterator() { return $this->__rit; }
+    protected function __rgxadvance() {
+        while ($this->__rit->valid()) {
+            $subj = ($this->__rflags & 1) ? $this->__rit->key() : $this->__rit->current();
+            $subj = (string)$subj;
+            $hit = preg_match($this->__rre, $subj, $m);
+            if ($this->__rflags & 2) { $hit = !$hit; $m = []; }
+            if ($hit) {
+                if ($this->__rmode === 1) { $this->__rcur = $m; }
+                elseif ($this->__rmode === 2) { preg_match_all($this->__rre, $subj, $ma); $this->__rcur = $ma; }
+                elseif ($this->__rmode === 3) { $this->__rcur = preg_split($this->__rre, $subj); }
+                else { $this->__rcur = $this->__rit->current(); }
+                return;
+            }
+            $this->__rit->next();
+        }
+    }
+}
+class RecursiveRegexIterator extends RegexIterator {
+    public function hasChildren() { return $this->__rit->hasChildren(); }
+    public function getChildren() { return new RecursiveRegexIterator($this->__rit->getChildren(), $this->__rre, $this->__rmode, $this->__rflags); }
 }
 class SplFileObject implements Iterator {
     const DROP_NEW_LINE = 1; const READ_AHEAD = 2; const SKIP_EMPTY = 4; const READ_CSV = 8;
@@ -1977,6 +2058,7 @@ impl Eval {
             cur_ns: String::new(),
             use_map: HashMap::new(),
             bc_scale: 0,
+            strtok_state: None,
             method_cache: RefCell::new(HashMap::new()),
             def_ctx: HashMap::new(),
             frames: Vec::new(),
@@ -2379,6 +2461,13 @@ impl Eval {
                 _ => {}
             }
         }
+    }
+
+    fn cur_file_str(&self) -> String {
+        self.cur_file
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 
     fn record_def_ctx(&mut self, key: String, ns: &str, uses: &Rc<HashMap<String, String>>) {
@@ -3946,6 +4035,38 @@ impl Eval {
             CastType::Array => match v {
                 Value::Array(_) => v,
                 Value::Null => Value::Array(Arr::new()),
+                // (array)$obj extracts the property table; private/protected
+                // keys get PHP's NUL-mangled prefixes ("\0Class\0p", "\0*\0p")
+                Value::Object(rc) => {
+                    let class = rc.borrow().class.clone();
+                    let props: Vec<(String, Value)> = rc.borrow().props.clone();
+                    let mut a = Arr::new();
+                    for (name, val) in props {
+                        let annot = self.prop_annotation(&class, &name);
+                        let key = if annot.is_empty() {
+                            name.into_bytes()
+                        } else if annot == ":protected" {
+                            let mut k = b"\0*\0".to_vec();
+                            k.extend_from_slice(name.as_bytes());
+                            k
+                        } else {
+                            // annot is `:"Declaring":private`
+                            let decl = annot
+                                .trim_start_matches(":\"")
+                                .split('"')
+                                .next()
+                                .unwrap_or(&class)
+                                .to_string();
+                            let mut k = vec![0u8];
+                            k.extend_from_slice(decl.as_bytes());
+                            k.push(0);
+                            k.extend_from_slice(name.as_bytes());
+                            k
+                        };
+                        a.insert(Key::Str(key), val);
+                    }
+                    Value::Array(a)
+                }
                 other => {
                     let mut a = Arr::new();
                     a.push(other);
@@ -4623,11 +4744,39 @@ impl Eval {
                     let all = name == "preg_match_all";
                     let pat = to_bytes(argv.get(0).unwrap_or(&Value::Null));
                     let subj = to_bytes(argv.get(1).unwrap_or(&Value::Null));
-                    let (count, matches) = self.preg_run(&pat, &subj, all);
+                    let flags = argv.get(3).map(to_i64).unwrap_or(0);
+                    let start = argv.get(4).map(to_i64).unwrap_or(0).max(0) as usize;
+                    let (count, matches) = self.preg_run(&pat, &subj, all, flags, start);
                     if args.len() > 2 {
                         self.assign_to(&args[2].value, matches)?;
                     }
+                    if count < 0 {
+                        return Ok(Value::Bool(false));
+                    }
                     return Ok(Value::Int(count));
+                }
+                // by-ref out-param: decode the query string into args[1]
+                "parse_str" if args.len() >= 2 => {
+                    let qs = to_bytes(argv.get(0).unwrap_or(&Value::Null));
+                    self.assign_to(&args[1].value, Value::Array(php_parse_str(&qs)))?;
+                    return Ok(Value::Null);
+                }
+                // no network layer: sockets fail like a refused connection,
+                // with errno/errstr written through the by-ref params so
+                // callers (Requests' Fsockopen transport) raise their own
+                // catchable errors instead of fataling
+                "fsockopen" | "stream_socket_client" => {
+                    let (errno_i, errstr_i) = if name == "fsockopen" { (2, 3) } else { (1, 2) };
+                    if args.len() > errno_i {
+                        self.assign_to(&args[errno_i].value, Value::Int(61))?;
+                    }
+                    if args.len() > errstr_i {
+                        self.assign_to(
+                            &args[errstr_i].value,
+                            Value::Str(b"Connection refused".to_vec()),
+                        )?;
+                    }
+                    return Ok(Value::Bool(false));
                 }
                 // 4-arg form: write the replacement count into the by-ref arg
                 "str_replace" | "str_ireplace" if args.len() >= 4 => {
@@ -5071,20 +5220,68 @@ impl Eval {
 
     /// Run a `preg_match`/`preg_match_all`, returning (count, matches-array),
     /// reusing the legacy regex engine (char-based, Value-independent).
-    fn preg_run(&self, pat: &[u8], subj: &[u8], all: bool) -> (i64, Value) {
+    fn preg_run(
+        &self,
+        pat: &[u8],
+        subj: &[u8],
+        all: bool,
+        flags: i64,
+        start_byte: usize,
+    ) -> (i64, Value) {
         let pattern = String::from_utf8_lossy(pat).into_owned();
         let rx = match crate::rx_compile(&pattern) {
             Some(r) => r,
             None => return (0, Value::Bool(false)),
         };
         let text: Vec<char> = String::from_utf8_lossy(subj).chars().collect();
+        let offset_capture = flags & 256 != 0; // PREG_OFFSET_CAPTURE
+        let set_order = flags & 2 != 0; // PREG_SET_ORDER (preg_match_all)
+        // PHP reports BYTE offsets; the matcher works on chars
+        let mut byte_at: Vec<usize> = Vec::with_capacity(text.len() + 1);
+        let mut b = 0usize;
+        for ch in &text {
+            byte_at.push(b);
+            b += ch.len_utf8();
+        }
+        byte_at.push(b);
+        let start_char = byte_at
+            .iter()
+            .position(|&x| x >= start_byte)
+            .unwrap_or(text.len());
         let mut steps = 0usize;
-        let grp = |slots: &[usize], g: usize| Value::Str(crate::rx_group_str(&text, slots, g).into_bytes());
+        let grp = |slots: &[usize], g: usize| -> Value {
+            let s = crate::rx_group_str(&text, slots, g);
+            if offset_capture {
+                let off = slots.get(2 * g).copied().unwrap_or(usize::MAX);
+                let off_v = if off == usize::MAX {
+                    -1i64
+                } else {
+                    byte_at[off.min(text.len())] as i64
+                };
+                let mut pair = Arr::new();
+                pair.push(Value::Str(s.into_bytes()));
+                pair.push(Value::Int(off_v));
+                Value::Array(pair)
+            } else {
+                Value::Str(s.into_bytes())
+            }
+        };
+        if start_byte > byte_at[text.len()] {
+            // offset past the end of the subject: PHP returns false
+            return (-1, Value::Array(Arr::new()));
+        }
         if !all {
-            match rx.exec(&text, 0, &mut steps) {
+            match rx.exec(&text, start_char, &mut steps) {
                 Some(slots) => {
                     let mut m = Arr::new();
+                    // PHP omits TRAILING unmatched groups from the match array
+                    let mut last = 0;
                     for g in 0..=rx.ngroups {
+                        if slots.get(2 * g).copied().unwrap_or(usize::MAX) != usize::MAX {
+                            last = g;
+                        }
+                    }
+                    for g in 0..=last {
                         if let Some((nm, _)) = rx.names.iter().find(|(_, idx)| *idx == g) {
                             m.insert(Key::Str(nm.as_bytes().to_vec()), grp(&slots, g));
                         }
@@ -5096,7 +5293,7 @@ impl Eval {
             }
         } else {
             let mut sets: Vec<Vec<usize>> = Vec::new();
-            let mut start = 0;
+            let mut start = start_char;
             while let Some(slots) = rx.exec(&text, start, &mut steps) {
                 let (ms, me) = (slots[0], slots[1]);
                 sets.push(slots);
@@ -5106,15 +5303,28 @@ impl Eval {
                 }
             }
             let mut result = Arr::new();
-            for g in 0..=rx.ngroups {
-                let mut col = Arr::new();
+            if set_order {
                 for slots in &sets {
-                    col.push(grp(slots, g));
+                    let mut m = Arr::new();
+                    for g in 0..=rx.ngroups {
+                        if let Some((nm, _)) = rx.names.iter().find(|(_, idx)| *idx == g) {
+                            m.insert(Key::Str(nm.as_bytes().to_vec()), grp(slots, g));
+                        }
+                        m.insert(Key::Int(g as i64), grp(slots, g));
+                    }
+                    result.push(Value::Array(m));
                 }
-                if let Some((nm, _)) = rx.names.iter().find(|(_, idx)| *idx == g) {
-                    result.insert(Key::Str(nm.as_bytes().to_vec()), Value::Array(col.clone()));
+            } else {
+                for g in 0..=rx.ngroups {
+                    let mut col = Arr::new();
+                    for slots in &sets {
+                        col.push(grp(slots, g));
+                    }
+                    if let Some((nm, _)) = rx.names.iter().find(|(_, idx)| *idx == g) {
+                        result.insert(Key::Str(nm.as_bytes().to_vec()), Value::Array(col.clone()));
+                    }
+                    result.insert(Key::Int(g as i64), Value::Array(col));
                 }
-                result.insert(Key::Int(g as i64), Value::Array(col));
             }
             (sets.len() as i64, Value::Array(result))
         }
@@ -5184,7 +5394,7 @@ impl Eval {
         self.enter_call()?;
         self.cur_args.push(Rc::new(args.clone()));
         self.cur_fn.push("{closure}".to_string());
-        self.frames.push(("{closure}".to_string(), self.cur_line));
+        self.frames.push(("{closure}".to_string(), self.cur_line, self.cur_file_str()));
         let mut scope = HashMap::new();
         for (k, v) in &c.captures {
             scope.insert(k.clone(), v.clone());
@@ -5272,7 +5482,7 @@ impl Eval {
         self.enter_call()?;
         self.cur_args.push(Rc::new(args.clone()));
         self.cur_fn.push(f.name.clone());
-        self.frames.push((f.name.clone(), self.cur_line));
+        self.frames.push((f.name.clone(), self.cur_line, self.cur_file_str()));
         let prev_df = self.enter_def_ctx(&format!("fn:{}", f.name.to_ascii_lowercase()));
         let mut scope = HashMap::new();
         let bind = self.bind_params(&mut scope, &f.params, &args, &f.name);
@@ -5638,11 +5848,21 @@ impl Eval {
         for c in &chain {
             if let Some(p) = c.props.iter().find(|p| p.is_static && p.name == name) {
                 let key = (c.name.to_ascii_lowercase(), name.to_string());
+                // defaults may reference `self::CONST` or use-aliased classes
+                // — evaluate under the declaring class + its def-site context
+                let prev_cc = self.current_class.replace(c.name.clone());
+                let prev_df = self.enter_def_ctx(&format!("class:{}", c.name.to_ascii_lowercase()));
                 let v = match &p.default {
-                    Some(d) => self.eval(d)?,
-                    None => Value::Null,
+                    Some(d) => self.eval(d),
+                    None => Ok(Value::Null),
                 };
-                self.static_props.insert(key.clone(), v);
+                self.current_class = prev_cc;
+                if let Some((pf, pns, puse)) = prev_df {
+                    self.cur_file = pf;
+                    self.cur_ns = pns;
+                    self.use_map = puse;
+                }
+                self.static_props.insert(key.clone(), v?);
                 return Ok(key);
             }
         }
@@ -5739,6 +5959,42 @@ impl Eval {
     /// single hottest allocation site. The memo clones once per unique
     /// (class, method) and hands out Rc thereafter; class (re)registration
     /// clears it.
+    /// find_method, but if the lookup misses because an ANCESTOR class hasn't
+    /// been loaded yet (autoloaded libraries: `class A extends \Ns\B` where B
+    /// arrives via spl_autoload later), autoload the missing parents and retry.
+    fn find_method_autoload(&mut self, class: &str, method: &str) -> Option<(String, Rc<MethodDecl>)> {
+        if let Some(hit) = self.find_method(class, method) {
+            return Some(hit);
+        }
+        let mut cur = self.find_class(class);
+        let mut guard = 0;
+        let mut loaded_any = false;
+        while let Some(c) = cur {
+            guard += 1;
+            if guard > 50 {
+                break;
+            }
+            let parent = match &c.parent {
+                Some(p) => p.clone(),
+                None => break,
+            };
+            if self.find_class_n(&parent).is_none() {
+                let name = parent.parts.join("\\");
+                if self.autoload(&name) {
+                    loaded_any = true;
+                } else {
+                    break;
+                }
+            }
+            cur = self.find_class_n(&parent);
+        }
+        if loaded_any {
+            self.method_cache.borrow_mut().clear();
+            return self.find_method(class, method);
+        }
+        None
+    }
+
     fn find_method(&self, class: &str, method: &str) -> Option<(String, Rc<MethodDecl>)> {
         let key = (class.to_ascii_lowercase(), method.to_ascii_lowercase());
         if let Some(hit) = self.method_cache.borrow().get(&key) {
@@ -5777,16 +6033,35 @@ impl Eval {
         // base-most first so overrides win.
         let chain = self.ancestry(class);
         for c in chain.iter().rev() {
+            // defaults may reference `self::CONST` or use-aliased classes
+            // (Requests' Iri: `Port::ACAP` in an array default) — evaluate
+            // under the declaring class AND its definition-site context
+            let prev_cc = self.current_class.replace(c.name.clone());
+            let prev_df = self.enter_def_ctx(&format!("class:{}", c.name.to_ascii_lowercase()));
+            let mut result = Ok(());
             for p in &c.props {
                 if p.is_static {
                     continue;
                 }
                 let v = match &p.default {
-                    Some(d) => self.eval(d)?,
-                    None => Value::Null,
+                    Some(d) => self.eval(d),
+                    None => Ok(Value::Null),
                 };
-                obj.borrow_mut().set(&p.name, v);
+                match v {
+                    Ok(v) => obj.borrow_mut().set(&p.name, v),
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
             }
+            self.current_class = prev_cc;
+            if let Some((pf, pns, puse)) = prev_df {
+                self.cur_file = pf;
+                self.cur_ns = pns;
+                self.use_map = puse;
+            }
+            result?;
         }
         let ov = Value::Object(obj);
         // constructor
@@ -5839,7 +6114,7 @@ impl Eval {
             Value::Object(rc) => rc.borrow().class.clone(),
             _ => return Ok(Value::Null),
         };
-        let (decl_class, m) = match self.find_method(&class, method) {
+        let (decl_class, m) = match self.find_method_autoload(&class, method) {
             Some(x) => x,
             None => {
                 // __call magic fallback
@@ -5892,9 +6167,13 @@ impl Eval {
             scope.insert("this".to_string(), recv.clone());
         }
         let mfname = format!("{}::{}", display_class(decl_class), m.name);
-        self.frames.push((format!("{}->{}", display_class(decl_class), m.name), self.cur_line));
+        self.frames.push((format!("{}->{}", display_class(decl_class), m.name), self.cur_line, self.cur_file_str()));
         let prev_df = self.enter_def_ctx(&format!("class:{}", decl_class.to_ascii_lowercase()));
+        // class scope must be in place BEFORE bind_params: parameter defaults
+        // may reference self:: (WP_Theme_JSON::__construct)
+        let prev_class = self.current_class.replace(decl_class.to_string());
         if let Err(e) = self.bind_params(&mut scope, &m.params, &args, &mfname) {
+            self.current_class = prev_class;
             if let Some((pf, pns, puse)) = prev_df {
                 self.cur_file = pf;
                 self.cur_ns = pns;
@@ -5921,7 +6200,6 @@ impl Eval {
                 }
             }
         }
-        let prev_class = self.current_class.replace(decl_class.to_string());
         // LSB scope: the runtime class of the receiver
         let prev_called = std::mem::replace(
             &mut self.called_class,
@@ -6050,7 +6328,7 @@ impl Eval {
         if self.find_class(class).is_none() {
             self.autoload(class);
         }
-        let (decl_class, m) = match self.find_method(class, method) {
+        let (decl_class, m) = match self.find_method_autoload(class, method) {
             Some(x) => x,
             None => {
                 return Err(self.throw_error(
@@ -6086,9 +6364,12 @@ impl Eval {
             }
         }
         let mfname = format!("{}::{}", display_class(&decl_class), m.name);
-        self.frames.push((mfname.clone(), self.cur_line));
+        self.frames.push((mfname.clone(), self.cur_line, self.cur_file_str()));
         let prev_df = self.enter_def_ctx(&format!("class:{}", decl_class.to_ascii_lowercase()));
+        // class scope before bind_params: parameter defaults may use self::
+        let prev_class = self.current_class.replace(decl_class.clone());
         if let Err(e) = self.bind_params(&mut scope, &m.params, &args, &mfname) {
+            self.current_class = prev_class;
             if let Some((pf, pns, puse)) = prev_df {
                 self.cur_file = pf;
                 self.cur_ns = pns;
@@ -6100,7 +6381,6 @@ impl Eval {
             self.call_depth -= 1;
             return Err(e);
         }
-        let prev_class = self.current_class.replace(decl_class.clone());
         // LSB scope: forwarding calls keep the caller's; explicit C::m() rebinds.
         // (Canonicalize through find_class so case matches the declaration.)
         let called = if forwarding {
@@ -7402,6 +7682,7 @@ impl Eval {
                 let h = match algo.as_str() {
                     "md5" => crate::md5_hex(&data),
                     "sha1" => crate::sha1_hex(&data),
+                    "sha256" => crate::sha256_hex(&data),
                     "crc32b" => format!("{:08x}", crate::crc32(&data)),
                     _ => {
                         return Err(self.throw_error(
@@ -7411,6 +7692,29 @@ impl Eval {
                     }
                 };
                 if to_bool(&a(2)) { Value::Str(hex_to_bytes(&h)) } else { Value::Str(h.into_bytes()) }
+            }
+            "hash_equals" => Value::Bool(to_bytes(&a(0)) == to_bytes(&a(1))),
+            "hash_hmac" => {
+                let algo = String::from_utf8_lossy(&to_bytes(&a(0))).to_ascii_lowercase();
+                let data = to_bytes(&a(1));
+                let key = to_bytes(&a(2));
+                match crate::hmac_hex(&algo, &data, &key) {
+                    Some(hex) => {
+                        if to_bool(&a(3)) {
+                            Value::Str(hex_to_bytes(&hex))
+                        } else {
+                            Value::Str(hex.into_bytes())
+                        }
+                    }
+                    None => Value::Bool(false),
+                }
+            }
+            "hash_algos" | "hash_hmac_algos" => {
+                let mut arr = Arr::new();
+                for n in ["md5", "sha1", "sha256", "crc32b"] {
+                    arr.push(Value::Str(n.as_bytes().to_vec()));
+                }
+                Value::Array(arr)
             }
             "base64_encode" => Value::Str(crate::base64_encode(&to_bytes(&a(0))).into_bytes()),
             "base64_decode" => {
@@ -7849,6 +8153,32 @@ impl Eval {
                 Value::Str(out.into_bytes())
             }
             // ---- more array builtins ----
+            "array_replace" | "array_replace_recursive" => {
+                let recursive = name == "array_replace_recursive";
+                fn rep(base: &mut Arr, over: &Arr, recursive: bool) {
+                    for (k, v) in &over.entries {
+                        if recursive {
+                            if let (Some(Value::Array(b)), Value::Array(o)) =
+                                (base.get_mut(k), v)
+                            {
+                                rep(b, o, true);
+                                continue;
+                            }
+                        }
+                        base.insert(k.clone(), v.clone());
+                    }
+                }
+                let mut out = match a(0) {
+                    Value::Array(arr) => arr,
+                    _ => Arr::new(),
+                };
+                for v in &args[1..] {
+                    if let Value::Array(o) = v {
+                        rep(&mut out, o, recursive);
+                    }
+                }
+                Value::Array(out)
+            }
             "array_intersect_key" | "array_diff_key" => {
                 let keep_present = name == "array_intersect_key";
                 let mut out = Arr::new();
@@ -8090,6 +8420,30 @@ impl Eval {
                 out.extend_from_slice(&s[end.max(start)..]);
                 Value::Str(out)
             }
+            "strtok" => {
+                // 2-arg form re-initializes; 1-arg form continues
+                if args.len() >= 2 {
+                    self.strtok_state = Some((to_bytes(&a(0)), 0));
+                }
+                let delims = if args.len() >= 2 { to_bytes(&a(1)) } else { to_bytes(&a(0)) };
+                match &mut self.strtok_state {
+                    Some((s, pos)) => {
+                        while *pos < s.len() && delims.contains(&s[*pos]) {
+                            *pos += 1;
+                        }
+                        if *pos >= s.len() {
+                            Value::Bool(false)
+                        } else {
+                            let start = *pos;
+                            while *pos < s.len() && !delims.contains(&s[*pos]) {
+                                *pos += 1;
+                            }
+                            Value::Str(s[start..*pos].to_vec())
+                        }
+                    }
+                    None => Value::Bool(false),
+                }
+            }
             "strtr" => {
                 let s = to_bytes(&a(0));
                 if let Value::Array(pairs) = a(1) {
@@ -8284,6 +8638,100 @@ impl Eval {
                         out.push(b'0');
                     } else {
                         out.push(b);
+                    }
+                }
+                Value::Str(out)
+            }
+            "stripcslashes" => {
+                let s = to_bytes(&a(0));
+                let mut out = Vec::with_capacity(s.len());
+                let mut i = 0;
+                while i < s.len() {
+                    if s[i] != b'\\' || i + 1 >= s.len() {
+                        out.push(s[i]);
+                        i += 1;
+                        continue;
+                    }
+                    i += 1;
+                    match s[i] {
+                        b'a' => out.push(0x07),
+                        b'b' => out.push(0x08),
+                        b'f' => out.push(0x0c),
+                        b'n' => out.push(b'\n'),
+                        b'r' => out.push(b'\r'),
+                        b't' => out.push(b'\t'),
+                        b'v' => out.push(0x0b),
+                        b'x' => {
+                            // \xHH: 1-2 hex digits; bare \x stays literal
+                            let mut val: u32 = 0;
+                            let mut n = 0;
+                            while n < 2 && i + 1 < s.len() && s[i + 1].is_ascii_hexdigit() {
+                                val = val * 16
+                                    + (s[i + 1] as char).to_digit(16).unwrap_or(0);
+                                i += 1;
+                                n += 1;
+                            }
+                            if n == 0 {
+                                out.push(b'x');
+                            } else {
+                                out.push(val as u8);
+                            }
+                        }
+                        b'0'..=b'7' => {
+                            // octal, up to 3 digits
+                            let mut val: u32 = (s[i] - b'0') as u32;
+                            let mut n = 1;
+                            while n < 3 && i + 1 < s.len() && (b'0'..=b'7').contains(&s[i + 1]) {
+                                val = val * 8 + (s[i + 1] - b'0') as u32;
+                                i += 1;
+                                n += 1;
+                            }
+                            out.push(val as u8);
+                        }
+                        other => out.push(other),
+                    }
+                    i += 1;
+                }
+                Value::Str(out)
+            }
+            "addcslashes" => {
+                let s = to_bytes(&a(0));
+                // charlist with "a..z" ranges
+                let list = to_bytes(&a(1));
+                let mut set = [false; 256];
+                let mut i = 0;
+                while i < list.len() {
+                    if i + 3 < list.len() && list[i + 1] == b'.' && list[i + 2] == b'.' {
+                        for b in list[i]..=list[i + 3] {
+                            set[b as usize] = true;
+                        }
+                        i += 4;
+                    } else {
+                        set[list[i] as usize] = true;
+                        i += 1;
+                    }
+                }
+                let mut out = Vec::with_capacity(s.len());
+                for &b in &s {
+                    if !set[b as usize] {
+                        out.push(b);
+                        continue;
+                    }
+                    match b {
+                        0x07 => out.extend_from_slice(b"\\a"),
+                        0x08 => out.extend_from_slice(b"\\b"),
+                        0x0c => out.extend_from_slice(b"\\f"),
+                        b'\n' => out.extend_from_slice(b"\\n"),
+                        b'\r' => out.extend_from_slice(b"\\r"),
+                        b'\t' => out.extend_from_slice(b"\\t"),
+                        0x0b => out.extend_from_slice(b"\\v"),
+                        b if b < 32 || b > 126 => {
+                            out.extend_from_slice(format!("\\{:03o}", b).as_bytes())
+                        }
+                        b => {
+                            out.push(b'\\');
+                            out.push(b);
+                        }
                     }
                 }
                 Value::Str(out)
@@ -9155,13 +9603,8 @@ impl Eval {
                 Value::Str(crate::php_date_tz(&fmt, ts, zone.as_deref()).into_bytes())
             }
             "__phargo_trace" => {
-                let file = self
-                    .cur_file
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default();
                 let mut arr = Arr::new();
-                for (name, line) in self.frames.iter().rev() {
+                for (name, line, file) in self.frames.iter().rev() {
                     // frames inside prelude code (Exception::__construct etc.)
                     // are engine internals — PHP traces don't show them
                     let base = name
@@ -9598,7 +10041,9 @@ impl Eval {
                 let pattern = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 let subject: Vec<char> =
                     String::from_utf8_lossy(&to_bytes(&a(1))).chars().collect();
-                let no_empty = to_i64(&a(3)) & 1 != 0;
+                let flags = to_i64(&a(3));
+                let no_empty = flags & 1 != 0; // PREG_SPLIT_NO_EMPTY
+                let delim_capture = flags & 2 != 0; // PREG_SPLIT_DELIM_CAPTURE
                 let mut arr = Arr::new();
                 match crate::rx_compile(&pattern) {
                     Some(rx) => {
@@ -9616,6 +10061,21 @@ impl Eval {
                                     let piece: String = subject[last..ms].iter().collect();
                                     if !(no_empty && piece.is_empty()) {
                                         arr.push(Value::Str(piece.into_bytes()));
+                                    }
+                                    // captured delimiter groups interleave with
+                                    // the pieces (wpdb::prepare depends on this)
+                                    if delim_capture {
+                                        for g in 1..=rx.ngroups {
+                                            if slots.get(2 * g).copied().unwrap_or(usize::MAX)
+                                                == usize::MAX
+                                            {
+                                                continue;
+                                            }
+                                            let gs = crate::rx_group_str(&subject, &slots, g);
+                                            if !(no_empty && gs.is_empty()) {
+                                                arr.push(Value::Str(gs.into_bytes()));
+                                            }
+                                        }
                                     }
                                     last = me;
                                     pos = if me > ms { me } else { me + 1 };
@@ -10434,6 +10894,8 @@ impl Eval {
             "phpversion" => Value::Str(b"8.3.0".to_vec()),
             "php_uname" => Value::Str(b"Linux".to_vec()),
             "error_get_last" => Value::Null,
+            // error_log: accepted and discarded (no log sink in the harness)
+            "error_log" => Value::Bool(true),
             _ => {
                 return Err(
                     self.throw_error("Error", &format!("Call to undefined function {name}()"))
@@ -10575,14 +11037,14 @@ static KNOWN_BUILTINS: &[&str] = &[
         "__phargo_bcscale_of", "__phargo_createfromformat", "__phargo_cur_file",
         "__phargo_cur_line", "__phargo_date_tz", "__phargo_mktime_tz", "__phargo_modify",
         "__phargo_strtotime_tz", "__phargo_trace", "__phargo_tz_offset",
-        "__phargo_tz_transitions", "__phargo_tz_valid", "abs", "addslashes", "array_chunk",
+        "__phargo_tz_transitions", "__phargo_tz_valid", "abs", "addcslashes", "addslashes", "array_chunk",
         "array_column", "array_combine", "array_count_values", "array_diff", "array_diff_key",
         "array_fill",
         "array_fill_keys", "array_filter", "array_flip", "array_intersect", "array_intersect_key",
         "array_is_list",
         "array_key_exists", "array_key_first", "array_key_last", "array_keys", "array_map",
         "array_merge", "array_merge_recursive", "array_multisort", "array_pad", "array_pop",
-        "array_product", "array_push", "array_reduce", "array_reverse", "array_search",
+        "array_product", "array_push", "array_reduce", "array_replace", "array_replace_recursive", "array_reverse", "array_search",
         "array_shift", "array_slice", "array_splice", "array_sum", "array_unique",
         "array_unshift", "array_values", "array_walk", "array_walk_recursive", "arsort",
         "asort", "assert", "base64_decode", "base64_encode", "basename", "bcadd", "bcceil",
@@ -10595,7 +11057,7 @@ static KNOWN_BUILTINS: &[&str] = &[
         "date_default_timezone_get", "date_default_timezone_set", "debug_backtrace",
         "debug_print_backtrace", "decbin", "dechex", "decoct", "define", "defined", "dirname",
         "doubleval", "each", "end", "enum_exists", "error_clear_last", "error_get_last",
-        "error_reporting", "escapeshellarg", "escapeshellcmd", "exec", "explode",
+        "error_log", "error_reporting", "escapeshellarg", "escapeshellcmd", "exec", "explode",
         "extension_loaded", "extract", "fclose", "fdiv", "feof", "fflush", "fgetc", "fgetcsv",
         "fgets", "file", "file_exists", "file_get_contents", "file_put_contents", "filesize",
         "filter_var", "floatval", "flock", "floor", "flush", "fopen", "fpassthru", "fputcsv",
@@ -10606,7 +11068,7 @@ static KNOWN_BUILTINS: &[&str] = &[
         "get_declared_interfaces", "get_declared_traits", "get_object_vars",
         "get_parent_class", "get_resource_id", "get_resource_type", "getcwd", "getdate",
         "getenv", "getimagesize", "getmypid", "getrandmax", "gettype", "glob", "gmdate", "gmmktime",
-        "gmstrftime", "hash", "header", "headers_sent", "hex2bin", "hexdec", "highlight_file",
+        "gmstrftime", "hash", "hash_algos", "hash_equals", "hash_hmac", "hash_hmac_algos", "header", "headers_sent", "hex2bin", "hexdec", "highlight_file",
         "highlight_string", "hrtime", "html_entity_decode", "htmlentities", "htmlspecialchars",
         "htmlspecialchars_decode", "http_build_query", "http_response_code", "idate",
         "ignore_user_abort", "implode", "in_array", "ini_get", "ini_set", "intdiv",
@@ -10649,9 +11111,10 @@ static KNOWN_BUILTINS: &[&str] = &[
         "stream_get_line", "stream_get_meta_data", "stream_set_blocking",
         "stream_set_read_buffer", "stream_set_timeout", "stream_set_write_buffer",
         "stream_socket_client", "stream_wrapper_register", "stream_wrapper_restore",
-        "stream_wrapper_unregister", "strftime", "strip_tags", "stripos", "stripslashes",
+        "stream_wrapper_unregister", "strftime", "strip_tags", "stripcslashes", "stripos",
+        "stripslashes",
         "stristr", "strlen", "strncasecmp", "strncmp", "strpbrk", "strpos", "strrchr",
-        "strrev", "strrpos", "strspn", "strstr", "strtolower", "strtotime", "strtoupper", "strtr",
+        "strrev", "strrpos", "strspn", "strstr", "strtok", "strtolower", "strtotime", "strtoupper", "strtr",
         "strval", "substr", "substr_compare", "substr_count", "substr_replace",
         "sys_get_temp_dir", "tempnam",
         "time", "timezone_identifiers_list", "touch", "trait_exists", "trigger_error", "trim",
@@ -11217,6 +11680,116 @@ fn php_glob(pattern: &str) -> Vec<String> {
     bases
 }
 
+/// parse_str(): decode a query string into a (possibly nested) array.
+/// Handles `a[b][]=v` bracket syntax; dots/spaces in top-level names become
+/// underscores, as PHP does for variable-name compatibility.
+fn php_parse_str(qs: &[u8]) -> Arr {
+    fn dec(s: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(s.len());
+        let mut i = 0;
+        while i < s.len() {
+            match s[i] {
+                b'+' => out.push(b' '),
+                b'%' if i + 2 < s.len() => {
+                    let hex = std::str::from_utf8(&s[i + 1..i + 3]).unwrap_or("");
+                    match u8::from_str_radix(hex, 16) {
+                        Ok(b) => {
+                            out.push(b);
+                            i += 2;
+                        }
+                        Err(_) => out.push(b'%'),
+                    }
+                }
+                b => out.push(b),
+            }
+            i += 1;
+        }
+        out
+    }
+    let mut root = Arr::new();
+    for pair in qs.split(|&b| b == b'&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (rawk, rawv) = match pair.iter().position(|&b| b == b'=') {
+            Some(i) => (&pair[..i], &pair[i + 1..]),
+            None => (pair, &b""[..]),
+        };
+        let key = dec(rawk);
+        let val = Value::Str(dec(rawv));
+        // split base[seg1][seg2]...
+        let (base, rest) = match key.iter().position(|&b| b == b'[') {
+            Some(i) => (&key[..i], &key[i..]),
+            None => (&key[..], &b""[..]),
+        };
+        let mut base: Vec<u8> = base.to_vec();
+        for b in base.iter_mut() {
+            if *b == b'.' || *b == b' ' {
+                *b = b'_';
+            }
+        }
+        if base.is_empty() {
+            continue;
+        }
+        // collect bracket segments
+        let mut segs: Vec<Option<Vec<u8>>> = Vec::new(); // None = append []
+        let mut i = 0;
+        while i < rest.len() {
+            if rest[i] == b'[' {
+                match rest[i..].iter().position(|&b| b == b']') {
+                    Some(j) => {
+                        let seg = &rest[i + 1..i + j];
+                        segs.push(if seg.is_empty() { None } else { Some(seg.to_vec()) });
+                        i += j + 1;
+                    }
+                    None => break,
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if segs.is_empty() {
+            root.insert(Key::Str(base), val);
+            continue;
+        }
+        // navigate/create nested arrays
+        fn place(arr: &mut Arr, segs: &[Option<Vec<u8>>], val: Value) {
+            match &segs[0] {
+                None => {
+                    if segs.len() == 1 {
+                        arr.push(val);
+                    } else {
+                        let mut child = Arr::new();
+                        place(&mut child, &segs[1..], val);
+                        arr.push(Value::Array(child));
+                    }
+                }
+                Some(seg) => {
+                    let k = Arr::norm_key(&Value::Str(seg.clone()));
+                    if segs.len() == 1 {
+                        arr.insert(k, val);
+                        return;
+                    }
+                    if !matches!(arr.get(&k), Some(Value::Array(_))) {
+                        arr.insert(k.clone(), Value::Array(Arr::new()));
+                    }
+                    if let Some(Value::Array(child)) = arr.get_mut(&k) {
+                        place(child, &segs[1..], val);
+                    }
+                }
+            }
+        }
+        let bk = Key::Str(base);
+        if !matches!(root.get(&bk), Some(Value::Array(_))) {
+            root.insert(bk.clone(), Value::Array(Arr::new()));
+        }
+        if let Some(Value::Array(child)) = root.get_mut(&bk) {
+            place(child, &segs, val);
+        }
+    }
+    root
+}
+
 /// PHP's lenient parse_url. Returns None for the cases PHP reports `false`
 /// (empty host after `//`, out-of-range port). Only present components appear
 /// in the array, matching PHP.
@@ -11764,6 +12337,19 @@ fn php_const(n: &str) -> Option<Value> {
         "DATE_COOKIE" => Str(b"l, d-M-Y H:i:s T".to_vec()),
         "DATE_RSS" => Str(b"D, d M Y H:i:s O".to_vec()),
         "DATE_W3C" => Str(b"Y-m-d\\TH:i:sP".to_vec()),
+        // htmlspecialchars() document-type flags
+        "ENT_HTML401" => Int(0),
+        "ENT_XML1" => Int(16),
+        "ENT_XHTML" => Int(32),
+        "ENT_HTML5" => Int(48),
+        // stream socket flags (transports probe and fail into WP_Error)
+        "STREAM_CLIENT_PERSISTENT" => Int(1),
+        "STREAM_CLIENT_ASYNC_CONNECT" => Int(2),
+        "STREAM_CLIENT_CONNECT" => Int(4),
+        // crypt() capability constants (PHP 8: all algorithms built in)
+        "CRYPT_BLOWFISH" | "CRYPT_EXT_DES" | "CRYPT_MD5" | "CRYPT_SHA256"
+        | "CRYPT_SHA512" | "CRYPT_STD_DES" => Int(1),
+        "CRYPT_SALT_LENGTH" => Int(123),
         // glob() flags (Linux values — the engine emulates PHP-on-Unix)
         "GLOB_ERR" => Int(1),
         "GLOB_MARK" => Int(2),
@@ -11902,6 +12488,18 @@ fn php_const(n: &str) -> Option<Value> {
         "ENT_HTML401" => Int(0),
         "ENT_HTML5" => Int(48),
         // json
+        "JSON_HEX_TAG" => Int(1),
+        "JSON_HEX_AMP" => Int(2),
+        "JSON_HEX_APOS" => Int(4),
+        "JSON_HEX_QUOT" => Int(8),
+        "JSON_FORCE_OBJECT" => Int(16),
+        "JSON_NUMERIC_CHECK" => Int(32),
+        "JSON_PARTIAL_OUTPUT_ON_ERROR" => Int(512),
+        "JSON_PRESERVE_ZERO_FRACTION" => Int(1024),
+        "JSON_INVALID_UTF8_IGNORE" => Int(1048576),
+        "JSON_INVALID_UTF8_SUBSTITUTE" => Int(2097152),
+        "JSON_OBJECT_AS_ARRAY" => Int(1),
+        "JSON_BIGINT_AS_STRING" => Int(2),
         "JSON_PRETTY_PRINT" => Int(128),
         "JSON_UNESCAPED_SLASHES" => Int(64),
         "JSON_UNESCAPED_UNICODE" => Int(256),
