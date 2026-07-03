@@ -4643,7 +4643,9 @@ impl Eval {
     fn instantiate(&mut self, class: &str, args: Vec<Value>) -> R<Value> {
         let decl = match self.find_class_autoload(class) {
             Some(d) => d,
-            None => return Err(RunError(format!("class {class} not found"))),
+            None => {
+                return Err(self.throw_error("Error", &format!("Class \"{class}\" not found")))
+            }
         };
         let obj = Rc::new(RefCell::new(Obj::new(decl.name.clone())));
         // initialize declared (instance) properties from the whole hierarchy,
@@ -4724,7 +4726,10 @@ impl Eval {
                     let cargs = vec![Value::Str(method.as_bytes().to_vec()), Value::Array(a)];
                     return self.invoke_method(recv, &dc, &self.find_method(&class, "__call").unwrap().1.clone(), cargs, None);
                 }
-                return Err(RunError(format!("call to undefined method {class}::{method}()")));
+                return Err(self.throw_error(
+                    "Error",
+                    &format!("Call to undefined method {}::{method}()", display_class(&class)),
+                ));
             }
         };
         // Visibility: an inaccessible method routes to __call if present, else errors.
@@ -4911,7 +4916,12 @@ impl Eval {
         }
         let (decl_class, m) = match self.find_method(class, method) {
             Some(x) => x,
-            None => return Err(RunError(format!("call to undefined method {class}::{method}()"))),
+            None => {
+                return Err(self.throw_error(
+                    "Error",
+                    &format!("Call to undefined method {}::{method}()", display_class(class)),
+                ))
+            }
         };
         // Visibility: an inaccessible static method routes to __callStatic, else errors.
         if let Some(msg) = self.vis_error(m.visibility, &decl_class, &display_class(class), method) {
@@ -8572,7 +8582,11 @@ impl Eval {
             "phpversion" => Value::Str(b"8.3.0".to_vec()),
             "php_uname" => Value::Str(b"Linux".to_vec()),
             "error_get_last" => Value::Null,
-            _ => return Err(RunError(format!("unknown function {name}()"))),
+            _ => {
+                return Err(
+                    self.throw_error("Error", &format!("Call to undefined function {name}()"))
+                )
+            }
         })
     }
 

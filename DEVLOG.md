@@ -27,6 +27,20 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-05 — Engine aborts become PHP fatals
+
+**Pass rate: 3436 → 3450.**
+
+Three engine-internal abort messages became real, catchable PHP `Error`s with
+exact wording: `Call to undefined function f()`, `Call to undefined method
+C::m()`, `Class "C" not found`. The structural effect is bigger than the
+score: Zend's engine-abort bucket collapsed from 351 to 43 — hundreds of
+tests that used to die inside the engine now print PHP-style fatal output
+(with the new file/line/trace machinery), turning them into near-misses the
+close-mismatch sampler can rank next round.
+
+---
+
 ## 2026-07-04 (late night) — Stack traces, frame by frame
 
 **Pass rate: 3430 → 3436.**
