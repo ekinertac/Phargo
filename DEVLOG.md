@@ -27,6 +27,27 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-05 — Namespaces exist now
+
+**Pass rate: 3450 → 3479.**
+
+The close-mismatch sampler kept circling one test until it got its way:
+`interface_exists('IFoo')` inside `namespace foo` must be **false** — and our
+engine had been ignoring namespaces since day one. Declarations now register
+fully qualified (`foo\Kid`, visible in get_class/var_dump like PHP),
+block-form `namespace X { }` bodies actually execute (they were dead code
+before — another silent hole), `use` imports resolve, and lookup runs
+use-alias → current-namespace → global. The global fallback is a deliberate
+deviation from PHP's strict class resolution: it keeps every existing pass
+and the entire prelude reachable from inside namespaces, trading a handful of
+"Class not found"-expectation tests for hundreds of working ones. Parent /
+interface / trait references get qualified at declaration time, so ancestry,
+catch-matching, and instanceof all work FQ-aware. One recovery round: modern
+DOM tests reach prelude classes via qualified spellings (`Dom\XMLDocument`),
+so qualified names that resolve to nothing fall back to the bare last segment.
+
+---
+
 ## 2026-07-05 — Engine aborts become PHP fatals
 
 **Pass rate: 3436 → 3450.**

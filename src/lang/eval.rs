@@ -73,6 +73,10 @@ pub struct Eval {
     has_error_handler: bool,
     /// 1-based source line of the statement currently executing (0 = unknown).
     cur_line: u32,
+    /// Current namespace (lowercased, "" = global) and `use` alias map
+    /// (alias-lower → FQ-lower). File-scoped: saved/restored across includes.
+    cur_ns: String,
+    use_map: HashMap<String, String>,
     /// Call-frame stack for exception traces: (display name like "f" or
     /// "Class->m", caller's line at the call site). Parallel to cur_fn pushes.
     frames: Vec<(String, u32)>,
@@ -1355,6 +1359,8 @@ impl Eval {
             quiet: 0,
             has_error_handler: false,
             cur_line: 0,
+            cur_ns: String::new(),
+            use_map: HashMap::new(),
             frames: Vec::new(),
             prelude_fns: HashSet::new(),
             prelude_classes: HashSet::new(),
@@ -1670,21 +1676,123 @@ impl Eval {
 
     /// Hoist top-level function declarations so call-before-definition works.
     fn hoist(&mut self, stmts: &[Stmt]) {
+        self.hoist_ns(stmts, &self.cur_ns.clone());
+    }
+
+    /// Register declarations, qualifying names with the enclosing namespace.
+    /// A statement-form `namespace X;` re-scopes the remainder of the list;
+    /// block form scopes only its body. Unqualified parent/interface/trait
+    /// references get the namespace prefix too (runtime lookup falls back to
+    /// the bare name, so global/prelude ancestors keep resolving).
+    fn hoist_ns(&mut self, stmts: &[Stmt], ns: &str) {
+        let mut ns = ns.to_string();
         for s in stmts {
             let s = match s {
                 Stmt::Marked(_, inner) => &**inner,
                 other => other,
             };
             match s {
+                Stmt::Namespace { name, body } => {
+                    let inner_ns = name
+                        .as_ref()
+                        .map(|n| n.parts.join("\\").to_ascii_lowercase())
+                        .unwrap_or_default();
+                    match body {
+                        Some(b) => self.hoist_ns(b, &inner_ns),
+                        None => ns = inner_ns,
+                    }
+                }
                 Stmt::Func(f) => {
-                    self.funcs.insert(f.name.to_ascii_lowercase(), Rc::new(f.clone()));
+                    let mut f = f.clone();
+                    if !ns.is_empty() {
+                        f.name = format!("{ns}\\{}", f.name);
+                    }
+                    self.funcs.insert(f.name.to_ascii_lowercase(), Rc::new(f));
                 }
                 Stmt::Class(c) => {
-                    self.classes.insert(c.name.to_ascii_lowercase(), Rc::new(c.clone()));
+                    let mut c = c.clone();
+                    if !ns.is_empty() {
+                        c.name = format!("{ns}\\{}", c.name);
+                        let prefix = |n: &mut Name| {
+                            if !n.fully_qualified && n.parts.len() == 1 {
+                                n.parts.insert(0, ns.clone());
+                            }
+                        };
+                        if let Some(p) = &mut c.parent {
+                            prefix(p);
+                        }
+                        for i in &mut c.interfaces {
+                            prefix(i);
+                        }
+                        for t in &mut c.uses_traits {
+                            prefix(t);
+                        }
+                    }
+                    self.classes.insert(c.name.to_ascii_lowercase(), Rc::new(c));
                 }
                 _ => {}
             }
         }
+    }
+
+    /// find_class through a (possibly qualified) AST Name: the joined form
+    /// first, then the bare last segment (global/prelude fallback).
+    fn find_class_n(&self, n: &Name) -> Option<Rc<ClassDecl>> {
+        let joined = n.parts.join("\\");
+        if n.parts.len() > 1 {
+            if let Some(c) = self.find_class(&joined) {
+                return Some(c);
+            }
+        }
+        self.find_class(n.last())
+    }
+
+    /// Resolve an unqualified/qualified class name written in source to the
+    /// registered class-key string: `use` aliases first, then current-namespace,
+    /// then the name as written (global fallback keeps prelude classes working).
+    fn resolve_ns_class(&self, n: &Name) -> String {
+        let joined = n.parts.join("\\");
+        if n.fully_qualified {
+            // FQ: as written; if unregistered but the bare last segment exists
+            // (prelude classes accessed via a namespace spelling), fall back
+            if !self.classes.contains_key(&joined.to_ascii_lowercase()) {
+                if let Some(c) = self.find_class(n.last()) {
+                    return c.name.clone();
+                }
+            }
+            return joined;
+        }
+        // use-alias on the first segment
+        if let Some(fq) = self.use_map.get(&n.parts[0].to_ascii_lowercase()) {
+            let mut out = fq.clone();
+            for extra in &n.parts[1..] {
+                out.push_str("\\");
+                out.push_str(extra);
+            }
+            if self.classes.contains_key(&out.to_ascii_lowercase()) {
+                return out;
+            }
+        }
+        if !self.cur_ns.is_empty() {
+            let cand = format!("{}\\{joined}", self.cur_ns);
+            if self.classes.contains_key(&cand.to_ascii_lowercase()) {
+                return self
+                    .find_class(&cand)
+                    .map(|c| c.name.clone())
+                    .unwrap_or(cand);
+            }
+        }
+        if n.parts.len() > 1 {
+            if self.classes.contains_key(&joined.to_ascii_lowercase()) {
+                return self.find_class(&joined).map(|c| c.name.clone()).unwrap_or(joined);
+            }
+            // qualified name with no registration: bare-last-segment fallback
+            // keeps prelude classes reachable via namespaced spellings
+            if let Some(c) = self.find_class(n.last()) {
+                return c.name.clone();
+            }
+        }
+        joined
     }
 
     fn vars(&mut self) -> &mut HashMap<String, Value> {
@@ -1772,12 +1880,22 @@ impl Eval {
             Stmt::Block(b) => return self.exec_block(b),
             Stmt::Nop => {}
             Stmt::Func(f) => {
-                self.funcs.insert(f.name.to_ascii_lowercase(), Rc::new(f.clone()));
+                // runtime (re)declaration — qualify with the current namespace
+                let mut f = f.clone();
+                if !self.cur_ns.is_empty() && !f.name.contains('\\') {
+                    f.name = format!("{}\\{}", self.cur_ns, f.name);
+                }
+                self.funcs.insert(f.name.to_ascii_lowercase(), Rc::new(f));
             }
             Stmt::ConstDecl(decls) => {
                 for (name, e) in decls {
                     let v = self.eval(e)?;
-                    self.consts.insert(name.clone(), v);
+                    let key = if self.cur_ns.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}\\{name}", self.cur_ns)
+                    };
+                    self.consts.insert(key, v);
                 }
             }
             Stmt::If { cond, then, elseifs, els } => {
@@ -2001,7 +2119,26 @@ impl Eval {
                 }
             }
             Stmt::Class(c) => {
-                self.classes.insert(c.name.to_ascii_lowercase(), Rc::new(c.clone()));
+                let mut c = c.clone();
+                if !self.cur_ns.is_empty() && !c.name.contains('\\') {
+                    let ns = self.cur_ns.clone();
+                    c.name = format!("{ns}\\{}", c.name);
+                    let prefix = |n: &mut Name| {
+                        if !n.fully_qualified && n.parts.len() == 1 {
+                            n.parts.insert(0, ns.clone());
+                        }
+                    };
+                    if let Some(p) = &mut c.parent {
+                        prefix(p);
+                    }
+                    for i in &mut c.interfaces {
+                        prefix(i);
+                    }
+                    for t in &mut c.uses_traits {
+                        prefix(t);
+                    }
+                }
+                self.classes.insert(c.name.to_ascii_lowercase(), Rc::new(c));
             }
             Stmt::Throw(e) => {
                 let v = self.eval(e)?;
@@ -2050,10 +2187,36 @@ impl Eval {
                     self.vars().insert(name.clone(), Value::Ref(cell));
                 }
             }
+            Stmt::Namespace { name, body } => {
+                let ns = name.as_ref().map(|n| n.parts.join("\\").to_ascii_lowercase()).unwrap_or_default();
+                match body {
+                    // block form: scoped to the braces
+                    Some(b) => {
+                        let prev = std::mem::replace(&mut self.cur_ns, ns);
+                        self.hoist(b);
+                        let f = self.exec_block(b)?;
+                        self.cur_ns = prev;
+                        if !matches!(f, Flow::Normal) {
+                            return Ok(f);
+                        }
+                    }
+                    // statement form: applies to the rest of the file
+                    None => self.cur_ns = ns,
+                }
+            }
+            Stmt::Use(items) => {
+                for it in items {
+                    let fq = it.name.parts.join("\\").to_ascii_lowercase();
+                    let alias = it
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| it.name.last().to_string())
+                        .to_ascii_lowercase();
+                    self.use_map.insert(alias, fq);
+                }
+            }
             // not yet implemented in this increment — parsed but skipped
-            Stmt::Namespace { .. }
-            | Stmt::Use(_)
-            | Stmt::Declare { strict_types: false } => {}
+            Stmt::Declare { strict_types: false } => {}
             Stmt::Declare { strict_types: true } => {
                 self.strict_types = true;
             }
@@ -3221,6 +3384,20 @@ impl Eval {
 
     fn const_fetch(&self, name: &Name) -> Option<Value> {
         let n = name.last();
+        // namespaced candidates first (constants fall back to global, per PHP)
+        if !name.fully_qualified {
+            if !self.cur_ns.is_empty() {
+                if let Some(v) = self.consts.get(&format!("{}\\{n}", self.cur_ns)) {
+                    return Some(v.clone());
+                }
+            }
+        }
+        if name.parts.len() > 1 {
+            let joined = name.parts.join("\\");
+            if let Some(v) = self.consts.get(&joined) {
+                return Some(v.clone());
+            }
+        }
         if let Some(v) = self.consts.get(n) {
             return Some(v.clone());
         }
@@ -3545,7 +3722,21 @@ impl Eval {
             if args.len() == 1 && args[0].name.as_deref() == Some("...") {
                 return Ok(Value::Str(n.last().as_bytes().to_vec()));
             }
-            let name = n.last().to_ascii_lowercase();
+            let name = {
+                let last = n.last().to_ascii_lowercase();
+                let joined = n.parts.join("\\").to_ascii_lowercase();
+                if n.fully_qualified {
+                    joined
+                } else if !self.cur_ns.is_empty()
+                    && self.funcs.contains_key(&format!("{}\\{joined}", self.cur_ns))
+                {
+                    format!("{}\\{joined}", self.cur_ns)
+                } else if n.parts.len() > 1 && self.funcs.contains_key(&joined) {
+                    joined
+                } else {
+                    last
+                }
+            };
             // Array internal-pointer fns: dispatch BEFORE eval_args so a large
             // array argument is never cloned into argv (O(n) per call → O(n^2)).
             if matches!(name.as_str(), "reset" | "end" | "next" | "prev" | "current" | "pos" | "key" | "each")
@@ -3721,10 +3912,14 @@ impl Eval {
             .map_err(|e| RunError(format!("Parse error: {}", e.msg)))?;
         let prev_file = std::mem::replace(&mut self.cur_file, path);
         let prev_line = self.cur_line;
+        let prev_ns = std::mem::take(&mut self.cur_ns);
+        let prev_use = std::mem::take(&mut self.use_map);
         self.hoist(&ast);
         let r = self.exec_block(&ast);
         self.cur_file = prev_file;
         self.cur_line = prev_line;
+        self.cur_ns = prev_ns;
+        self.use_map = prev_use;
         match r? {
             Flow::Return(v) => Ok(v),
             _ => Ok(Value::Int(1)), // include/eval default return value
@@ -4377,10 +4572,10 @@ impl Eval {
                         let cur = self.current_class.clone().unwrap_or_default();
                         Ok(self
                             .find_class(&cur)
-                            .and_then(|c| c.parent.as_ref().map(|p| p.last().to_string()))
+                            .and_then(|c| c.parent.as_ref().map(|p| p.parts.join("\\")))
                             .unwrap_or(cur))
                     }
-                    _ => Ok(last.to_string()),
+                    _ => Ok(self.resolve_ns_class(n)),
                 }
             }
             _ => {
@@ -4532,7 +4727,7 @@ impl Eval {
             if guard > 50 {
                 break;
             }
-            cur = c.parent.as_ref().and_then(|p| self.find_class(p.last()));
+            cur = c.parent.as_ref().and_then(|p| self.find_class_n(p));
         }
         out
     }
@@ -4627,7 +4822,7 @@ impl Eval {
         for c in self.ancestry(class) {
             // traits first (declared in the class), then own methods
             for t in &c.uses_traits {
-                if let Some(tc) = self.find_class(t.last()) {
+                if let Some(tc) = self.find_class_n(t) {
                     if let Some(md) = tc.methods.iter().find(|x| x.name.to_ascii_lowercase() == m) {
                         return Some((c.name.clone(), md.clone()));
                     }
@@ -5091,15 +5286,28 @@ impl Eval {
 
     /// Is class `c` (or an ancestor) named `want`, or does it implement it?
     fn instance_of_name(&self, c: &str, want: &str) -> bool {
-        if c.eq_ignore_ascii_case(want) {
+        // FQ-aware: equal as written, or (unqualified want) equal last segment
+        fn matches(name: &str, want: &str) -> bool {
+            if name.eq_ignore_ascii_case(want) {
+                return true;
+            }
+            if !want.contains('\\') {
+                if let Some(lastseg) = name.rsplit('\\').next() {
+                    return lastseg.eq_ignore_ascii_case(want);
+                }
+            }
+            false
+        }
+        if matches(c, want) {
             return true;
         }
         for a in self.ancestry(c) {
-            if a.name.eq_ignore_ascii_case(want) {
+            if matches(&a.name, want) {
                 return true;
             }
             for i in &a.interfaces {
-                if i.last().eq_ignore_ascii_case(want) || self.instance_of_name(i.last(), want) {
+                let joined = i.parts.join("\\");
+                if matches(&joined, want) || self.instance_of_name(&joined, want) {
                     return true;
                 }
             }
@@ -5363,7 +5571,7 @@ impl Eval {
             }
             // interface constants
             for i in &c.interfaces {
-                if let Some(ic) = self.find_class(i.last()) {
+                if let Some(ic) = self.find_class_n(i) {
                     if let Some(cc) = ic.consts.iter().find(|x| x.name == name) {
                         let (expr, decl) = (cc.value.clone(), ic.name.clone());
                         return eval_in(self, expr, decl);
