@@ -27,6 +27,21 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-05 (later) — Error handlers fire
+
+**Pass rate: 3479 → 3497.**
+
+`set_error_handler` callbacks are actually invoked now — with PHP's
+`(errno, errstr, errfile, errline)` signature, a false return falling through
+to normal printing, a re-entrancy guard, and exceptions thrown inside the
+handler propagating like PHP. `trigger_error` routes through the same path
+with all the E_USER_* labels (and E_USER_ERROR halting). A satisfying knock-on:
+the object-id off-by-one cluster from the close sampler resolved itself,
+because handlers that construct objects now consume instance ids exactly
+where PHP does.
+
+---
+
 ## 2026-07-05 — Namespaces exist now
 
 **Pass rate: 3450 → 3479.**

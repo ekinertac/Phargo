@@ -69,8 +69,10 @@ pub struct Eval {
     /// Warning-suppression depth: >0 inside isset()/empty()/??-lhs/@/by-ref
     /// out-args, where PHP stays silent about undefined variables/keys.
     quiet: u32,
-    /// set_error_handler() is active: warnings are intercepted (not printed).
-    has_error_handler: bool,
+    /// set_error_handler() callback (invoked by warn/trigger_error) and the
+    /// re-entrancy guard for warnings raised inside the handler itself.
+    error_handler: Option<Value>,
+    in_error_handler: bool,
     /// 1-based source line of the statement currently executing (0 = unknown).
     cur_line: u32,
     /// Current namespace (lowercased, "" = global) and `use` alias map
@@ -1357,7 +1359,8 @@ impl Eval {
             shutdown_fns: Vec::new(),
             strict_types: false,
             quiet: 0,
-            has_error_handler: false,
+            error_handler: None,
+            in_error_handler: false,
             cur_line: 0,
             cur_ns: String::new(),
             use_map: HashMap::new(),
@@ -1975,7 +1978,7 @@ impl Eval {
                 let arr = self.eval(array)?;
                 if !matches!(arr, Value::Array(_) | Value::Object(_) | Value::Closure(_)) {
                     let t = self.given_type(&arr);
-                    self.warn(&format!("foreach() argument must be of type array|object, {t} given"));
+                    self.warn(&format!("foreach() argument must be of type array|object, {t} given"))?;
                 }
                 match arr {
                     Value::Array(a) => {
@@ -2232,25 +2235,46 @@ impl Eval {
     /// if the loop must stop (break/return propagation), `None` to continue.
     /// Emit a PHP runtime warning to the output stream (display_errors style),
     /// honoring @/isset-style suppression and the error_reporting level.
-    fn warn(&mut self, msg: &str) {
+    fn warn(&mut self, msg: &str) -> R<()> {
         const E_WARNING: i64 = 2;
         // gen_buf: our generators run eagerly; PHP's run lazily and a body that
         // is never iterated never warns — so eager pre-execution stays silent.
         if self.quiet > 0
-            || self.has_error_handler
             || self.gen_buf.is_some()
             || self.error_level & E_WARNING == 0
             || self.out.len() > MAX_OUTPUT
         {
-            return;
+            return Ok(());
         }
         let file = self
             .cur_file
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // a registered handler intercepts; false return falls through to print
+        if let Some(h) = self.error_handler.clone() {
+            if self.in_error_handler {
+                return Ok(());
+            }
+            self.in_error_handler = true;
+            let r = self.call_value(
+                h,
+                vec![
+                    Value::Int(E_WARNING),
+                    Value::Str(msg.as_bytes().to_vec()),
+                    Value::Str(file.clone().into_bytes()),
+                    Value::Int(self.cur_line as i64),
+                ],
+            );
+            self.in_error_handler = false;
+            let v = r?;
+            if !matches!(v, Value::Bool(false)) {
+                return Ok(());
+            }
+        }
         let s = format!("\nWarning: {msg} in {file} on line {}\n", self.cur_line);
         self.out.extend_from_slice(s.as_bytes());
+        Ok(())
     }
 
     /// Evaluate with undefined-variable/key warnings suppressed (isset/empty/??/@).
@@ -2502,7 +2526,7 @@ impl Eval {
                         None => {
                             // "this" reads outside objects stay silent (engine paths probe it)
                             if name != "this" {
-                                self.warn(&format!("Undefined variable ${name}"));
+                                self.warn(&format!("Undefined variable ${name}"))?;
                             }
                             Value::Null
                         }
@@ -2826,7 +2850,7 @@ impl Eval {
                     Value::Closure(_) | Value::Null | Value::Array(_) => Value::Null,
                     other => {
                         let t = self.given_type(other);
-                        self.warn(&format!("Attempt to read property \"{pname}\" on {t}"));
+                        self.warn(&format!("Attempt to read property \"{pname}\" on {t}"))?;
                         Value::Null
                     }
                 }
@@ -3353,7 +3377,7 @@ impl Eval {
             if done { out } else { v.deref() }
         };
         if let Some(m) = warn_msg {
-            self.warn(&m);
+            self.warn(&m)?;
         }
         Ok(result)
     }
@@ -8673,14 +8697,14 @@ impl Eval {
                 Value::Int(old)
             }
             "set_error_handler" => {
-                // registered handlers intercept warnings; we don't invoke the
-                // callback but we do stop printing (closest observable behavior)
-                self.has_error_handler = !matches!(a(0), Value::Null);
-                Value::Null
+                let prev = self.error_handler.take();
+                let h = a(0);
+                self.error_handler = if matches!(h, Value::Null) { None } else { Some(h) };
+                prev.unwrap_or(Value::Null)
             }
             "restore_error_handler" => {
-                self.has_error_handler = false;
-                Value::Null
+                self.error_handler = None;
+                Value::Bool(true)
             }
             "set_exception_handler"
             | "restore_exception_handler" | "error_clear_last" | "debug_print_backtrace"
@@ -8718,7 +8742,47 @@ impl Eval {
                 }
                 Value::Array(arr)
             }
-            "trigger_error" | "assert" | "gc_enabled" | "headers_sent"
+            "trigger_error" => {
+                let msg = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let level = if args.len() > 1 { to_i64(&a(1)) } else { 1024 }; // E_USER_NOTICE
+                let file = self
+                    .cur_file
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let mut handled = false;
+                if let Some(h) = self.error_handler.clone() {
+                    if !self.in_error_handler {
+                        self.in_error_handler = true;
+                        let r = self.call_value(
+                            h,
+                            vec![
+                                Value::Int(level),
+                                Value::Str(msg.clone().into_bytes()),
+                                Value::Str(file.clone().into_bytes()),
+                                Value::Int(self.cur_line as i64),
+                            ],
+                        );
+                        self.in_error_handler = false;
+                        handled = !matches!(r?, Value::Bool(false));
+                    }
+                }
+                if !handled && self.error_level & level != 0 && self.out.len() <= MAX_OUTPUT {
+                    let label = match level {
+                        256 => "Fatal error",   // E_USER_ERROR
+                        512 => "Warning",       // E_USER_WARNING
+                        8192 | 16384 => "Deprecated",
+                        _ => "Notice",
+                    };
+                    let s = format!("\n{label}: {msg} in {file} on line {}\n", self.cur_line);
+                    self.out.extend_from_slice(s.as_bytes());
+                }
+                if level == 256 {
+                    return Err(RunError("__phargo_exit__".into())); // E_USER_ERROR halts
+                }
+                Value::Bool(true)
+            }
+            "assert" | "gc_enabled" | "headers_sent"
             | "stream_set_blocking" | "stream_set_timeout" | "stream_set_read_buffer"
             | "stream_set_write_buffer" | "stream_wrapper_register" | "stream_wrapper_unregister"
             | "stream_wrapper_restore" | "stream_filter_remove" => {
