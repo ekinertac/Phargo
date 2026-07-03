@@ -75,6 +75,12 @@ fn classify(out_res: &Result<Result<String, phargo::EngineError>, ()>, expect: &
                 ("PASS", String::new())
             } else if g.is_empty() {
                 ("MISMATCH_EMPTY", "no output".into())
+            } else if let Some((cat, name, _msg)) = undefined_thing(g).filter(|(_, _, msg)| !e.contains(msg.as_str())) {
+                // Engine threw a real PHP Error for an undefined fn/method/class/const
+                // (used to be a Rust-level RunError caught below) AND the test's
+                // expected output doesn't itself want that fatal — so this IS the
+                // primary blocker, same bucketing the old RunError path gave us.
+                return (cat, name);
             } else if g.contains("Fatal error: Uncaught") && !e.contains("Fatal error") && !e.contains("Uncaught") {
                 // Extract the underlying cause so we can see WHICH missing piece
                 // causes the mid-execution fatal (real second-order leverage).
@@ -140,6 +146,47 @@ fn diff_close(got: &str, expect: &str, file: &str) -> (String, String) {
         g_mid
     );
     (sig, sample)
+}
+
+/// Scan an engine-produced fatal-error message for one of the four
+/// "undefined X" patterns (function/method/class/constant) and return the
+/// matching category + extracted name. These used to be Rust-level errors
+/// (RunError) caught by `classify`'s `Ok(Err(e))` arm; now the engine throws
+/// a real PHP `Error`, so the run SUCCEEDS and the signal lives in the text
+/// output as `Fatal error: Uncaught Error: ...`. Returns the extracted name
+/// bare (no trailing parens) plus the raw message substring so the caller can
+/// check whether the EXPECTED output already contains the same fatal (i.e.
+/// the test wanted this error and the real diff is elsewhere).
+fn undefined_thing(text: &str) -> Option<(&'static str, String, String)> {
+    if let Some(i) = text.find("Uncaught Error: Call to undefined function ") {
+        let start = i + "Uncaught Error: Call to undefined function ".len();
+        let rest = &text[start..];
+        let name = rest.split('(').next().unwrap_or("?").trim();
+        let msg = format!("Call to undefined function {name}(");
+        return Some(("MISSING_FN", name.to_string(), msg));
+    }
+    if let Some(i) = text.find("Uncaught Error: Call to undefined method ") {
+        let start = i + "Uncaught Error: Call to undefined method ".len();
+        let rest = &text[start..];
+        let name = rest.split('(').next().unwrap_or("?").trim();
+        let msg = format!("Call to undefined method {name}(");
+        return Some(("MISSING_METHOD", name.to_string(), msg));
+    }
+    if let Some(i) = text.find("Uncaught Error: Class \"") {
+        let start = i + "Uncaught Error: Class \"".len();
+        let rest = &text[start..];
+        let name = rest.split('"').next().unwrap_or("?");
+        let msg = format!("Class \"{name}\"");
+        return Some(("MISSING_CLASS", name.to_string(), msg));
+    }
+    if let Some(i) = text.find("Uncaught Error: Undefined constant \"") {
+        let start = i + "Uncaught Error: Undefined constant \"".len();
+        let rest = &text[start..];
+        let name = rest.split('"').next().unwrap_or("?");
+        let msg = format!("Undefined constant \"{name}\"");
+        return Some(("MISSING_CONST", name.to_string(), msg));
+    }
+    None
 }
 
 fn abstract_digits(s: &str) -> String {

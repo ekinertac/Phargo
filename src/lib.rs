@@ -77,10 +77,12 @@ static GLOBAL: capped_alloc::Capped = capped_alloc::Capped;
 // Shared subsystems reused by the v2 evaluator via `crate::` (char/byte/int —
 // no engine-value dependency): the from-scratch regex VM and civil-calendar
 // date/time math.
+mod bcmath;
 mod datetime;
 mod hash;
 mod regex;
 pub(crate) mod tz;
+pub(crate) use bcmath as bc;
 pub(crate) use datetime::*;
 pub(crate) use hash::*;
 pub(crate) use regex::*;

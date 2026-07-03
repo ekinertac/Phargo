@@ -75,6 +75,8 @@ pub struct Eval {
     in_error_handler: bool,
     /// 1-based source line of the statement currently executing (0 = unknown).
     cur_line: u32,
+    /// bcscale() default decimal precision for the bc* builtins.
+    bc_scale: usize,
     /// Current namespace (lowercased, "" = global) and `use` alias map
     /// (alias-lower → FQ-lower). File-scoped: saved/restored across includes.
     cur_ns: String,
@@ -1364,6 +1366,7 @@ impl Eval {
             cur_line: 0,
             cur_ns: String::new(),
             use_map: HashMap::new(),
+            bc_scale: 0,
             frames: Vec::new(),
             prelude_fns: HashSet::new(),
             prelude_classes: HashSet::new(),
@@ -5941,6 +5944,143 @@ impl Eval {
                 Value::Float((to_f64(&a(0)) * m).round() / m)
             }
             "sqrt" => Value::Float(to_f64(&a(0)).sqrt()),
+            // ---- bcmath (from-scratch decimal bignums in src/bcmath.rs) ----
+            "bcadd" | "bcsub" | "bcmul" | "bcdiv" | "bcmod" | "bccomp" => {
+                let parse = |v: &Value| crate::bc::Dec::parse(&String::from_utf8_lossy(&to_bytes(v)));
+                let x = match parse(&a(0)) {
+                    Some(d) => d,
+                    None => {
+                        return Err(self.throw_error(
+                            "ValueError",
+                            &format!("{name}(): Argument #1 ($num1) is not well-formed"),
+                        ))
+                    }
+                };
+                let y = match parse(&a(1)) {
+                    Some(d) => d,
+                    None => {
+                        return Err(self.throw_error(
+                            "ValueError",
+                            &format!("{name}(): Argument #2 ($num2) is not well-formed"),
+                        ))
+                    }
+                };
+                let scale = if args.len() > 2 {
+                    let sc = to_i64(&a(2));
+                    if !(0..=2147483647).contains(&sc) {
+                        return Err(self.throw_error(
+                            "ValueError",
+                            &format!("{name}(): Argument #3 ($scale) must be between 0 and 2147483647"),
+                        ));
+                    }
+                    (sc as usize).min(100_000)
+                } else {
+                    self.bc_scale
+                };
+                match name {
+                    "bccomp" => {
+                        let (xa, ya) = (x.with_scale(scale), y.with_scale(scale));
+                        Value::Int(match crate::bc::cmp(&xa, &ya) {
+                            std::cmp::Ordering::Less => -1,
+                            std::cmp::Ordering::Equal => 0,
+                            std::cmp::Ordering::Greater => 1,
+                        })
+                    }
+                    "bcadd" => Value::Str(crate::bc::add(&x, &y).to_string_scaled(scale).into_bytes()),
+                    "bcsub" => Value::Str(crate::bc::sub(&x, &y).to_string_scaled(scale).into_bytes()),
+                    "bcmul" => match crate::bc::mul(&x, &y) {
+                        Some(r) => Value::Str(r.to_string_scaled(scale).into_bytes()),
+                        None => return Err(self.throw_error("ValueError", "bcmul(): result too large")),
+                    },
+                    "bcdiv" => match crate::bc::div(&x, &y, scale) {
+                        Some(r) => Value::Str(r.to_string_scaled(scale).into_bytes()),
+                        None => {
+                            return Err(self.throw_error("DivisionByZeroError", "Division by zero"))
+                        }
+                    },
+                    _ => match crate::bc::modulo(&x, &y, scale) {
+                        Some(r) => Value::Str(r.to_string_scaled(scale).into_bytes()),
+                        None => {
+                            return Err(self.throw_error("DivisionByZeroError", "Modulo by zero"))
+                        }
+                    },
+                }
+            }
+            "bcpow" => {
+                let base = crate::bc::Dec::parse(&String::from_utf8_lossy(&to_bytes(&a(0))));
+                let Some(base) = base else {
+                    return Err(self.throw_error(
+                        "ValueError",
+                        "bcpow(): Argument #1 ($num) is not well-formed",
+                    ));
+                };
+                let exp = to_i64(&a(1));
+                let scale = if args.len() > 2 {
+                    let sc = to_i64(&a(2));
+                    if !(0..=2147483647).contains(&sc) {
+                        return Err(self.throw_error(
+                            "ValueError",
+                            "bcpow(): Argument #3 ($scale) must be between 0 and 2147483647",
+                        ));
+                    }
+                    (sc as usize).min(100_000)
+                } else {
+                    self.bc_scale
+                };
+                let r = if exp >= 0 {
+                    crate::bc::pow(&base, exp as u64, scale)
+                } else {
+                    crate::bc::pow(&base, (-exp) as u64, scale.max(base.scale) + 10)
+                        .and_then(|p| crate::bc::div(&crate::bc::Dec::parse("1").unwrap(), &p, scale))
+                };
+                match r {
+                    Some(r) => Value::Str(r.to_string_scaled(scale).into_bytes()),
+                    None => return Err(self.throw_error("ValueError", "bcpow(): result too large")),
+                }
+            }
+            "bcsqrt" => {
+                let Some(x) = crate::bc::Dec::parse(&String::from_utf8_lossy(&to_bytes(&a(0)))) else {
+                    return Err(self.throw_error(
+                        "ValueError",
+                        "bcsqrt(): Argument #1 ($num) is not well-formed",
+                    ));
+                };
+                let scale = if args.len() > 1 {
+                    let sc = to_i64(&a(1));
+                    if !(0..=2147483647).contains(&sc) {
+                        return Err(self.throw_error(
+                            "ValueError",
+                            "bcsqrt(): Argument #2 ($scale) must be between 0 and 2147483647",
+                        ));
+                    }
+                    (sc as usize).min(100_000)
+                } else {
+                    self.bc_scale
+                };
+                match crate::bc::sqrt(&x, scale) {
+                    Some(r) => Value::Str(r.to_string_scaled(scale).into_bytes()),
+                    None => {
+                        return Err(self.throw_error(
+                            "ValueError",
+                            "bcsqrt(): Argument #1 ($num) must be greater than or equal to 0",
+                        ))
+                    }
+                }
+            }
+            "bcscale" => {
+                let old = self.bc_scale as i64;
+                if !args.is_empty() {
+                    let sc = to_i64(&a(0));
+                    if !(0..=2147483647).contains(&sc) {
+                        return Err(self.throw_error(
+                            "ValueError",
+                            "bcscale(): Argument #1 ($scale) must be between 0 and 2147483647",
+                        ));
+                    }
+                    self.bc_scale = (sc as usize).min(100_000);
+                }
+                Value::Int(old)
+            }
             "pow" => self.apply_bin(BinOp::Pow, &a(0), &a(1))?,
             "intdiv" => {
                 let d = to_i64(&a(1));
@@ -9953,6 +10093,84 @@ fn php_const(n: &str) -> Option<Value> {
         "FILTER_REQUIRE_SCALAR" => Int(33554432),
         "FILTER_REQUIRE_ARRAY" => Int(16777216),
         "FILTER_FORCE_ARRAY" => Int(67108864),
+        // filter: remaining validate/sanitize kinds + flags (ext/filter)
+        "FILTER_VALIDATE_MAC" => Int(276),
+        "FILTER_VALIDATE_DOMAIN" => Int(277),
+        "FILTER_SANITIZE_ENCODED" => Int(514),
+        "FILTER_SANITIZE_SPECIAL_CHARS" => Int(515),
+        "FILTER_SANITIZE_NUMBER_FLOAT" => Int(520),
+        "FILTER_SANITIZE_FULL_SPECIAL_CHARS" => Int(522),
+        "FILTER_SANITIZE_ADD_SLASHES" => Int(523),
+        "FILTER_CALLBACK" => Int(1024),
+        "FILTER_FLAG_ALLOW_OCTAL" => Int(1),
+        "FILTER_FLAG_ALLOW_HEX" => Int(2),
+        "FILTER_FLAG_ALLOW_FRACTION" => Int(4096),
+        "FILTER_FLAG_ALLOW_SCIENTIFIC" => Int(16384),
+        "FILTER_FLAG_IPV4" => Int(1048576),
+        "FILTER_FLAG_IPV6" => Int(2097152),
+        // filter_input() input sources (ext/filter)
+        "INPUT_POST" => Int(0),
+        "INPUT_GET" => Int(1),
+        "INPUT_COOKIE" => Int(2),
+        "INPUT_ENV" => Int(4),
+        "INPUT_SERVER" => Int(5),
+        // libxml (DOM / SimpleXML option args + error levels)
+        "LIBXML_VERSION" | "LIBXML_LOADED_VERSION" => Int(21400),
+        "LIBXML_DOTTED_VERSION" => Str(b"2.14.0".to_vec()),
+        "LIBXML_NOENT" => Int(2),
+        "LIBXML_DTDLOAD" => Int(4),
+        "LIBXML_DTDATTR" => Int(8),
+        "LIBXML_DTDVALID" => Int(16),
+        "LIBXML_NOERROR" => Int(32),
+        "LIBXML_NOWARNING" => Int(64),
+        "LIBXML_NOBLANKS" => Int(256),
+        "LIBXML_XINCLUDE" => Int(1024),
+        "LIBXML_NSCLEAN" => Int(8192),
+        "LIBXML_NOCDATA" => Int(16384),
+        "LIBXML_NONET" => Int(2048),
+        "LIBXML_PEDANTIC" => Int(128),
+        "LIBXML_COMPACT" => Int(65536),
+        "LIBXML_PARSEHUGE" => Int(524288),
+        "LIBXML_BIGLINES" => Int(4194304),
+        "LIBXML_NOXMLDECL" => Int(2),
+        "LIBXML_NOEMPTYTAG" => Int(4),
+        "LIBXML_SCHEMA_CREATE" => Int(1),
+        "LIBXML_HTML_NOIMPLIED" => Int(8192),
+        "LIBXML_HTML_NODEFDTD" => Int(4),
+        "LIBXML_ERR_NONE" => Int(0),
+        "LIBXML_ERR_WARNING" => Int(1),
+        "LIBXML_ERR_ERROR" => Int(2),
+        "LIBXML_ERR_FATAL" => Int(3),
+        // xml parser (ext/xml, xml_parser_* functions)
+        "XML_OPTION_CASE_FOLDING" => Int(1),
+        "XML_OPTION_TARGET_ENCODING" => Int(2),
+        "XML_OPTION_SKIP_TAGSTART" => Int(3),
+        "XML_OPTION_SKIP_WHITE" => Int(4),
+        "XML_ERROR_NONE" => Int(0),
+        "XML_ERROR_SYNTAX" => Int(2),
+        // htmlspecialchars/htmlentities decode table selector + token_get_all flags
+        "HTML_ENTITIES" => Int(1),
+        "HTML_SPECIALCHARS" => Int(0),
+        "TOKEN_PARSE" => Int(1),
+        // ext/fileinfo
+        "FILEINFO_NONE" => Int(0),
+        "FILEINFO_MIME" => Int(1040),
+        "FILEINFO_MIME_TYPE" => Int(16),
+        "FILEINFO_MIME_ENCODING" => Int(1024),
+        // array_change_key_case / mb_convert_case
+        "CASE_LOWER" => Int(0),
+        "CASE_UPPER" => Int(1),
+        "MB_CASE_UPPER" => Int(0),
+        "MB_CASE_LOWER" => Int(1),
+        "MB_CASE_TITLE" => Int(2),
+        // connection_status()
+        "CONNECTION_NORMAL" => Int(0),
+        "CONNECTION_ABORTED" => Int(1),
+        "CONNECTION_TIMEOUT" => Int(2),
+        // preg: remaining split/grep flags (PATTERN_ORDER etc already defined above)
+        "PREG_SPLIT_OFFSET_CAPTURE" => Int(4),
+        "PREG_UNMATCHED_AS_NULL" => Int(512),
+        "PREG_GREP_INVERT" => Int(1),
         _ => return None,
     })
 }

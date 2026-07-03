@@ -27,6 +27,30 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-05 (later still) — bcmath from scratch; 16% crossed
+
+**Pass rate: 3497 → 3549 — biggest batch since the harness fix.**
+
+`src/bcmath.rs`: arbitrary-precision decimal arithmetic on base-10 digit
+vectors — schoolbook add/sub/mul, long division truncating to PHP's scale
+semantics (no rounding, trailing zeros kept), Newton's method sqrt,
+repeated-squaring pow — wired to bcadd/bcsub/bcmul/bcdiv/bcmod/bccomp/bcpow/
+bcsqrt/bcscale with PHP's exact ValueErrors. ext/bcmath went 0 → 43.
+
+The corpus supplied its ritual resource bomb within minutes:
+`bcscale(634314234334311)` — with no range validation, the next bcsqrt tried
+to materialize 634 trillion zero digits. PHP validates scale to 0..2³¹-1;
+now we do too (plus an internal 100k-digit cap, because a "legal" scale of
+two billion is still a memory bomb).
+
+Also this batch: a subagent restored the analyzer's MISSING_* histograms
+(the fatal-conversion had collapsed them all into MISMATCH_FATAL — the
+measurement tool needed to learn the engine's new output format), and a
+second agent added ~70 constants (LIBXML_*, FILTER_*, INPUT_*, XML_OPTION_*,
+FILEINFO_*…) — LIBXML_NOERROR alone was blocking 42 tests. ext/filter +6.
+
+---
+
 ## 2026-07-05 (later) — Error handlers fire
 
 **Pass rate: 3479 → 3497.**
