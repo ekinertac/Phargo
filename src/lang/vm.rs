@@ -148,6 +148,9 @@ pub struct Chunk {
     pub slot_names: Vec<String>,
     /// Whether any op touches $this (the interpreter resolves it at entry).
     pub uses_this: bool,
+    /// Top-level chunks: slots ARE global variables, so calls that leave the
+    /// VM must sync slots out/in (walker callees can mutate globals).
+    pub top_level: bool,
     /// Function-body chunks: parameters occupy slots 0..nparams in order.
     /// Defaults here are compile-time constants; anything fancier clears
     /// fast_callable.
@@ -232,6 +235,7 @@ struct LoopCtx {
     break_patches: Vec<usize>,
     iter_depth: usize,
     is_switch: bool,
+    is_foreach: bool,
 }
 
 /// Builtins that must never be called from a chunk: by-ref out-params,
@@ -309,7 +313,26 @@ impl<'a> Compiler<'a> {
                 param_defaults.push(d);
             }
         }
-        c.block(body)?;
+        if top_level {
+            // direct top-level declarations were hoisted before execution —
+            // safe to skip. NESTED (conditional) declarations register at
+            // runtime, which a chunk can't do: stmt() bails on those.
+            for s in body {
+                let inner = match s {
+                    Stmt::Marked(line, i) => {
+                        c.ops.push(Op::Line(*line));
+                        &**i
+                    }
+                    other => other,
+                };
+                if matches!(inner, Stmt::Func(_) | Stmt::Class(_)) {
+                    continue;
+                }
+                c.stmt(inner)?;
+            }
+        } else {
+            c.block(body)?;
+        }
         c.ops.push(Op::RetNull);
         let n_sites = c.n_sites as usize;
         Some(Chunk {
@@ -318,6 +341,7 @@ impl<'a> Compiler<'a> {
             names: c.names,
             slot_names: c.slot_names,
             uses_this: c.uses_this,
+            top_level,
             nparams,
             param_defaults,
             fast_callable,
@@ -497,6 +521,7 @@ impl<'a> Compiler<'a> {
                     break_patches: Vec::new(),
                     iter_depth: self.iter_depth,
                     is_switch: false,
+                    is_foreach: false,
                 });
                 self.block(body)?;
                 self.ops.push(Op::Jmp(start));
@@ -513,6 +538,7 @@ impl<'a> Compiler<'a> {
                     break_patches: Vec::new(),
                     iter_depth: self.iter_depth,
                     is_switch: false,
+                    is_foreach: false,
                 });
                 self.block(body)?;
                 let cond_at = self.here();
@@ -547,6 +573,7 @@ impl<'a> Compiler<'a> {
                     break_patches: Vec::new(),
                     iter_depth: self.iter_depth,
                     is_switch: false,
+                    is_foreach: false,
                 });
                 self.block(body)?;
                 let step_at = self.here();
@@ -591,6 +618,7 @@ impl<'a> Compiler<'a> {
                     break_patches: Vec::new(),
                     iter_depth: self.iter_depth,
                     is_switch: false,
+                    is_foreach: true,
                 });
                 self.block(body)?;
                 self.ops.push(Op::Jmp(start));
@@ -638,6 +666,7 @@ impl<'a> Compiler<'a> {
                     break_patches: Vec::new(),
                     iter_depth: self.iter_depth,
                     is_switch: true,
+                    is_foreach: false,
                 });
                 let mut body_starts: Vec<u32> = Vec::new();
                 for c in cases {
@@ -665,9 +694,10 @@ impl<'a> Compiler<'a> {
                 if *n != 1 {
                     return None;
                 }
-                let ctx_iter_depth = self.loops.last()?.iter_depth;
-                // leaving a foreach: pop its iterator
-                if self.iter_depth > 0 && ctx_iter_depth == self.iter_depth {
+                // leaving a foreach: pop its iterator (only when the loop
+                // being broken IS the foreach — a while nested inside one
+                // must not pop the outer iterator)
+                if self.loops.last()?.is_foreach {
                     self.ops.push(Op::PopIter);
                 }
                 let p = self.ops.len();
@@ -693,12 +723,6 @@ impl<'a> Compiler<'a> {
                 }
                 Some(())
             }
-            // top-level declarations were hoisted before execution; leaving
-            // them out of the chunk preserves behavior for the direct case.
-            // (Conditional declarations sit inside If bodies and bail there
-            // via this same match falling to None for nested positions —
-            // we only accept them when compiling the top level.)
-            Stmt::Func(_) | Stmt::Class(_) if self.top_level && self.loops.is_empty() => Some(()),
             _ => None,
         }
     }
@@ -791,11 +815,13 @@ impl<'a> Compiler<'a> {
                 Expr::Var(n) => {
                     let s = self.slot(n)?;
                     if matches!(op, BinOp::Concat) {
+                        // the walker's `.=` fast path creates silently
                         self.expr(rhs)?;
                         self.ops.push(Op::ConcatAssign(s));
                         return Some(());
                     }
-                    self.ops.push(Op::LoadQuiet(s));
+                    // compound assignment reads CHECKED (undefined warns)
+                    self.ops.push(Op::Load(s));
                     self.expr(rhs)?;
                     self.ops.push(Op::Bin(*op));
                     self.ops.push(Op::Store(s));
@@ -819,7 +845,7 @@ impl<'a> Compiler<'a> {
             _ => return None,
         };
         let one = self.konst(super::value::Value::Int(1))?;
-        self.ops.push(Op::LoadQuiet(s));
+        self.ops.push(Op::Load(s));
         self.ops.push(Op::Const(one));
         self.ops.push(Op::Bin(op));
         self.ops.push(Op::Store(s));
@@ -907,6 +933,11 @@ impl<'a> Compiler<'a> {
                 let ci = self.name(&cname)?;
                 let mi = self.name(m)?;
                 self.needs_ctx = true;
+                // static calls forward $this when the target isn't static
+                // (parent::m()), so the chunk must resolve its receiver
+                if !self.top_level {
+                    self.uses_this = true;
+                }
                 self.ops.push(Op::CallStatic { class: ci, method: mi, argc: args.len() as u8 });
             }
             Expr::Var(n) => {

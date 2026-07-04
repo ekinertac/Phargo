@@ -4542,6 +4542,19 @@ impl Eval {
             VmOwner::Method(m) => Some(&m.params),
             VmOwner::Top => None,
         };
+        // by-ref parameters live in the scope map (the walker's capture/
+        // apply write-back reads them there after the body runs) — a chunk
+        // writing slots would silently break the caller's aliasing. By-ref
+        // RETURNS need write-context lvalue fetches the VM doesn't model.
+        let by_ref_return = match &owner {
+            VmOwner::Fn(f) => f.by_ref_return,
+            VmOwner::Method(m) => m.by_ref_return,
+            VmOwner::Top => false,
+        };
+        if by_ref_return || params.map(|ps| ps.iter().any(|p| p.by_ref)).unwrap_or(false) {
+            self.vm_cache.insert(key, (None, owner));
+            return None;
+        }
         let chunk = crate::lang::vm::Compiler::compile(body, top_level, params, &resolver).map(|mut c| {
             c.debug_name = self.cur_fn.last().cloned().unwrap_or_else(|| "{top}".into());
             Rc::new(c)
@@ -4584,6 +4597,29 @@ impl Eval {
             }
         }
         r
+    }
+
+    /// Class-name resolution for VM ops: self/parent/static keywords like
+    /// resolve_class_name, everything else through the namespace machinery.
+    fn vm_resolve_class(&mut self, raw: &str) -> String {
+        match raw.to_ascii_lowercase().as_str() {
+            "self" => self.current_class.clone().unwrap_or_else(|| raw.to_string()),
+            "static" => self
+                .called_class
+                .clone()
+                .or_else(|| self.current_class.clone())
+                .unwrap_or_else(|| raw.to_string()),
+            "parent" => {
+                let cur = self.current_class.clone().unwrap_or_default();
+                self.find_class(&cur)
+                    .and_then(|c| c.parent.as_ref().map(|p| p.parts.join("\\")))
+                    .unwrap_or(cur)
+            }
+            _ => {
+                let n = Name { parts: vec![raw.to_string()], fully_qualified: false };
+                self.resolve_ns_class(&n)
+            }
+        }
     }
 
     /// The VM-native call: bind arguments straight into the callee chunk's
@@ -4702,6 +4738,48 @@ impl Eval {
         r
     }
 
+    /// Top-level chunk slot<->scope synchronization around out-of-VM calls
+    /// (top-level slots are aliases of global variables). Values MOVE — a
+    /// clone here is quadratic when a slot holds a growing string and the
+    /// loop calls out every iteration (concat_003 taught this). Existing Ref
+    /// cells in the scope are written through, preserving `global` bindings.
+    fn vm_sync_out(&mut self, chunk: &crate::lang::vm::Chunk, slots: &mut [Value], assigned: &[bool]) {
+        for (i, name) in chunk.slot_names.iter().enumerate() {
+            if assigned[i] {
+                let v = std::mem::replace(&mut slots[i], Value::Null);
+                match self.vars().get(name) {
+                    Some(Value::Ref(cell)) => {
+                        let cell = cell.clone();
+                        *cell.borrow_mut() = v;
+                    }
+                    _ => {
+                        self.vars().insert(name.clone(), v);
+                    }
+                }
+            }
+        }
+    }
+
+    fn vm_sync_in(&mut self, chunk: &crate::lang::vm::Chunk, slots: &mut [Value], assigned: &mut [bool]) {
+        for (i, name) in chunk.slot_names.iter().enumerate() {
+            match self.vars().get(name) {
+                Some(Value::Ref(cell)) => {
+                    // ref-bound global: leave the cell in place, copy content
+                    let cell = cell.clone();
+                    slots[i] = cell.borrow().clone();
+                    assigned[i] = true;
+                }
+                Some(_) => {
+                    if let Some(v) = self.vars().remove(name) {
+                        slots[i] = v;
+                        assigned[i] = true;
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+
     fn run_chunk_inner(
         &mut self,
         chunk: &Rc<crate::lang::vm::Chunk>,
@@ -4712,7 +4790,13 @@ impl Eval {
         use crate::lang::vm::Op;
         let ops = &chunk.ops;
         let mut stack: Vec<Value> = Vec::with_capacity(16);
-        let mut iters: Vec<(Vec<(Key, Value)>, usize)> = Vec::new();
+        enum VmIter {
+            Snapshot(Vec<(Key, Value)>, usize),
+            /// Iterator-protocol object; bool = next() already due before
+            /// the coming round (i.e. not the first).
+            Proto(Value, bool),
+        }
+        let mut iters: Vec<VmIter> = Vec::new();
         let mut pc: usize = 0;
         let mut budget: u32 = 0;
         macro_rules! pop {
@@ -4793,6 +4877,16 @@ impl Eval {
                             continue;
                         }
                     }
+                    // concat with objects goes through __toString, like the
+                    // walker's Binary eval
+                    if matches!(b, BinOp::Concat)
+                        && (matches!(l, Value::Object(_)) || matches!(r, Value::Object(_)))
+                    {
+                        let mut out = self.stringify(&l)?;
+                        out.extend_from_slice(&self.stringify(&r)?);
+                        stack.push(Value::Str(out));
+                        continue;
+                    }
                     stack.push(self.apply_bin(*b, &l, &r)?);
                 }
                 Op::Not => {
@@ -4871,6 +4965,10 @@ impl Eval {
                         };
                         target = Some(t);
                     }
+                    let sync = chunk.top_level;
+                    if sync {
+                        self.vm_sync_out(chunk, slots, assigned);
+                    }
                     let r = match target.unwrap() {
                         crate::lang::vm::Callee::Fast(f, cc) => self.vm_fast_call(&f, &cc, argv)?,
                         crate::lang::vm::Callee::Slow(f) => self.call_user(&f, argv, None)?,
@@ -4882,6 +4980,9 @@ impl Eval {
                         | crate::lang::vm::Callee::FastMethod { .. }
                         | crate::lang::vm::Callee::SlowMethod { .. } => unreachable!(),
                     };
+                    if sync {
+                        self.vm_sync_in(chunk, slots, assigned);
+                    }
                     stack.push(r);
                 }
                 Op::Echo(nvals) => {
@@ -4899,8 +5000,23 @@ impl Eval {
                 Op::LoadIndexQuiet(i) | Op::LoadIndex(i) => {
                     let checked = matches!(op, Op::LoadIndex(_));
                     let kv = pop!();
-                    let k = Arr::norm_key(&kv);
                     let i = *i as usize;
+                    if let Value::Object(rc) = &slots[i] {
+                        let class = rc.borrow().class.clone();
+                        if self.find_method(&class, "offsetget").is_some() {
+                            let obj = Value::Object(rc.clone());
+                            if chunk.top_level {
+                                self.vm_sync_out(chunk, slots, assigned);
+                            }
+                            let v = self.call_method(obj, "offsetGet", vec![kv])?;
+                            if chunk.top_level {
+                                self.vm_sync_in(chunk, slots, assigned);
+                            }
+                            stack.push(v);
+                            continue;
+                        }
+                    }
+                    let k = Arr::norm_key(&kv);
                     let got = match &slots[i] {
                         Value::Array(a) => a.get(&k).map(|v| v.deref()),
                         Value::Str(s) => {
@@ -4935,8 +5051,23 @@ impl Eval {
                 Op::StoreIndex(i) => {
                     let v = pop!();
                     let kv = pop!();
-                    let k = Arr::norm_key(&kv);
                     let i = *i as usize;
+                    // ArrayAccess object in the slot: offsetSet, like assign_index
+                    if let Value::Object(rc) = &slots[i] {
+                        let class = rc.borrow().class.clone();
+                        if self.find_method(&class, "offsetset").is_some() {
+                            let obj = Value::Object(rc.clone());
+                            if chunk.top_level {
+                                self.vm_sync_out(chunk, slots, assigned);
+                            }
+                            self.call_method(obj, "offsetSet", vec![kv, v])?;
+                            if chunk.top_level {
+                                self.vm_sync_in(chunk, slots, assigned);
+                            }
+                            continue;
+                        }
+                    }
+                    let k = Arr::norm_key(&kv);
                     if !matches!(slots[i], Value::Array(_)) {
                         slots[i] = Value::Array(Arr::new());
                     }
@@ -4951,6 +5082,20 @@ impl Eval {
                 Op::Append(i) => {
                     let v = pop!();
                     let i = *i as usize;
+                    if let Value::Object(rc) = &slots[i] {
+                        let class = rc.borrow().class.clone();
+                        if self.find_method(&class, "offsetset").is_some() {
+                            let obj = Value::Object(rc.clone());
+                            if chunk.top_level {
+                                self.vm_sync_out(chunk, slots, assigned);
+                            }
+                            self.call_method(obj, "offsetSet", vec![Value::Null, v])?;
+                            if chunk.top_level {
+                                self.vm_sync_in(chunk, slots, assigned);
+                            }
+                            continue;
+                        }
+                    }
                     if !matches!(slots[i], Value::Array(_)) {
                         slots[i] = Value::Array(Arr::new());
                     }
@@ -4981,9 +5126,57 @@ impl Eval {
                 }
                 Op::IterInit { slot, end } => {
                     let i = *slot as usize;
+                    if !assigned[i] {
+                        self.warn(&format!("Undefined variable ${}", chunk.slot_names[i]))?;
+                    }
                     match &slots[i] {
                         Value::Array(a) => {
-                            iters.push((a.entries.clone(), 0));
+                            iters.push(VmIter::Snapshot(a.entries.clone(), 0));
+                        }
+                        Value::Object(rc) => {
+                            // mirror the walker: IteratorAggregate -> real
+                            // iterator; Iterator protocol driven per round;
+                            // plain object -> property snapshot. Protocol
+                            // methods are user code: sync top-level slots.
+                            let rc = rc.clone();
+                            if chunk.top_level {
+                                self.vm_sync_out(chunk, slots, assigned);
+                            }
+                            let class = rc.borrow().class.clone();
+                            let iter = if self.find_method(&class, "getiterator").is_some() {
+                                self.call_method(Value::Object(rc.clone()), "getIterator", vec![])?
+                            } else {
+                                Value::Object(rc.clone())
+                            };
+                            let it_class = match &iter {
+                                Value::Object(irc) => Some(irc.borrow().class.clone()),
+                                _ => None,
+                            };
+                            let proto = it_class
+                                .as_ref()
+                                .map(|ic| {
+                                    self.find_method(ic, "rewind").is_some()
+                                        && self.find_method(ic, "valid").is_some()
+                                })
+                                .unwrap_or(false);
+                            if proto {
+                                self.call_method(iter.clone(), "rewind", vec![])?;
+                                if chunk.top_level {
+                                    self.vm_sync_in(chunk, slots, assigned);
+                                }
+                                iters.push(VmIter::Proto(iter, false));
+                            } else {
+                                let props: Vec<(Key, Value)> = rc
+                                    .borrow()
+                                    .props
+                                    .iter()
+                                    .map(|(k, v)| (Key::Str(k.clone().into_bytes()), v.clone()))
+                                    .collect();
+                                if chunk.top_level {
+                                    self.vm_sync_in(chunk, slots, assigned);
+                                }
+                                iters.push(VmIter::Snapshot(props, 0));
+                            }
                         }
                         other => {
                             let t = self.given_type(other);
@@ -4995,21 +5188,63 @@ impl Eval {
                     }
                 }
                 Op::IterNext { val_slot, key_slot, end } => {
-                    let (entries, idx) = iters.last_mut().expect("iter underflow");
-                    if *idx < entries.len() {
-                        let (k, v) = &entries[*idx];
-                        *idx += 1;
-                        let vi = *val_slot as usize;
-                        slots[vi] = v.deref();
-                        assigned[vi] = true;
-                        if *key_slot != u16::MAX {
-                            let ki = *key_slot as usize;
-                            slots[ki] = akey_to_value(k);
-                            assigned[ki] = true;
+                    enum Round {
+                        Bind(Value, Option<Value>),
+                        Done,
+                    }
+                    let round = match iters.last_mut().expect("iter underflow") {
+                        VmIter::Snapshot(entries, idx) => {
+                            if *idx < entries.len() {
+                                let (k, v) = &entries[*idx];
+                                *idx += 1;
+                                Round::Bind(v.deref(), Some(akey_to_value(k)))
+                            } else {
+                                Round::Done
+                            }
                         }
-                    } else {
-                        iters.pop();
-                        pc = *end as usize;
+                        VmIter::Proto(iter, started) => {
+                            let iter = iter.clone();
+                            let advance = *started;
+                            *started = true;
+                            if chunk.top_level {
+                                self.vm_sync_out(chunk, slots, assigned);
+                            }
+                            if advance {
+                                self.call_method(iter.clone(), "next", vec![])?;
+                            }
+                            self.tick()?;
+                            let round = if to_bool(&self.call_method(iter.clone(), "valid", vec![])?) {
+                                let cur = self.call_method(iter.clone(), "current", vec![])?;
+                                let k = if *key_slot != u16::MAX {
+                                    Some(self.call_method(iter, "key", vec![])?)
+                                } else {
+                                    None
+                                };
+                                Round::Bind(cur, k)
+                            } else {
+                                Round::Done
+                            };
+                            if chunk.top_level {
+                                self.vm_sync_in(chunk, slots, assigned);
+                            }
+                            round
+                        }
+                    };
+                    match round {
+                        Round::Bind(v, k) => {
+                            let vi = *val_slot as usize;
+                            slots[vi] = v;
+                            assigned[vi] = true;
+                            if *key_slot != u16::MAX {
+                                let ki = *key_slot as usize;
+                                slots[ki] = k.unwrap_or(Value::Null);
+                                assigned[ki] = true;
+                            }
+                        }
+                        Round::Done => {
+                            iters.pop();
+                            pc = *end as usize;
+                        }
                     }
                 }
                 Op::PopIter => {
@@ -5038,17 +5273,38 @@ impl Eval {
                     let at = stack.len() - d;
                     let keys: Vec<Key> = stack.split_off(at).iter().map(Arr::norm_key).collect();
                     let is_prop = matches!(op, crate::lang::vm::Op::LoadPathThisProp { .. });
-                    let v = if is_prop {
+                    // navigate the prefix, then final step warns on a
+                    // missing key like the walker's checked read
+                    let (prefix, last) = keys.split_at(d - 1);
+                    let container = if is_prop {
                         let name = &chunk.names[*slot as usize];
                         this_rc
                             .as_ref()
                             .and_then(|rc| {
                                 let b = rc.borrow();
-                                b.get(name).map(|base| read_index_value(base, &keys))
+                                b.get(name).map(|base| read_index_value(base, prefix))
                             })
                             .unwrap_or(Value::Null)
                     } else {
-                        read_index_value(&slots[*slot as usize], &keys)
+                        read_index_value(&slots[*slot as usize], prefix)
+                    };
+                    let k = &last[0];
+                    let v = match &container {
+                        Value::Array(a) => match a.get(k) {
+                            Some(x) => x.deref(),
+                            None => {
+                                let msg = match k {
+                                    Key::Int(n) => format!("Undefined array key {n}"),
+                                    Key::Str(s) => format!(
+                                        "Undefined array key \"{}\"",
+                                        String::from_utf8_lossy(s)
+                                    ),
+                                };
+                                self.warn(&msg)?;
+                                Value::Null
+                            }
+                        },
+                        other => read_index_value(other, last),
                     };
                     stack.push(v);
                 }
@@ -5097,24 +5353,7 @@ impl Eval {
                 }
                 Op::ClassConstOp { class, name } => {
                     let raw = chunk.names[*class as usize].clone();
-                    let cname = match raw.to_ascii_lowercase().as_str() {
-                        "self" => self.current_class.clone().unwrap_or(raw),
-                        "static" => self
-                            .called_class
-                            .clone()
-                            .or_else(|| self.current_class.clone())
-                            .unwrap_or(raw),
-                        "parent" => {
-                            let cur = self.current_class.clone().unwrap_or_default();
-                            self.find_class(&cur)
-                                .and_then(|c| c.parent.as_ref().map(|p| p.parts.join("\\")))
-                                .unwrap_or(cur)
-                        }
-                        _ => {
-                            let n = Name { parts: vec![raw.clone()], fully_qualified: false };
-                            self.resolve_ns_class(&n)
-                        }
-                    };
+                    let cname = self.vm_resolve_class(&raw);
                     let cn = chunk.names[*name as usize].clone();
                     let v = self.class_const(&cname, &cn)?;
                     stack.push(v);
@@ -5184,9 +5423,14 @@ impl Eval {
                     let at = stack.len() - argc;
                     let argv: Vec<Value> = stack.split_off(at);
                     let raw = chunk.names[*class as usize].clone();
-                    let n = Name { parts: vec![raw], fully_qualified: false };
-                    let cname = self.resolve_ns_class(&n);
+                    let cname = self.vm_resolve_class(&raw);
+                    if chunk.top_level {
+                        self.vm_sync_out(chunk, slots, assigned);
+                    }
                     let v = self.instantiate(&cname, argv)?;
+                    if chunk.top_level {
+                        self.vm_sync_in(chunk, slots, assigned);
+                    }
                     stack.push(v);
                 }
                 Op::CallStatic { class, method, argc } => {
@@ -5196,27 +5440,22 @@ impl Eval {
                     let argv: Vec<Value> = stack.split_off(at);
                     let raw = chunk.names[*class as usize].clone();
                     let mname = chunk.names[*method as usize].clone();
-                    // self/parent/static resolve like resolve_class_name
-                    let cname = match raw.to_ascii_lowercase().as_str() {
-                        "self" => self.current_class.clone().unwrap_or(raw),
-                        "static" => self
-                            .called_class
-                            .clone()
-                            .or_else(|| self.current_class.clone())
-                            .unwrap_or(raw),
-                        "parent" => {
-                            let cur = self.current_class.clone().unwrap_or_default();
-                            self.find_class(&cur)
-                                .and_then(|c| c.parent.as_ref().map(|p| p.parts.join("\\")))
-                                .unwrap_or(cur)
-                        }
-                        _ => {
-                            let n = Name { parts: vec![raw.clone()], fully_qualified: false };
-                            self.resolve_ns_class(&n)
-                        }
-                    };
-                    let this = self.vars().get("this").cloned();
-                    let v = self.call_static(&cname, &mname, argv, this, None)?;
+                    let cname = self.vm_resolve_class(&raw);
+                    // $this comes from the chunk's resolved receiver — fast
+                    // frames have no scope map to look it up in
+                    let this = this_rc.as_ref().map(|rc| Value::Object(rc.clone()));
+                    if chunk.top_level {
+                        self.vm_sync_out(chunk, slots, assigned);
+                    }
+                    // self::/parent::/static:: forward the LSB scope
+                    let forwarding = matches!(
+                        raw.to_ascii_lowercase().as_str(),
+                        "self" | "parent" | "static"
+                    );
+                    let v = self.call_static_fw(&cname, &mname, argv, this, None, forwarding)?;
+                    if chunk.top_level {
+                        self.vm_sync_in(chunk, slots, assigned);
+                    }
                     stack.push(v);
                 }
                 Op::LoadThis => {
@@ -5227,10 +5466,29 @@ impl Eval {
                 }
                 Op::LoadThisProp(i) => {
                     let name = &chunk.names[*i as usize];
-                    let v = this_rc
+                    let hit = this_rc
                         .as_ref()
-                        .and_then(|rc| rc.borrow().get(name).map(|v| v.deref()))
-                        .unwrap_or(Value::Null);
+                        .and_then(|rc| rc.borrow().get(name).map(|v| v.deref()));
+                    let v = match hit {
+                        Some(v) => v,
+                        None => {
+                            // absent property falls through to __get (walker
+                            // parity: unset($obj->p) + magic getter)
+                            match this_rc {
+                                Some(rc) => {
+                                    let class = rc.borrow().class.clone();
+                                    if self.find_method(&class, "__get").is_some() {
+                                        let obj = Value::Object(rc.clone());
+                                        let arg = Value::Str(name.clone().into_bytes());
+                                        self.call_method(obj, "__get", vec![arg])?
+                                    } else {
+                                        Value::Null
+                                    }
+                                }
+                                None => Value::Null,
+                            }
+                        }
+                    };
                     stack.push(v);
                 }
                 Op::StoreThisProp(i) => {
@@ -5395,7 +5653,13 @@ impl Eval {
                         }
                     }
                     let mname = chunk.names[*name as usize].clone();
+                    if chunk.top_level {
+                        self.vm_sync_out(chunk, slots, assigned);
+                    }
                     let r = self.call_method(recv, &mname, argv)?;
+                    if chunk.top_level {
+                        self.vm_sync_in(chunk, slots, assigned);
+                    }
                     stack.push(r);
                 }
                 Op::ConstLookup(i) => {

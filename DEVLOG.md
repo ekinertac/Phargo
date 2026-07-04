@@ -27,6 +27,39 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-07 (later) — The parity hunt: 69 regressions, 12 bug classes, and an inversion.
+
+**The VM went from 44 tests BEHIND the walker to 23 tests AHEAD (3866 vs
+3843).** The method: a per-test results dump (PHARGO_RESULTS), diff the two
+modes, fix by bug class, re-sweep. What the 69 regressions decomposed into:
+
+- **By-ref anywhere = walker.** Bodies with by-ref params compiled happily
+  and wrote their params into slots — invisible to capture_byref's
+  write-back. Same for by-ref RETURNS (write-context lvalue fetches). Both
+  now bail at compile.
+- **Top-level slots ARE globals.** Walker callees mutate globals through
+  `global`; the compiled top level kept stale slots. Every op that leaves
+  the VM (calls, new, ArrayAccess dispatch, iterator protocol) now syncs
+  slots out/in — and the sync MOVES values instead of cloning them,
+  because a growing 15 MB string synced around 220,000 calls is how
+  concat_003 turned a correctness fix into an infinite loop.
+- **Objects behave like objects**: ArrayAccess offsetGet/offsetSet from
+  slots, __get fallback on unset properties, __toString in concat,
+  protocol-driven foreach (rewind/valid/current/key/next interleaved
+  exactly like the walker — our eager generators made this exact),
+  `new static` and parent:: LSB forwarding.
+- **Small exactness**: compound assignments read CHECKED (undefined
+  warns), foreach warns before type-checking its subject, nested-path
+  reads warn on the final missing key, break inside a while nested in a
+  foreach no longer pops the outer iterator, and conditional declarations
+  inside if-blocks bail the chunk (they register at runtime; Nop-ing them
+  was inventing hoisting PHP doesn't have).
+
+The inversion (VM > walker) comes from the fast paths fixing real walker
+weaknesses in the 24 tests that always passed under the VM. Cutover still
+needs the reverse diff — those 24 are walker bugs to understand, not
+trophies to bank.
+
 ## 2026-07-07 — Fast calls, and the guards that keep them honest.
 
 **The per-call wall falls.** Call sites in compiled chunks now carry memos

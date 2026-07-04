@@ -82,6 +82,12 @@ fn run_scoreboard() {
 
     let n = tests.len();
     let breadcrumb = Path::new(root).join("target").join("current_test.txt");
+    // PHARGO_RESULTS=<file>: dump one "P|F|U\t<path>" line per test, for
+    // diffing engine modes (walker vs VM parity hunts)
+    let mut results_out: Option<std::io::BufWriter<fs::File>> = std::env::var("PHARGO_RESULTS")
+        .ok()
+        .and_then(|p| fs::File::create(p).ok())
+        .map(std::io::BufWriter::new);
     for (i, (group, path)) in tests.iter().enumerate() {
         let _ = fs::write(&breadcrumb, path.to_string_lossy().as_bytes());
         let bytes = fs::read(path).unwrap_or_default();
@@ -93,6 +99,10 @@ fn run_scoreboard() {
             Outcome::Fail => 1,
             Outcome::Unsupported => 2,
         };
+        if let Some(w) = results_out.as_mut() {
+            use std::io::Write;
+            let _ = writeln!(w, "{}\t{}", ["P", "F", "U"][idx], path.display());
+        }
         if group == CURATED {
             curated[idx] += 1;
             curated[3] += 1;
