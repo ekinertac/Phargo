@@ -14032,6 +14032,9 @@ fn php_const(n: &str) -> Option<Value> {
         "ENT_XML1" => Int(16),
         "ENT_XHTML" => Int(32),
         "ENT_HTML5" => Int(48),
+        // debug_backtrace() option flags
+        "DEBUG_BACKTRACE_PROVIDE_OBJECT" => Int(1),
+        "DEBUG_BACKTRACE_IGNORE_ARGS" => Int(2),
         // stream socket flags (transports probe and fail into WP_Error)
         "STREAM_CLIENT_PERSISTENT" => Int(1),
         "STREAM_CLIENT_ASYNC_CONNECT" => Int(2),
