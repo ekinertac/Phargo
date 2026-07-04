@@ -12466,7 +12466,41 @@ impl Eval {
             "session_get_cookie_params" => Value::Array(Arr::new()),
             "php_sapi_name" => Value::Str(b"cli".to_vec()),
             "date_default_timezone_get" => Value::Str(self.default_tz.clone().into_bytes()),
-            "debug_backtrace" => Value::Array(Arr::new()),
+            "debug_backtrace" => {
+                // real frames (newest first), like __phargo_trace: function,
+                // file, line; "Class->m"/"Class::m" split into class+function
+                let limit = if args.len() > 1 { to_i64(&a(1)).max(0) as usize } else { 0 };
+                let mut arr = Arr::new();
+                for (name, line, file) in self.frames.iter().rev() {
+                    if limit > 0 && arr.len() >= limit {
+                        break;
+                    }
+                    let base = name
+                        .split(|c| c == '-' || c == ':')
+                        .next()
+                        .unwrap_or(name)
+                        .to_ascii_lowercase();
+                    if self.prelude_classes.contains(&base) || self.prelude_fns.contains(&base) {
+                        continue;
+                    }
+                    let mut f = Arr::new();
+                    f.insert(Key::Str(b"file".to_vec()), Value::Str(file.clone().into_bytes()));
+                    f.insert(Key::Str(b"line".to_vec()), Value::Int(*line as i64));
+                    if let Some((cls, m)) = name.split_once("->") {
+                        f.insert(Key::Str(b"function".to_vec()), Value::Str(m.as_bytes().to_vec()));
+                        f.insert(Key::Str(b"class".to_vec()), Value::Str(cls.as_bytes().to_vec()));
+                        f.insert(Key::Str(b"type".to_vec()), Value::Str(b"->".to_vec()));
+                    } else if let Some((cls, m)) = name.split_once("::") {
+                        f.insert(Key::Str(b"function".to_vec()), Value::Str(m.as_bytes().to_vec()));
+                        f.insert(Key::Str(b"class".to_vec()), Value::Str(cls.as_bytes().to_vec()));
+                        f.insert(Key::Str(b"type".to_vec()), Value::Str(b"::".to_vec()));
+                    } else {
+                        f.insert(Key::Str(b"function".to_vec()), Value::Str(name.clone().into_bytes()));
+                    }
+                    arr.push(Value::Array(f));
+                }
+                Value::Array(arr)
+            }
             "gc_collect_cycles" | "http_response_code" | "getmypid" | "hrtime" => Value::Int(0),
             "memory_get_usage" | "memory_get_peak_usage" => Value::Int(2_000_000),
             "php_sapi_name" => Value::Str(b"cli".to_vec()),
