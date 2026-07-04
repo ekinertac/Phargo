@@ -16,6 +16,15 @@ use std::rc::Rc;
 #[derive(Debug)]
 pub struct RunError(pub String);
 
+/// Keep-alive for a VM-compiled body: pins the declaration whose Vec<Stmt>
+/// address keys the chunk cache.
+#[derive(Clone)]
+enum VmOwner {
+    Fn(Rc<FuncDecl>),
+    Method(Rc<MethodDecl>),
+    Top,
+}
+
 /// Where a foreach-by-ref array lives: a local variable or an object property.
 enum ArrPlace {
     Var(String),
@@ -94,9 +103,14 @@ pub struct Eval {
     /// strtok() resumable state: (subject, cursor).
     strtok_state: Option<(Vec<u8>, usize)>,
     /// Path C mixed-mode: bytecode engine enabled (PHARGO_ENGINE=vm) and the
-    /// per-body compilation cache (body ptr → chunk, None = walker-only).
+    /// per-body compilation cache. Keyed by the body slice address; every
+    /// entry PINS the owning declaration (Rc) so the address can never be
+    /// freed and reused for a different body — the cache is the keep-alive.
     vm_enabled: bool,
-    vm_cache: HashMap<usize, Option<Rc<crate::lang::vm::Chunk>>>,
+    vm_cache: HashMap<usize, (Option<Rc<crate::lang::vm::Chunk>>, VmOwner)>,
+    /// Set by callers that hold the body's owning Rc, consumed by the
+    /// run_fn_body VM hook. None → the body runs on the walker.
+    vm_next_owner: Option<VmOwner>,
     /// (class, method) → resolved Rc'd declaration; cleared on class changes.
     method_cache: RefCell<HashMap<(String, String), Option<(String, Rc<MethodDecl>)>>>,
     /// `fn:<name>` / `class:<name>` (lowercase) → definition-site context.
@@ -2073,6 +2087,7 @@ impl Eval {
             strtok_state: None,
             vm_enabled: std::env::var("PHARGO_ENGINE").map(|v| v == "vm").unwrap_or(false),
             vm_cache: HashMap::new(),
+            vm_next_owner: None,
             method_cache: RefCell::new(HashMap::new()),
             def_ctx: HashMap::new(),
             frames: Vec::new(),
@@ -2332,7 +2347,7 @@ impl Eval {
         crate::pdo::reset();
         e.hoist(program);
         let top_result = if e.vm_enabled {
-            match e.vm_chunk_for(program, true) {
+            match e.vm_chunk_for(program, true, VmOwner::Top) {
                 Some(chunk) => e.run_chunk(&chunk, true).map(|_| Flow::Normal),
                 None => e.exec_block(program),
             }
@@ -4483,9 +4498,14 @@ impl Eval {
     // ---- Path C: bytecode interpreter (mixed-mode) ------------------------
 
     /// Compile a body once (cached by AST address); None = walker-only.
-    fn vm_chunk_for(&mut self, body: &[Stmt], top_level: bool) -> Option<Rc<crate::lang::vm::Chunk>> {
+    fn vm_chunk_for(
+        &mut self,
+        body: &[Stmt],
+        top_level: bool,
+        owner: VmOwner,
+    ) -> Option<Rc<crate::lang::vm::Chunk>> {
         let key = body.as_ptr() as usize;
-        if let Some(hit) = self.vm_cache.get(&key) {
+        if let Some((hit, _)) = self.vm_cache.get(&key) {
             return hit.clone();
         }
         // the resolver decides which callables a chunk may invoke by value
@@ -4502,8 +4522,11 @@ impl Eval {
             }
             crate::lang::vm::CalleeKind::Unsafe
         };
-        let chunk = crate::lang::vm::Compiler::compile(body, top_level, &resolver).map(Rc::new);
-        self.vm_cache.insert(key, chunk.clone());
+        let chunk = crate::lang::vm::Compiler::compile(body, top_level, &resolver).map(|mut c| {
+            c.debug_name = self.cur_fn.last().cloned().unwrap_or_else(|| "{top}".into());
+            Rc::new(c)
+        });
+        self.vm_cache.insert(key, (chunk.clone(), owner));
         chunk
     }
 
@@ -4551,7 +4574,11 @@ impl Eval {
         }
         loop {
             budget += 1;
-            if budget >= 512 {
+            if budget >= 64 {
+                // VM ops are ~4-6x finer-grained than walker statements;
+                // charge the batch at a comparable rate so runaway corpus
+                // tests still die at the same step budget
+                self.steps += 15;
                 budget = 0;
                 self.tick()?;
             }
@@ -4562,6 +4589,12 @@ impl Eval {
                 Op::Load(i) => {
                     let i = *i as usize;
                     if !assigned[i] {
+                        if std::env::var("PHARGO_VM_DEBUG").is_ok() {
+                            eprintln!(
+                                "[vm undef] ${} in chunk {}",
+                                chunk.slot_names[i], chunk.debug_name
+                            );
+                        }
                         self.warn(&format!("Undefined variable ${}", chunk.slot_names[i]))?;
                     }
                     stack.push(slots[i].clone());
@@ -5986,10 +6019,33 @@ impl Eval {
     }
 
     fn run_fn_body_inner(&mut self, body: &[Stmt]) -> R<Value> {
-        // Path C mixed-mode: run compiled bodies on the bytecode VM
+        // Path C mixed-mode: run compiled bodies on the bytecode VM. Only
+        // bodies whose caller registered an owning Rc are eligible — the
+        // owner pins the cache key's allocation (closures etc. run walker).
+        let owner = self.vm_next_owner.take();
         if self.vm_enabled && !has_yield(body) {
-            if let Some(chunk) = self.vm_chunk_for(body, false) {
-                return self.run_chunk(&chunk, false);
+            // cache hit: no owner needed (the entry already pins one)
+            if owner.is_none() {
+                if let Some((Some(chunk), _)) = self.vm_cache.get(&(body.as_ptr() as usize)) {
+                    let chunk = chunk.clone();
+                    return self.run_chunk(&chunk, false);
+                }
+            }
+            if let Some(owner) = owner {
+                let fname = self.cur_fn.last().cloned().unwrap_or_default();
+                let skip = std::env::var("PHARGO_VM_SKIP")
+                    .map(|s| !s.is_empty() && s.split(',').any(|p| fname.to_ascii_lowercase().contains(&p.to_ascii_lowercase())))
+                    .unwrap_or(false);
+                if !skip {
+                    let dbg = std::env::var("PHARGO_VM_DEBUG").is_ok();
+                    let fresh = dbg && !self.vm_cache.contains_key(&(body.as_ptr() as usize));
+                    if let Some(chunk) = self.vm_chunk_for(body, false, owner) {
+                        if fresh {
+                            eprintln!("[vm compile] {fname}");
+                        }
+                        return self.run_chunk(&chunk, false);
+                    }
+                }
             }
         }
         if has_yield(body) {
@@ -6060,6 +6116,13 @@ impl Eval {
         }
         self.byref_ret.push(f.by_ref_return);
         self.scopes.push(scope);
+        if self.vm_enabled && !self.vm_cache.contains_key(&(f.body.as_ptr() as usize)) {
+            if let Some(rc) = self.funcs.get(&f.name.to_ascii_lowercase()) {
+                if rc.body.as_ptr() == f.body.as_ptr() {
+                    self.vm_next_owner = Some(VmOwner::Fn(rc.clone()));
+                }
+            }
+        }
         let r = self.run_fn_body(&f.body);
         let wb = self.capture_byref(&f.params, byref);
         self.scopes.pop();
@@ -6755,14 +6818,15 @@ impl Eval {
         &mut self,
         recv: Value,
         decl_class: &str,
-        m: &MethodDecl,
+        m: &Rc<MethodDecl>,
         args: Vec<Value>,
         byref: Option<&[Arg]>,
     ) -> R<Value> {
-        let body = match &m.body {
-            Some(b) => b.clone(),
-            None => return Ok(Value::Null),
-        };
+        // the Rc keeps the body slice address stable for the VM chunk cache
+        let m = m.clone();
+        if m.body.is_none() {
+            return Ok(Value::Null);
+        }
         self.enter_call()?;
         self.cur_args.push(Rc::new(args.clone()));
         self.cur_fn.push(m.name.clone());
@@ -6819,7 +6883,10 @@ impl Eval {
         }
         self.byref_ret.push(m.by_ref_return);
         self.scopes.push(scope);
-        let r = self.run_fn_body(&body);
+        if self.vm_enabled {
+            self.vm_next_owner = Some(VmOwner::Method(m.clone()));
+        }
+        let r = self.run_fn_body(m.body.as_deref().unwrap_or(&[]));
         let wb = self.capture_byref(&m.params, byref);
         self.scopes.pop();
         self.byref_ret.pop();
@@ -6954,10 +7021,10 @@ impl Eval {
             }
             return Err(self.throw_error("Error", &msg));
         }
-        let body = match &m.body {
-            Some(b) => b.clone(),
-            None => return Ok(Value::Null),
-        };
+        let m = m.clone();
+        if m.body.is_none() {
+            return Ok(Value::Null);
+        }
         self.enter_call()?;
         self.cur_args.push(Rc::new(args.clone()));
         self.cur_fn.push(m.name.clone());
@@ -7003,7 +7070,10 @@ impl Eval {
         }
         self.byref_ret.push(m.by_ref_return);
         self.scopes.push(scope);
-        let r = self.run_fn_body(&body);
+        if self.vm_enabled {
+            self.vm_next_owner = Some(VmOwner::Method(m.clone()));
+        }
+        let r = self.run_fn_body(m.body.as_deref().unwrap_or(&[]));
         let wb = self.capture_byref(&m.params, byref);
         self.scopes.pop();
         self.byref_ret.pop();

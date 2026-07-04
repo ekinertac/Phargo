@@ -76,15 +76,23 @@ parallel behind a flag; run BOTH engines against BOTH oracles; cut over
 only when the VM beats the tree-walker on each; then delete the walker.
 
 **Preconditions before starting:**
-- [ ] `docs/DEVIATIONS.md` — promote the approximations scattered through
-      DEVLOG into a single punch list the VM must resolve (eager
-      generators, readonly init-once, `global`-by-value, namespace global
-      fallback, ref-in-array demotion, prelude object shapes vs real
-      var_dump, `restore_error_handler` single-slot, …).
-- [ ] Corpus ≥ ~20% and the Phase-1 gate passed, so the safety net is
-      dense where WP needs it.
-- [ ] `examples/bench.rs` — a small perf harness (scoreboard wall-time
-      trend + micro-benchmarks) so "beats the walker" is measurable.
+- [x] `docs/DEVIATIONS.md` — landed 2026-07-06: the punch list of
+      approximations, split into "VM fixes for free" / "needs VM design" /
+      "policy that survives".
+- [ ] Corpus ≥ ~20% and the Phase-1 gate passed (gate passed 2026-07-04 —
+      WordPress installs, renders pages, and serves wp-admin; corpus at
+      17.5% and climbing alongside).
+- [x] `examples/bench.rs` — landed 2026-07-06, including a `cmp` mode that
+      races real PHP and writes `docs/BENCHMARKS.md`. Walker baseline:
+      micro 1065 ms, wp-front-page 7526 ms (PHP 8.5: 125 ms).
+
+**Status 2026-07-06: STARTED.** `src/lang/vm.rs` — mixed-mode stack VM
+behind `PHARGO_ENGINE=vm`: slot-indexed locals, const pool, jumps,
+in-place array/concat ops, integer fast paths; per-body fallback to the
+walker; chunk cache pinned by owning declaration Rcs. First wins: micro
+suite 1065 → ~760 ms; WordPress renders byte-identical under the flag.
+Next subset targets: $this/property ops, method calls, array literals —
+WordPress is objects all the way down.
 
 **Gate:** cut-over merged; legacy walker deleted (second engine funeral).
 

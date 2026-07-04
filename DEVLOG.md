@@ -27,6 +27,31 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-06 (night) — The VM meets WordPress, and the allocator bites.
+
+**The first real VM bug was a use-after-free in spirit.** The chunk cache
+keyed compiled bodies by the body Vec's heap address — but method bodies
+were CLONED per call, freed pointers got reused by the allocator, and the
+wrong chunk executed with the wrong function's parameters ("Undefined
+variable $str", 8 MB of warning spam, garbage pages). The fix is
+architectural, not a patch: cache entries now PIN the owning declaration
+(the Rc<FuncDecl>/Rc<MethodDecl> the body lives in), so a cached address
+can never be freed; bodies without a registered owner (closures) simply
+run on the walker. Killing the per-call method body clone was a perf win
+the walker gets for free too.
+
+Second lesson: **the step limit is a safety property.** VM ops ticked the
+budget 512× slower than walker statements, so the corpus's deliberate
+infinite-loop tests ran... indefinitely. Op batches now charge steps at a
+comparable rate; runaways die on schedule again.
+
+After both: **the WordPress front page renders byte-identical under
+PHARGO_ENGINE=vm**, the corpus parity gap shrank 28 → 10, the default
+engine holds 3844, and `docs/BENCHMARKS.md` is now auto-generated — the
+same scripts raced through real PHP 8.5, the walker, and the VM, outputs
+verified identical. Honest headline: PHP does the WP page in ~126 ms, we
+do ~6.9 s. That 55× is the number this phase exists to destroy.
+
 ## 2026-07-06 (later) — Phase 2 begins: the VM takes its first breath.
 
 **The bytecode engine exists.** `PHARGO_ENGINE=vm` switches on mixed-mode

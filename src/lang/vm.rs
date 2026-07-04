@@ -98,6 +98,8 @@ pub struct Chunk {
     pub consts: Vec<super::value::Value>,
     pub names: Vec<String>,
     pub slot_names: Vec<String>,
+    /// Owning function name, for diagnostics.
+    pub debug_name: String,
 }
 
 /// What the compiler needs to know about a callable name, answered by the
@@ -172,6 +174,7 @@ impl<'a> Compiler<'a> {
             consts: c.consts,
             names: c.names,
             slot_names: c.slot_names,
+            debug_name: String::new(),
         })
     }
 
