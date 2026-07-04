@@ -181,6 +181,23 @@ and the full front-controller lifecycle renders a 23 KB HTML page:
 template parts, clean `</html>`. wpscan now runs the real index.php path
 and saves the response to target/wp_page.html.
 
+**UPDATE (2026-07-06/07, Phase 2 in progress):** the bytecode VM exists
+behind PHARGO_ENGINE=vm (src/lang/vm.rs + run_chunk in eval.rs).
+Mixed-mode: bodies compile to stack-machine chunks or fall back to the
+walker per-body; chunk cache pinned by owning declaration Rcs (pointer
+reuse burned us once). Subset so far: slots/consts/jumps, in-place
+array+concat ops, int fast paths, $this props (incl. nested paths),
+method/static/new calls (non-lvalue args only — by-ref safety), array
+literals, isset family, switch, class constants. Verified: A/B harnesses
+byte-identical, WP front page byte-identical under the flag, default
+scoreboard untouched (3844), VM-mode gap 10 tests (task: close to 0).
+Benchmarks: docs/BENCHMARKS.md auto-generated (bench -- cmp): micro
+1-3x of PHP 8.5, WP page 55x (7.1s vs 126ms — the Phase 2 number).
+**Profile-proven next lever: per-call overhead — VM-native chunk-to-chunk
+calls binding args directly into callee slots, skipping the scope
+HashMap/def-ctx/frame machinery for compiled callees. Also: compile rate
+614/2030 WP bodies; next bail causes worth a census after calls land.**
+
 **UPDATE (2026-07-05): "Hello world!" RENDERS.** Named SQL parameters now
 bind via rusqlite raw_bind_parameter/parameter_index (the PDO prelude's
 bindValue had cast ":param0" to int 0; execute() flattened assoc arrays).
