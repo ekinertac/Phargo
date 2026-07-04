@@ -111,6 +111,8 @@ pub struct Eval {
     /// Set by callers that hold the body's owning Rc, consumed by the
     /// run_fn_body VM hook. None → the body runs on the walker.
     vm_next_owner: Option<VmOwner>,
+    /// Bumped on any function (re)definition; call-site memos revalidate.
+    funcs_generation: u64,
     /// (class, method) → resolved Rc'd declaration; cleared on class changes.
     method_cache: RefCell<HashMap<(String, String), Option<(String, Rc<MethodDecl>)>>>,
     /// `fn:<name>` / `class:<name>` (lowercase) → definition-site context.
@@ -2088,6 +2090,7 @@ impl Eval {
             vm_enabled: std::env::var("PHARGO_ENGINE").map(|v| v == "vm").unwrap_or(false),
             vm_cache: HashMap::new(),
             vm_next_owner: None,
+            funcs_generation: 1,
             method_cache: RefCell::new(HashMap::new()),
             def_ctx: HashMap::new(),
             frames: Vec::new(),
@@ -2470,7 +2473,8 @@ impl Eval {
                         f.name = format!("{ns}\\{}", f.name);
                     }
                     self.record_def_ctx(format!("fn:{}", f.name.to_ascii_lowercase()), &ns, &uses);
-                    self.funcs.insert(f.name.to_ascii_lowercase(), Rc::new(f));
+                    self.funcs_generation += 1;
+                self.funcs.insert(f.name.to_ascii_lowercase(), Rc::new(f));
                 }
                 Stmt::Class(c) => {
                     let mut c = c.clone();
@@ -2727,6 +2731,7 @@ impl Eval {
                 }
                 let (ns, uses) = (self.cur_ns.clone(), Rc::new(self.use_map.clone()));
                 self.record_def_ctx(format!("fn:{}", f.name.to_ascii_lowercase()), &ns, &uses);
+                self.funcs_generation += 1;
                 self.funcs.insert(f.name.to_ascii_lowercase(), Rc::new(f));
             }
             Stmt::ConstDecl(decls) => {
@@ -4522,7 +4527,12 @@ impl Eval {
             }
             crate::lang::vm::CalleeKind::Unsafe
         };
-        let chunk = crate::lang::vm::Compiler::compile(body, top_level, &resolver).map(|mut c| {
+        let params: Option<&[Param]> = match &owner {
+            VmOwner::Fn(f) => Some(&f.params),
+            VmOwner::Method(m) => Some(&m.params),
+            VmOwner::Top => None,
+        };
+        let chunk = crate::lang::vm::Compiler::compile(body, top_level, params, &resolver).map(|mut c| {
             c.debug_name = self.cur_fn.last().cloned().unwrap_or_else(|| "{top}".into());
             Rc::new(c)
         });
@@ -4563,6 +4573,56 @@ impl Eval {
                 }
             }
         }
+        r
+    }
+
+    /// The VM-native call: bind arguments straight into the callee chunk's
+    /// parameter slots — no scope HashMap, no by-ref plumbing (fast_callable
+    /// guarantees plain by-value untyped params), no def-ctx swap unless the
+    /// callee resolves names. Falls back to call_user for the exact
+    /// too-few-arguments error path.
+    fn vm_fast_call(
+        &mut self,
+        f: &Rc<FuncDecl>,
+        cc: &Rc<crate::lang::vm::Chunk>,
+        mut argv: Vec<Value>,
+    ) -> R<Value> {
+        let np = cc.nparams as usize;
+        if argv.len() < np {
+            for i in argv.len()..np {
+                match &cc.param_defaults[i] {
+                    Some(d) => argv.push(d.clone()),
+                    None => return self.call_user(f, argv, None),
+                }
+            }
+        }
+        self.enter_call()?;
+        self.cur_fn.push(f.name.clone());
+        self.frames.push((f.name.clone(), self.cur_line, self.cur_file_str()));
+        let prev_df = if cc.needs_ctx {
+            self.enter_def_ctx(&format!("fn:{}", f.name.to_ascii_lowercase()))
+        } else {
+            None
+        };
+        let n = cc.slot_names.len();
+        let mut slots: Vec<Value> = vec![Value::Null; n];
+        let mut assigned: Vec<bool> = vec![false; n];
+        for (i, v) in argv.into_iter().enumerate() {
+            if i >= np {
+                break; // extra args: only observable via func_get_args, which bails
+            }
+            slots[i] = if let Value::Ref(c) = &v { c.borrow().clone() } else { v };
+            assigned[i] = true;
+        }
+        let r = self.run_chunk_inner(cc, &mut slots, &mut assigned, &None);
+        if let Some((pf, pns, puse)) = prev_df {
+            self.cur_file = pf;
+            self.cur_ns = pns;
+            self.use_map = puse;
+        }
+        self.cur_fn.pop();
+        self.frames.pop();
+        self.call_depth -= 1;
         r
     }
 
@@ -4697,15 +4757,51 @@ impl Eval {
                         pc = *t as usize;
                     }
                 }
-                Op::CallFn { name, argc } => {
+                Op::CallFn { name, argc, site } => {
                     let argc = *argc as usize;
                     let at = stack.len() - argc;
                     let argv: Vec<Value> = stack.split_off(at);
-                    let fname = &chunk.names[*name as usize];
-                    let r = if let Some(f) = self.funcs.get(fname).cloned() {
-                        self.call_user(&f, argv, None)?
-                    } else {
-                        self.builtin(fname, argv)?
+                    // per-site memo, revalidated when any function is redefined
+                    let mut target = {
+                        let sites = chunk.sites.borrow();
+                        let m = &sites[*site as usize];
+                        if m.generation == self.funcs_generation {
+                            Some(m.target.clone())
+                        } else {
+                            None
+                        }
+                    };
+                    if target.is_none() {
+                        let fname = chunk.names[*name as usize].clone();
+                        let t = match self.funcs.get(&fname).cloned() {
+                            Some(f) => {
+                                if self.prelude_fns.contains(&fname) {
+                                    crate::lang::vm::Callee::Slow(f)
+                                } else {
+                                    match self.vm_chunk_for(&f.body, false, VmOwner::Fn(f.clone())) {
+                                        Some(cc) if cc.fast_callable => {
+                                            crate::lang::vm::Callee::Fast(f, cc)
+                                        }
+                                        _ => crate::lang::vm::Callee::Slow(f),
+                                    }
+                                }
+                            }
+                            None => crate::lang::vm::Callee::Builtin,
+                        };
+                        chunk.sites.borrow_mut()[*site as usize] = crate::lang::vm::SiteMemo {
+                            generation: self.funcs_generation,
+                            target: t.clone(),
+                        };
+                        target = Some(t);
+                    }
+                    let r = match target.unwrap() {
+                        crate::lang::vm::Callee::Fast(f, cc) => self.vm_fast_call(&f, &cc, argv)?,
+                        crate::lang::vm::Callee::Slow(f) => self.call_user(&f, argv, None)?,
+                        crate::lang::vm::Callee::Builtin => {
+                            let fname = &chunk.names[*name as usize];
+                            self.builtin(fname, argv)?
+                        }
+                        crate::lang::vm::Callee::Unresolved => unreachable!(),
                     };
                     stack.push(r);
                 }

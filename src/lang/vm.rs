@@ -52,8 +52,9 @@ pub enum Op {
     JmpIfFalse(u32),
     JmpIfTrue(u32),
     /// Call a named function (user or builtin) with argc stack args
-    /// (pushed left-to-right). Name resolved per call via names[i].
-    CallFn { name: u16, argc: u8 },
+    /// (pushed left-to-right). Name resolved via names[i]; `site` indexes
+    /// the chunk's per-call-site memo.
+    CallFn { name: u16, argc: u8, site: u16 },
     /// Echo the top n stack values (in push order).
     Echo(u8),
     /// $slot[key]: pop key, push element (Null + no warning if absent — the
@@ -147,8 +148,37 @@ pub struct Chunk {
     pub slot_names: Vec<String>,
     /// Whether any op touches $this (the interpreter resolves it at entry).
     pub uses_this: bool,
+    /// Function-body chunks: parameters occupy slots 0..nparams in order.
+    /// Defaults here are compile-time constants; anything fancier clears
+    /// fast_callable.
+    pub nparams: u16,
+    pub param_defaults: Vec<Option<super::value::Value>>,
+    /// Eligible for the VM-native fast call: untyped by-value params with
+    /// constant defaults, no variadics/promotion.
+    pub fast_callable: bool,
+    /// Any op resolves names through the namespace/use context (const
+    /// lookups, new, static calls) — fast calls must swap def-ctx.
+    pub needs_ctx: bool,
+    /// Per-call-site memo (validated against Eval::funcs_generation).
+    pub sites: std::cell::RefCell<Vec<SiteMemo>>,
     /// Owning function name, for diagnostics.
     pub debug_name: String,
+}
+
+#[derive(Clone)]
+pub struct SiteMemo {
+    pub generation: u64,
+    pub target: Callee,
+}
+
+#[derive(Clone)]
+pub enum Callee {
+    Unresolved,
+    /// Compiled user function: bind args straight into callee slots.
+    Fast(std::rc::Rc<FuncDecl>, std::rc::Rc<Chunk>),
+    /// User function that must go through the walker's call machinery.
+    Slow(std::rc::Rc<FuncDecl>),
+    Builtin,
 }
 
 /// What the compiler needs to know about a callable name, answered by the
@@ -175,6 +205,8 @@ pub struct Compiler<'a> {
     iter_depth: usize,
     top_level: bool,
     uses_this: bool,
+    needs_ctx: bool,
+    n_sites: u16,
 }
 
 enum PathRoot {
@@ -210,6 +242,7 @@ impl<'a> Compiler<'a> {
     pub fn compile(
         body: &[Stmt],
         top_level: bool,
+        params: Option<&[Param]>,
         resolver: &'a dyn Fn(&str) -> CalleeKind,
     ) -> Option<Chunk> {
         let mut c = Compiler {
@@ -223,15 +256,64 @@ impl<'a> Compiler<'a> {
             iter_depth: 0,
             top_level,
             uses_this: false,
+            needs_ctx: false,
+            n_sites: 0,
         };
+        // parameters claim slots 0..n in declaration order
+        let mut nparams = 0u16;
+        let mut param_defaults: Vec<Option<super::value::Value>> = Vec::new();
+        let mut fast_callable = params.is_some();
+        if let Some(ps) = params {
+            for p in ps {
+                let s = c.slot(&p.name)?;
+                debug_assert_eq!(s as usize, param_defaults.len());
+                nparams += 1;
+                if p.by_ref || p.variadic || p.type_hint.is_some() || p.promote.is_some() {
+                    fast_callable = false;
+                }
+                let d = match &p.default {
+                    None => None,
+                    Some(Expr::Null) => Some(super::value::Value::Null),
+                    Some(Expr::Bool(b)) => Some(super::value::Value::Bool(*b)),
+                    Some(Expr::Int(n)) => Some(super::value::Value::Int(*n)),
+                    Some(Expr::Float(f)) => Some(super::value::Value::Float(*f)),
+                    Some(Expr::Str(s)) => Some(super::value::Value::Str(s.clone())),
+                    Some(Expr::ConstFetch(n)) if n.parts.len() == 1 => {
+                        match n.last().to_ascii_lowercase().as_str() {
+                            "true" => Some(super::value::Value::Bool(true)),
+                            "false" => Some(super::value::Value::Bool(false)),
+                            "null" => Some(super::value::Value::Null),
+                            _ => {
+                                fast_callable = false;
+                                None
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        fast_callable = false;
+                        None
+                    }
+                };
+                param_defaults.push(d);
+            }
+        }
         c.block(body)?;
         c.ops.push(Op::RetNull);
+        let n_sites = c.n_sites as usize;
         Some(Chunk {
             ops: c.ops,
             consts: c.consts,
             names: c.names,
             slot_names: c.slot_names,
             uses_this: c.uses_this,
+            nparams,
+            param_defaults,
+            fast_callable,
+            needs_ctx: c.needs_ctx,
+            sites: std::cell::RefCell::new(vec![
+                SiteMemo { generation: 0, target: Callee::Unresolved };
+                n_sites
+            ]),
             debug_name: String::new(),
         })
     }
@@ -791,6 +873,7 @@ impl<'a> Compiler<'a> {
                     self.expr(&a.value)?;
                 }
                 let ci = self.name(&cname)?;
+                self.needs_ctx = true;
                 self.ops.push(Op::NewObj { class: ci, argc: args.len() as u8 });
             }
             Expr::StaticCall(class, PropName::Id(m), args) => {
@@ -811,6 +894,7 @@ impl<'a> Compiler<'a> {
                 }
                 let ci = self.name(&cname)?;
                 let mi = self.name(m)?;
+                self.needs_ctx = true;
                 self.ops.push(Op::CallStatic { class: ci, method: mi, argc: args.len() as u8 });
             }
             Expr::Var(n) => {
@@ -1135,6 +1219,7 @@ impl<'a> Compiler<'a> {
                 };
                 let ci = self.name(&raw)?;
                 let ni = self.name(cname)?;
+                self.needs_ctx = true;
                 self.ops.push(Op::ClassConstOp { class: ci, name: ni });
             }
             Expr::ConstFetch(n) => {
@@ -1157,7 +1242,8 @@ impl<'a> Compiler<'a> {
                     }
                     _ => {
                         let ni = self.name(bare)?;
-                        self.ops.push(Op::ConstLookup(ni));
+                        self.needs_ctx = true;
+                self.ops.push(Op::ConstLookup(ni));
                     }
                 }
             }
@@ -1184,7 +1270,9 @@ impl<'a> Compiler<'a> {
                     self.expr(&a.value)?;
                 }
                 let ni = self.name(&name)?;
-                self.ops.push(Op::CallFn { name: ni, argc: args.len() as u8 });
+                let site = self.n_sites;
+                self.n_sites = self.n_sites.checked_add(1)?;
+                self.ops.push(Op::CallFn { name: ni, argc: args.len() as u8, site });
             }
             _ => return None,
         }
