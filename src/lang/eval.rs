@@ -4467,6 +4467,14 @@ impl Eval {
 
     // ---- assignment targets --------------------------------------------
     fn assign_to(&mut self, target: &Expr, val: Value) -> R<()> {
+        // plain assignment copies the VALUE — a Ref cell arriving here (from
+        // by-ref arrays, filter machinery, aliased params) must not become an
+        // alias in the target slot (WP_Query->posts read as Ref broke reads)
+        let val = if let Value::Ref(c) = &val {
+            c.borrow().clone()
+        } else {
+            val
+        };
         // Guard against pathological array explosion (e.g. self-referential
         // value-copy where references aren't modeled yet).
         if matches!(val, Value::Array(_)) && value_size(&val, MAX_ARRAY_NODES) > MAX_ARRAY_NODES {
@@ -8910,15 +8918,34 @@ impl Eval {
                     Value::Int(byte_sign(&m, &s))
                 }
             }
-            "strspn" => {
+            "strspn" | "strcspn" => {
+                // offset/length args select the examined window (negative =
+                // from the end) — WP's HTML Tag Processor scans with these
                 let subj = to_bytes(&a(0));
                 let mask = to_bytes(&a(1));
-                Value::Int(subj.iter().take_while(|b| mask.contains(b)).count() as i64)
-            }
-            "strcspn" => {
-                let subj = to_bytes(&a(0));
-                let mask = to_bytes(&a(1));
-                Value::Int(subj.iter().take_while(|b| !mask.contains(b)).count() as i64)
+                let len = subj.len() as i64;
+                let mut start = if args.len() > 2 { to_i64(&a(2)) } else { 0 };
+                if start < 0 {
+                    start = (len + start).max(0);
+                }
+                let start = start.min(len) as usize;
+                let mut span_len = if args.len() > 3 && !matches!(a(3), Value::Null) {
+                    to_i64(&a(3))
+                } else {
+                    len
+                };
+                if span_len < 0 {
+                    span_len = (len - start as i64 + span_len).max(0);
+                }
+                let end = (start + span_len.max(0) as usize).min(subj.len());
+                let window = &subj[start..end];
+                let inv = name == "strcspn";
+                Value::Int(
+                    window
+                        .iter()
+                        .take_while(|b| mask.contains(b) != inv)
+                        .count() as i64,
+                )
             }
             "addslashes" => {
                 let s = to_bytes(&a(0));

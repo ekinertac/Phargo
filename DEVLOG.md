@@ -27,6 +27,32 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-06 — The browser is the seventh analyzer.
+
+**The user's browser said "HTML fine, CSS loading, nothing rendering" —
+headless Chrome screenshots turned that into two engine bugs.** 3835 → 3843.
+
+- **`strspn`/`strcspn` ignored their offset/length arguments.** WP's
+  HTML Tag Processor — the machinery that injects layout classes into
+  every block — scans with `strcspn($html, $mask, $at)`. With the offset
+  dropped, `next_tag()` never found a tag, `wp_render_layout_support_flag`
+  silently returned markup unchanged, and no `is-layout-*` CSS ever
+  matched. One window calculation later, headers lay out flex and root
+  padding applies.
+- **Plain assignment didn't copy through Ref cells.** After the aliasing
+  work, a `Value::Ref` could reach `$this->posts = …` and get STORED as
+  the property value; readers that match `Value::Array` strictly (index
+  reads, array_keys) saw nothing while count/foreach (which deref) saw one
+  post — the front page's query loop rendered an empty card. assign_to
+  now dereferences Ref values on entry: plain `=` copies values, only
+  `=&` aliases. That's the PHP value model, stated in one guard clause.
+
+Also: chasing "posts render empty" through WP_Query with filter probes and
+a debug-patched class-wp-query.php was the first time the WordPress corpus
+debugged the ENGINE's newest feature (references) rather than a missing
+one. The twentytwentythree front page now shows the post card with
+excerpt and date, styled.
+
 ## 2026-07-05 (later that night) — References, for real this time.
 
 **3797 → 3835 (+38) — the biggest single batch since the trim fix — and the
