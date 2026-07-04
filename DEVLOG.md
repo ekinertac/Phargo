@@ -27,6 +27,30 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-07 — Fast calls, and the guards that keep them honest.
+
+**The per-call wall falls.** Call sites in compiled chunks now carry memos
+(validated against a definitions-generation counter): a compiled callee
+gets the VM-native path — arguments bound straight into its parameter
+slots, no scope HashMap, def-ctx swap only if the callee resolves names —
+and methods get a monomorphic inline cache keyed on the receiver class,
+with LSB scope bound directly. Everything the fast path can't prove safe
+(visibility, __call, typed params, variadics, prelude bodies, polymorphic
+misses) falls through to the walker's call machinery mid-flight.
+
+fn-calls 136 → 40 ms, method-calls 239 → 71 ms, recursion 30 → 9 ms;
+micro total 1065 → 464 ms. On several shapes we now beat PHP-with-startup.
+
+The guards fought back twice. Call-weight ops had to charge full steps
+(a VM `new` loop out-allocated the step budget and hit the 6 GiB
+allocator ABORT — killing the whole scoreboard process on a corpus
+memory-bomb test). Then a second bomb found another path, which forced
+the correct fix: tick() now enforces a **soft 5 GiB ceiling** as a
+catchable engine error, so memory exhaustion dies like PHP's
+memory_limit instead of like a segfault. Both engines benefit; the
+default scoreboard holds 3843. VM-mode parity: 3799 — the 44-test gap is
+the tracked debt on the road to defaulting the VM.
+
 ## 2026-07-06 (night) — The VM meets WordPress, and the allocator bites.
 
 **The first real VM bug was a use-after-free in spirit.** The chunk cache

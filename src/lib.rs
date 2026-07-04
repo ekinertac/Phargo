@@ -28,6 +28,13 @@ mod capped_alloc {
     const HEAP_CEILING: usize = 6 * 1024 * 1024 * 1024; // 6 GiB
     static HEAP_USED: AtomicUsize = AtomicUsize::new(0);
 
+    /// Current heap usage — the evaluator's tick() checks this against a
+    /// soft ceiling so runaway allocation dies as a catchable engine error
+    /// instead of an allocator abort.
+    pub fn heap_used() -> usize {
+        HEAP_USED.load(Ordering::Relaxed)
+    }
+
     pub struct Capped;
 
     unsafe impl GlobalAlloc for Capped {

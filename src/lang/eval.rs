@@ -2631,6 +2631,14 @@ impl Eval {
 
     fn tick(&mut self) -> R<()> {
         self.steps += 1;
+        // soft memory ceiling: die as a catchable engine error well before
+        // the 6 GiB allocator cap aborts the whole process (VM loops can
+        // out-allocate the step budget; corpus memory bombs rely on death)
+        if self.steps & 0x3FF == 0 && crate::capped_alloc::heap_used() > 5 * 1024 * 1024 * 1024 {
+            return Err(RunError(
+                "Allowed memory size exhausted (phargo soft ceiling)".into(),
+            ));
+        }
         if self.steps > step_limit() {
             // self-diagnosing: where was execution when the budget died?
             let fname = self.cur_fn.last().cloned().unwrap_or_default();
@@ -4826,6 +4834,7 @@ impl Eval {
                     }
                 }
                 Op::CallFn { name, argc, site } => {
+                    self.steps += 1;
                     let argc = *argc as usize;
                     let at = stack.len() - argc;
                     let argv: Vec<Value> = stack.split_off(at);
@@ -5170,6 +5179,7 @@ impl Eval {
                     stack.push(Value::Bool(b));
                 }
                 Op::NewObj { class, argc } => {
+                    self.steps += 1;
                     let argc = *argc as usize;
                     let at = stack.len() - argc;
                     let argv: Vec<Value> = stack.split_off(at);
@@ -5180,6 +5190,7 @@ impl Eval {
                     stack.push(v);
                 }
                 Op::CallStatic { class, method, argc } => {
+                    self.steps += 1;
                     let argc = *argc as usize;
                     let at = stack.len() - argc;
                     let argv: Vec<Value> = stack.split_off(at);
@@ -5280,6 +5291,7 @@ impl Eval {
                     }
                 }
                 Op::CallMethod { name, argc, site } => {
+                    self.steps += 1;
                     let argc = *argc as usize;
                     let at = stack.len() - argc;
                     let argv: Vec<Value> = stack.split_off(at);
