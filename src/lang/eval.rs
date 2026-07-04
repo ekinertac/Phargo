@@ -2798,7 +2798,7 @@ impl Eval {
                         }
                     }
                 }
-                let arr = self.eval(array)?;
+                let arr = self.eval(array)?.deref();
                 if !matches!(arr, Value::Array(_) | Value::Object(_) | Value::Closure(_)) {
                     let t = self.given_type(&arr);
                     self.warn(&format!("foreach() argument must be of type array|object, {t} given"))?;
@@ -3176,6 +3176,71 @@ impl Eval {
         }
     }
 
+    /// Promote `$base[$idx]` to a shared Ref cell IN PLACE and return it —
+    /// the aliasing backbone of `$x = &$arr[k]`. Creates the element (NULL)
+    /// and the base array itself when absent, as PHP does. Returns None for
+    /// unsupported base shapes (caller falls back to a value copy).
+    fn ref_cell_for_index(
+        &mut self,
+        base: &Expr,
+        idx: &Expr,
+    ) -> R<Option<Rc<RefCell<Value>>>> {
+        let k = Arr::norm_key(&self.eval(idx)?);
+        let place = match base {
+            Expr::Var(n) if !is_superglobal(n) => {
+                // materialize the base array for missing/null vars
+                let needs_init = match self.vars().get(n) {
+                    None | Some(Value::Null) => true,
+                    Some(Value::Ref(c)) => matches!(&*c.borrow(), Value::Null),
+                    _ => false,
+                };
+                if needs_init {
+                    match self.vars().get(n) {
+                        Some(Value::Ref(c)) => {
+                            let c = c.clone();
+                            *c.borrow_mut() = Value::Array(Arr::new());
+                        }
+                        _ => {
+                            self.vars().insert(n.clone(), Value::Array(Arr::new()));
+                        }
+                    }
+                }
+                ArrPlace::Var(n.clone())
+            }
+            Expr::Prop(objexpr, pn, _) => {
+                let o = self.eval(objexpr)?;
+                let pname = self.prop_name_str(pn)?;
+                match o {
+                    Value::Object(rc) => {
+                        {
+                            let mut b = rc.borrow_mut();
+                            let needs_init = matches!(b.get(&pname), None | Some(Value::Null));
+                            if needs_init {
+                                b.set(&pname, Value::Array(Arr::new()));
+                            }
+                        }
+                        ArrPlace::Prop(rc, pname)
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+        Ok(self.with_place_mut(&place, |a| {
+            if a.get(&k).is_none() {
+                a.insert(k.clone(), Value::Null);
+            }
+            match a.get_mut(&k).unwrap() {
+                Value::Ref(c) => c.clone(),
+                other => {
+                    let c = Rc::new(RefCell::new(std::mem::replace(other, Value::Null)));
+                    *other = Value::Ref(c.clone());
+                    c
+                }
+            }
+        }))
+    }
+
     /// `foreach ($arr as [$k =>] &$v)`: promote each visited element to a shared
     /// Ref cell in place and bind $v to that cell, so writes through $v (and
     /// writes to $arr[$k]) alias. After moving on, an element whose cell has no
@@ -3470,12 +3535,64 @@ impl Eval {
                     (Expr::Var(lname), Expr::Var(rname)) => {
                         let cell = self.get_ref_cell(rname);
                         let v = cell.borrow().clone();
+                        self.mark_rebound(lname);
                         self.vars().insert(lname.clone(), Value::Ref(cell));
                         v
                     }
+                    // `$x = &$arr[k]`: promote the ELEMENT to a shared Ref cell
+                    // and REBIND $x to it. _wp_array_set walks nested arrays by
+                    // re-binding a reference ($ref = &$ref[$k]) — the old
+                    // value-copy fallback wrote the subtree through the by-ref
+                    // parameter, replacing the caller's whole array.
+                    (Expr::Var(lname), Expr::Index(base, Some(idx))) => {
+                        let lname = lname.clone();
+                        match self.ref_cell_for_index(base, idx)? {
+                            Some(cell) => {
+                                let v = cell.borrow().clone();
+                                self.mark_rebound(&lname);
+                                self.vars().insert(lname, Value::Ref(cell));
+                                v
+                            }
+                            None => {
+                                let v = self.eval_quiet(rhs)?;
+                                self.vars().insert(lname, v.clone());
+                                v
+                            }
+                        }
+                    }
+                    // `$x = &$obj->prop`: alias the property slot
+                    (Expr::Var(lname), Expr::Prop(objexpr, pn, _)) => {
+                        let lname = lname.clone();
+                        let o = self.eval(objexpr)?;
+                        let pname = self.prop_name_str(pn)?;
+                        if let Value::Object(rc) = o {
+                            let mut b = rc.borrow_mut();
+                            if b.get(&pname).is_none() {
+                                b.set(&pname, Value::Null);
+                            }
+                            let cell = match b.get_mut(&pname).unwrap() {
+                                Value::Ref(c) => c.clone(),
+                                other => {
+                                    let c = Rc::new(RefCell::new(std::mem::replace(
+                                        other,
+                                        Value::Null,
+                                    )));
+                                    *other = Value::Ref(c.clone());
+                                    c
+                                }
+                            };
+                            drop(b);
+                            let v = cell.borrow().clone();
+                            self.mark_rebound(&lname);
+                            self.vars().insert(lname, Value::Ref(cell));
+                            v
+                        } else {
+                            Value::Null
+                        }
+                    }
                     _ => {
-                        // `$x[0] =& $y` fallback (value copy): `=&` creates fresh
-                        // variables silently in PHP, so the read side stays quiet
+                        // remaining shapes (`$x[0] =& $y`, …) fall back to a
+                        // value copy; `=&` reads stay quiet like PHP
                         let v = self.eval_quiet(rhs)?;
                         self.assign_to(lhs, v.clone())?;
                         v
@@ -3872,8 +3989,12 @@ impl Eval {
             }
             Expr::ArrowFn(a) => {
                 // arrow fns auto-capture the entire enclosing scope by value
-                let captures: Vec<(String, Value)> =
-                    self.vars().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                let captures: Vec<(String, Value)> = self
+                    .vars()
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with('\0'))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
                 let bound_this = if a.is_static {
                     None
                 } else {
@@ -5538,6 +5659,9 @@ impl Eval {
         let prev_df = self.enter_def_ctx(&format!("fn:{}", f.name.to_ascii_lowercase()));
         let mut scope = HashMap::new();
         let bind = self.bind_params(&mut scope, &f.params, &args, &f.name);
+        if bind.is_ok() {
+            self.alias_byref_params(&mut scope, &f.params, byref);
+        }
         if let Err(e) = bind {
             if let Some((pf, pns, puse)) = prev_df {
                 self.cur_file = pf;
@@ -5584,6 +5708,52 @@ impl Eval {
     /// final value back into the caller's variable after the call returns. This
     /// cascades correctly through recursion (each frame writes back to its caller).
     /// Capture must run before the callee scope is popped; apply after.
+    /// Bind by-ref parameters whose argument is a plain variable as TRUE
+    /// aliases: the parameter shares the caller variable's Ref cell, so
+    /// element aliasing (`$p = &$p['x']`) and in-place writes behave like
+    /// PHP. Runs after bind_params, before the scope is pushed; aliased
+    /// params get the rebound marker so capture_byref skips their (now
+    /// redundant) write-back. Non-variable lvalue args keep the write-back
+    /// cascade.
+    fn alias_byref_params(
+        &mut self,
+        scope: &mut HashMap<String, Value>,
+        params: &[Param],
+        byref: Option<&[Arg]>,
+    ) {
+        let args = match byref {
+            Some(a) => a,
+            None => return,
+        };
+        for (i, p) in params.iter().enumerate() {
+            if !p.by_ref || p.variadic {
+                continue;
+            }
+            let Some(arg) = args.get(i) else { continue };
+            if arg.spread || arg.name.is_some() {
+                continue;
+            }
+            if let Expr::Var(vn) = &arg.value {
+                if is_superglobal(vn) {
+                    continue;
+                }
+                let cell = self.get_ref_cell(vn);
+                scope.insert(p.name.clone(), Value::Ref(cell));
+                scope.insert(format!("\0rebound\0{}", p.name), Value::Bool(true));
+            }
+        }
+    }
+
+    /// Record that `$name` was re-bound with `=&` in the current scope.
+    /// A re-bound by-ref PARAMETER breaks its link to the caller's variable
+    /// (PHP: `$p = &$p['x']` aliases deeper without replacing the argument),
+    /// so capture_byref must skip its write-back. The marker key starts with
+    /// NUL — unreachable from PHP variable names.
+    fn mark_rebound(&mut self, name: &str) {
+        self.vars()
+            .insert(format!("\0rebound\0{name}"), Value::Bool(true));
+    }
+
     fn capture_byref(&self, params: &[Param], byref: Option<&[Arg]>) -> Vec<(usize, Value)> {
         let mut wb = Vec::new();
         let args = match byref {
@@ -5598,6 +5768,9 @@ impl Eval {
             if p.by_ref && !p.variadic {
                 if let Some(arg) = args.get(i) {
                     if !arg.spread && arg.name.is_none() && is_lvalue_expr(&arg.value) {
+                        if scope.contains_key(&format!("\0rebound\0{}", p.name)) {
+                            continue; // param re-bound with =& — link broken
+                        }
                         if let Some(v) = scope.get(&p.name) {
                             wb.push((i, v.clone()));
                         }
@@ -6237,6 +6410,7 @@ impl Eval {
             self.call_depth -= 1;
             return Err(e);
         }
+        self.alias_byref_params(&mut scope, &m.params, byref);
         // constructor property promotion
         if m.name.eq_ignore_ascii_case("__construct") {
             if let Value::Object(rc) = &recv {
@@ -6433,6 +6607,7 @@ impl Eval {
             self.call_depth -= 1;
             return Err(e);
         }
+        self.alias_byref_params(&mut scope, &m.params, byref);
         // LSB scope: forwarding calls keep the caller's; explicit C::m() rebinds.
         // (Canonicalize through find_class so case matches the declaration.)
         let called = if forwarding {
@@ -7200,6 +7375,37 @@ impl Eval {
                 let m = 10f64.powi(p as i32);
                 Value::Float((to_f64(&a(0)) * m).round() / m)
             }
+            "log" => {
+                let x = to_f64(&a(0));
+                if args.len() > 1 {
+                    Value::Float(x.log(to_f64(&a(1))))
+                } else {
+                    Value::Float(x.ln())
+                }
+            }
+            "log10" => Value::Float(to_f64(&a(0)).log10()),
+            "log2" => Value::Float(to_f64(&a(0)).log2()),
+            "log1p" => Value::Float(to_f64(&a(0)).ln_1p()),
+            "exp" => Value::Float(to_f64(&a(0)).exp()),
+            "expm1" => Value::Float(to_f64(&a(0)).exp_m1()),
+            "sin" => Value::Float(to_f64(&a(0)).sin()),
+            "cos" => Value::Float(to_f64(&a(0)).cos()),
+            "tan" => Value::Float(to_f64(&a(0)).tan()),
+            "asin" => Value::Float(to_f64(&a(0)).asin()),
+            "acos" => Value::Float(to_f64(&a(0)).acos()),
+            "atan" => Value::Float(to_f64(&a(0)).atan()),
+            "atan2" => Value::Float(to_f64(&a(0)).atan2(to_f64(&a(1)))),
+            "sinh" => Value::Float(to_f64(&a(0)).sinh()),
+            "cosh" => Value::Float(to_f64(&a(0)).cosh()),
+            "tanh" => Value::Float(to_f64(&a(0)).tanh()),
+            "asinh" => Value::Float(to_f64(&a(0)).asinh()),
+            "acosh" => Value::Float(to_f64(&a(0)).acosh()),
+            "atanh" => Value::Float(to_f64(&a(0)).atanh()),
+            "pi" => Value::Float(std::f64::consts::PI),
+            "fmod" => Value::Float(to_f64(&a(0)) % to_f64(&a(1))),
+            "hypot" => Value::Float(to_f64(&a(0)).hypot(to_f64(&a(1)))),
+            "deg2rad" => Value::Float(to_f64(&a(0)).to_radians()),
+            "rad2deg" => Value::Float(to_f64(&a(0)).to_degrees()),
             "sqrt" => Value::Float(to_f64(&a(0)).sqrt()),
             // ---- bcmath (from-scratch decimal bignums in src/bcmath.rs) ----
             "bcadd" | "bcsub" | "bcmul" | "bcdiv" | "bcmod" | "bccomp" => {
@@ -9156,13 +9362,20 @@ impl Eval {
             }
             "array_filter" => {
                 let cb = a(1);
+                // mode: 0 = value, ARRAY_FILTER_USE_KEY = 2, USE_BOTH = 1
+                let mode = to_i64(&a(2));
                 let mut out = Arr::new();
                 if let Value::Array(arr) = a(0) {
                     for (k, v) in arr.entries {
                         let keep = if matches!(cb, Value::Null) {
                             to_bool(&v)
                         } else {
-                            to_bool(&self.call_value(cb.clone(), vec![v.clone()])?)
+                            let cb_args = match mode {
+                                2 => vec![akey_to_value(&k)],
+                                1 => vec![v.clone(), akey_to_value(&k)],
+                                _ => vec![v.clone()],
+                            };
+                            to_bool(&self.call_value(cb.clone(), cb_args)?)
                         };
                         if keep {
                             out.insert(k, v);
@@ -11099,10 +11312,24 @@ impl Eval {
                 break;
             }
             let conv = fmt[i];
-            let spec = String::from_utf8_lossy(&fmt[spec_start..i]).into_owned();
+            let mut spec = String::from_utf8_lossy(&fmt[spec_start..i]).into_owned();
             i += 1;
-            let arg = args.get(ai).cloned().unwrap_or(Value::Null);
-            ai += 1;
+            // positional `%N$s`: selects args[N] WITHOUT moving the
+            // sequential cursor (PHP reuses positions: '<%1$s>…</%1$s>')
+            let mut positional: Option<usize> = None;
+            let digits: String = spec.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() && spec[digits.len()..].starts_with('$') {
+                positional = digits.parse::<usize>().ok();
+                spec = spec[digits.len() + 1..].to_string();
+            }
+            let arg = match positional {
+                Some(n) => args.get(n).cloned().unwrap_or(Value::Null),
+                None => {
+                    let a = args.get(ai).cloned().unwrap_or(Value::Null);
+                    ai += 1;
+                    a
+                }
+            };
             let piece = format_spec(conv, &spec, &arg);
             out.extend_from_slice(&piece);
         }
@@ -11116,103 +11343,100 @@ impl Eval {
 /// builtins with pure-PHP fallbacks that assume a full runtime (WP's
 /// _mb_strlen calls get_option before the DB exists).
 static KNOWN_BUILTINS: &[&str] = &[
-        "__dom_parse", "__pdo_close", "__pdo_lastid", "__pdo_open", "__pdo_query",
-        "__phargo_bcscale_of", "__phargo_createfromformat", "__phargo_cur_file",
-        "__phargo_cur_line", "__phargo_date_tz", "__phargo_mktime_tz", "__phargo_modify",
-        "__phargo_strtotime_tz", "__phargo_trace", "__phargo_tz_offset",
-        "__phargo_tz_transitions", "__phargo_tz_valid", "abs", "addcslashes", "addslashes", "array_chunk",
-        "array_column", "array_combine", "array_count_values", "array_diff", "array_diff_key",
-        "array_fill",
-        "array_fill_keys", "array_filter", "array_flip", "array_intersect", "array_intersect_key",
-        "array_is_list",
-        "array_key_exists", "array_key_first", "array_key_last", "array_keys", "array_map",
-        "array_merge", "array_merge_recursive", "array_multisort", "array_pad", "array_pop",
-        "array_product", "array_push", "array_reduce", "array_replace", "array_replace_recursive", "array_reverse", "array_search",
-        "array_shift", "array_slice", "array_splice", "array_sum", "array_unique",
-        "array_unshift", "array_values", "array_walk", "array_walk_recursive", "arsort",
-        "asort", "assert", "base64_decode", "base64_encode", "basename", "bcadd", "bcceil",
-        "bccomp", "bcdiv", "bcdivmod", "bcfloor", "bcmod", "bcmul", "bcpow", "bcpowmod",
-        "bcround", "bcscale", "bcsqrt", "bcsub", "bin2hex", "bindec", "boolval",
-        "call_user_func", "call_user_func_array", "ceil", "chdir", "checkdate", "chop", "chr",
-        "chunk_split", "class_alias", "class_exists", "class_implements", "class_parents",
-        "class_uses", "clearstatcache", "closedir", "compact", "constant", "copy", "count",
-        "crc32", "ctype_alnum", "ctype_alpha", "ctype_digit", "ctype_space", "current", "date",
-        "date_default_timezone_get", "date_default_timezone_set", "debug_backtrace",
-        "debug_print_backtrace", "decbin", "dechex", "decoct", "define", "defined", "dirname",
-        "doubleval", "each", "end", "enum_exists", "error_clear_last", "error_get_last",
-        "error_log", "error_reporting", "escapeshellarg", "escapeshellcmd", "exec", "explode",
-        "extension_loaded", "extract", "fclose", "fdiv", "feof", "fflush", "fgetc", "fgetcsv",
-        "fgets", "file", "file_exists", "file_get_contents", "file_put_contents", "filesize",
-        "filter_var", "floatval", "flock", "floor", "flush", "fopen", "fpassthru", "fputcsv",
-        "fputs", "fread", "fscanf", "fseek", "fsockopen", "ftell", "func_get_arg",
-        "func_get_args", "func_num_args", "function_exists", "fwrite", "gc_collect_cycles",
-        "gc_disable", "gc_enable", "gc_enabled", "get_called_class", "get_class",
-        "get_class_methods", "get_class_vars", "get_declared_classes",
-        "get_declared_interfaces", "get_declared_traits", "get_loaded_extensions", "get_object_vars",
-        "get_parent_class", "get_resource_id", "get_resource_type", "getcwd", "getdate",
-        "getenv", "getimagesize", "getmypid", "getrandmax", "gettype", "glob", "gmdate", "gmmktime",
-        "gmstrftime", "hash", "hash_algos", "hash_equals", "hash_hmac", "hash_hmac_algos", "header", "headers_sent", "hex2bin", "hexdec", "highlight_file",
-        "highlight_string", "hrtime", "html_entity_decode", "htmlentities", "htmlspecialchars",
-        "htmlspecialchars_decode", "http_build_query", "http_response_code", "idate",
-        "ignore_user_abort", "implode", "in_array", "ini_get", "ini_set", "intdiv",
-        "interface_exists", "intval", "is_a", "is_array", "is_bool", "is_callable", "is_dir",
-        "is_double", "is_file", "is_float", "is_int", "is_integer", "is_iterable", "is_long",
-        "is_null", "is_numeric", "is_object", "is_readable", "is_resource", "is_scalar",
-        "is_string", "is_subclass_of", "is_writable", "is_writeable", "iterator_to_array",
-        "join", "json_decode", "json_encode", "json_last_error", "json_last_error_msg", "key",
-        "key_exists", "krsort", "ksort", "lcfirst", "levenshtein", "ltrim", "max",
-        "mb_check_encoding", "mb_chr", "mb_convert_case", "mb_convert_encoding",
-        "mb_detect_encoding", "mb_http_output", "mb_internal_encoding", "mb_ord", "mb_scrub",
-        "mb_str_split", "mb_strlen", "mb_strpos", "mb_strtolower", "mb_strtoupper",
-        "mb_substitute_character", "mb_substr", "md5", "memory_get_peak_usage",
-        "memory_get_usage", "method_exists", "microtime", "min", "mkdir", "mktime",
-        "mt_getrandmax", "mt_rand", "mt_srand", "natcasesort", "natsort", "next", "nl2br",
-        "number_format", "ob_clean", "ob_end_clean", "ob_end_flush", "ob_flush",
-        "ob_get_clean", "ob_get_contents", "ob_get_length", "ob_get_level", "ob_start",
-        "octdec", "opendir", "openssl_sign", "ord", "pack", "parse_str", "parse_url", "pathinfo",
-        "php_sapi_name", "php_uname", "phpversion", "pos", "pow", "preg_grep", "preg_match",
-        "preg_match_all", "preg_quote", "preg_replace", "preg_replace_callback", "preg_split",
-        "prev", "print_r", "printf", "property_exists", "putenv", "quotemeta", "rand",
-        "random_int", "range", "rawurldecode", "rawurlencode", "readdir", "readfile",
-        "realpath", "register_shutdown_function", "rename", "reset", "restore_error_handler",
-        "restore_exception_handler", "rewind", "rewinddir", "rmdir", "round", "rsort", "rtrim",
-        "scandir", "serialize", "session_abort", "session_cache_expire",
-        "session_cache_limiter", "session_commit", "session_create_id", "session_destroy",
-        "session_get_cookie_params", "session_id", "session_module_name", "session_name",
-        "session_regenerate_id", "session_register_shutdown", "session_reset",
-        "session_save_path", "session_set_cookie_params", "session_set_save_handler",
-        "session_start", "session_status", "session_unset", "session_write_close",
-        "set_error_handler", "set_exception_handler", "set_time_limit", "setcookie", "setlocale", "setrawcookie", "settype",
-        "sha1", "shuffle", "similar_text", "sizeof", "sleep", "sort", "spl_autoload_functions",
-        "spl_autoload_register", "spl_autoload_unregister", "spl_object_hash", "spl_object_id",
-        "sprintf", "sqrt", "srand", "sscanf", "str_contains", "str_ends_with", "str_getcsv",
-        "str_ireplace", "str_pad", "str_repeat", "str_replace", "str_rot13", "str_split",
-        "str_starts_with", "str_word_count", "strcasecmp", "strchr", "strcmp", "strcspn",
-        "stream_context_create", "stream_context_get_default", "stream_context_set_default",
-        "stream_context_set_option", "stream_context_set_params", "stream_filter_append",
-        "stream_filter_prepend", "stream_filter_remove", "stream_get_contents",
-        "stream_get_line", "stream_get_meta_data", "stream_set_blocking",
-        "stream_set_read_buffer", "stream_set_timeout", "stream_set_write_buffer",
-        "stream_socket_client", "stream_wrapper_register", "stream_wrapper_restore",
-        "stream_wrapper_unregister", "strftime", "strip_tags", "stripcslashes", "stripos",
-        "stripslashes",
-        "stristr", "strlen", "strncasecmp", "strncmp", "strpbrk", "strpos", "strrchr",
-        "strrev", "strrpos", "strspn", "strstr", "strtok", "strtolower", "strtotime", "strtoupper", "strtr",
-        "strval", "substr", "substr_compare", "substr_count", "substr_replace",
-        "sys_get_temp_dir", "tempnam",
-        "time", "timezone_identifiers_list", "touch", "trait_exists", "trigger_error", "trim",
-        "uasort", "ucfirst", "ucwords", "uksort", "umask", "uniqid", "unlink", "unpack", "unserialize",
-        "urldecode", "urlencode", "usleep", "usort", "var_dump", "var_export",
-        "version_compare", "vprintf", "vsprintf", "wordwrap", "xml_error_string",
-        "xml_get_current_byte_index", "xml_get_current_column_number",
-        "xml_get_current_line_number", "xml_get_error_code", "xml_parse",
-        "xml_parse_into_struct", "xml_parser_create", "xml_parser_create_ns",
-        "xml_parser_free", "xml_parser_get_option", "xml_parser_set_option",
-        "xml_set_character_data_handler", "xml_set_default_handler", "xml_set_element_handler",
-        "xml_set_end_namespace_decl_handler", "xml_set_external_entity_ref_handler",
-        "xml_set_notation_decl_handler", "xml_set_object",
-        "xml_set_processing_instruction_handler", "xml_set_start_namespace_decl_handler",
-        "xml_set_unparsed_entity_decl_handler",
+    "__dom_parse", "__pdo_close", "__pdo_lastid", "__pdo_open", "__pdo_query",
+    "__phargo_bcscale_of", "__phargo_createfromformat", "__phargo_cur_file",
+    "__phargo_cur_line", "__phargo_date_tz", "__phargo_mktime_tz", "__phargo_modify",
+    "__phargo_strtotime_tz", "__phargo_trace", "__phargo_tz_offset", "__phargo_tz_transitions",
+    "__phargo_tz_valid", "abs", "acos", "acosh", "addcslashes", "addslashes", "array_chunk",
+    "array_column", "array_combine", "array_count_values", "array_diff", "array_diff_key",
+    "array_fill", "array_fill_keys", "array_filter", "array_flip", "array_intersect",
+    "array_intersect_key", "array_is_list", "array_key_exists", "array_key_first",
+    "array_key_last", "array_keys", "array_map", "array_merge", "array_merge_recursive",
+    "array_multisort", "array_pad", "array_pop", "array_product", "array_push", "array_reduce",
+    "array_replace", "array_replace_recursive", "array_reverse", "array_search", "array_shift",
+    "array_slice", "array_splice", "array_sum", "array_unique", "array_unshift",
+    "array_values", "array_walk", "array_walk_recursive", "arsort", "asin", "asinh", "asort",
+    "assert", "atan", "atan2", "atanh", "base64_decode", "base64_encode", "basename", "bcadd",
+    "bcceil", "bccomp", "bcdiv", "bcdivmod", "bcfloor", "bcmod", "bcmul", "bcpow", "bcpowmod",
+    "bcround", "bcscale", "bcsqrt", "bcsub", "bin2hex", "bindec", "boolval", "call_user_func",
+    "call_user_func_array", "ceil", "chdir", "checkdate", "chop", "chr", "chunk_split",
+    "class_alias", "class_exists", "class_implements", "class_parents", "class_uses",
+    "clearstatcache", "closedir", "compact", "constant", "copy", "cos", "cosh", "count",
+    "crc32", "ctype_alnum", "ctype_alpha", "ctype_digit", "ctype_space", "current", "date",
+    "date_default_timezone_get", "date_default_timezone_set", "debug_backtrace",
+    "debug_print_backtrace", "decbin", "dechex", "decoct", "define", "defined", "deg2rad",
+    "dirname", "doubleval", "each", "end", "enum_exists", "error_clear_last", "error_get_last",
+    "error_log", "error_reporting", "escapeshellarg", "escapeshellcmd", "exec", "exp",
+    "explode", "expm1", "extension_loaded", "extract", "fclose", "fdiv", "feof", "fflush",
+    "fgetc", "fgetcsv", "fgets", "file", "file_exists", "file_get_contents",
+    "file_put_contents", "filesize", "filter_var", "floatval", "flock", "floor", "flush",
+    "fmod", "fopen", "fpassthru", "fputcsv", "fputs", "fread", "fscanf", "fseek", "fsockopen",
+    "ftell", "func_get_arg", "func_get_args", "func_num_args", "function_exists", "fwrite",
+    "gc_collect_cycles", "gc_disable", "gc_enable", "gc_enabled", "get_called_class",
+    "get_class", "get_class_methods", "get_class_vars", "get_declared_classes",
+    "get_declared_interfaces", "get_declared_traits", "get_loaded_extensions",
+    "get_object_vars", "get_parent_class", "get_resource_id", "get_resource_type", "getcwd",
+    "getdate", "getenv", "getimagesize", "getmypid", "getrandmax", "gettype", "glob", "gmdate",
+    "gmmktime", "gmstrftime", "hash", "hash_algos", "hash_equals", "hash_hmac",
+    "hash_hmac_algos", "header", "headers_sent", "hex2bin", "hexdec", "highlight_file",
+    "highlight_string", "hrtime", "html_entity_decode", "htmlentities", "htmlspecialchars",
+    "htmlspecialchars_decode", "http_build_query", "http_response_code", "hypot", "idate",
+    "ignore_user_abort", "implode", "in_array", "ini_get", "ini_set", "intdiv",
+    "interface_exists", "intval", "is_a", "is_array", "is_bool", "is_callable", "is_dir",
+    "is_double", "is_file", "is_float", "is_int", "is_integer", "is_iterable", "is_long",
+    "is_null", "is_numeric", "is_object", "is_readable", "is_resource", "is_scalar",
+    "is_string", "is_subclass_of", "is_writable", "is_writeable", "iterator_to_array", "join",
+    "json_decode", "json_encode", "json_last_error", "json_last_error_msg", "key",
+    "key_exists", "krsort", "ksort", "lcfirst", "levenshtein", "log", "log10", "log1p", "log2",
+    "ltrim", "max", "mb_check_encoding", "mb_chr", "mb_convert_case", "mb_convert_encoding",
+    "mb_detect_encoding", "mb_http_output", "mb_internal_encoding", "mb_ord", "mb_scrub",
+    "mb_str_split", "mb_strlen", "mb_strpos", "mb_strtolower", "mb_strtoupper",
+    "mb_substitute_character", "mb_substr", "md5", "memory_get_peak_usage", "memory_get_usage",
+    "method_exists", "microtime", "min", "mkdir", "mktime", "mt_getrandmax", "mt_rand",
+    "mt_srand", "natcasesort", "natsort", "next", "nl2br", "number_format", "ob_clean",
+    "ob_end_clean", "ob_end_flush", "ob_flush", "ob_get_clean", "ob_get_contents",
+    "ob_get_length", "ob_get_level", "ob_start", "octdec", "opendir", "openssl_sign", "ord",
+    "pack", "parse_str", "parse_url", "pathinfo", "php_sapi_name", "php_uname", "phpversion",
+    "pi", "pos", "pow", "preg_grep", "preg_match", "preg_match_all", "preg_quote",
+    "preg_replace", "preg_replace_callback", "preg_split", "prev", "print_r", "printf",
+    "property_exists", "putenv", "quotemeta", "rad2deg", "rand", "random_int", "range",
+    "rawurldecode", "rawurlencode", "readdir", "readfile", "realpath",
+    "register_shutdown_function", "rename", "reset", "restore_error_handler",
+    "restore_exception_handler", "rewind", "rewinddir", "rmdir", "round", "rsort", "rtrim",
+    "scandir", "serialize", "session_abort", "session_cache_expire", "session_cache_limiter",
+    "session_commit", "session_create_id", "session_destroy", "session_get_cookie_params",
+    "session_id", "session_module_name", "session_name", "session_regenerate_id",
+    "session_register_shutdown", "session_reset", "session_save_path",
+    "session_set_cookie_params", "session_set_save_handler", "session_start", "session_status",
+    "session_unset", "session_write_close", "set_error_handler", "set_exception_handler",
+    "set_time_limit", "setcookie", "setlocale", "setrawcookie", "settype", "sha1", "shuffle",
+    "similar_text", "sin", "sinh", "sizeof", "sleep", "sort", "spl_autoload_functions",
+    "spl_autoload_register", "spl_autoload_unregister", "spl_object_hash", "spl_object_id",
+    "sprintf", "sqrt", "srand", "sscanf", "str_contains", "str_ends_with", "str_getcsv",
+    "str_ireplace", "str_pad", "str_repeat", "str_replace", "str_rot13", "str_split",
+    "str_starts_with", "str_word_count", "strcasecmp", "strchr", "strcmp", "strcspn",
+    "stream_context_create", "stream_context_get_default", "stream_context_set_default",
+    "stream_context_set_option", "stream_context_set_params", "stream_filter_append",
+    "stream_filter_prepend", "stream_filter_remove", "stream_get_contents", "stream_get_line",
+    "stream_get_meta_data", "stream_set_blocking", "stream_set_read_buffer",
+    "stream_set_timeout", "stream_set_write_buffer", "stream_socket_client",
+    "stream_wrapper_register", "stream_wrapper_restore", "stream_wrapper_unregister",
+    "strftime", "strip_tags", "stripcslashes", "stripos", "stripslashes", "stristr", "strlen",
+    "strncasecmp", "strncmp", "strpbrk", "strpos", "strrchr", "strrev", "strrpos", "strspn",
+    "strstr", "strtok", "strtolower", "strtotime", "strtoupper", "strtr", "strval", "substr",
+    "substr_compare", "substr_count", "substr_replace", "sys_get_temp_dir", "tan", "tanh",
+    "tempnam", "time", "timezone_identifiers_list", "touch", "trait_exists", "trigger_error",
+    "trim", "uasort", "ucfirst", "ucwords", "uksort", "umask", "uniqid", "unlink", "unpack",
+    "unserialize", "urldecode", "urlencode", "usleep", "usort", "var_dump", "var_export",
+    "version_compare", "vprintf", "vsprintf", "wordwrap", "xml_error_string",
+    "xml_get_current_byte_index", "xml_get_current_column_number",
+    "xml_get_current_line_number", "xml_get_error_code", "xml_parse", "xml_parse_into_struct",
+    "xml_parser_create", "xml_parser_create_ns", "xml_parser_free", "xml_parser_get_option",
+    "xml_parser_set_option", "xml_set_character_data_handler", "xml_set_default_handler",
+    "xml_set_element_handler", "xml_set_end_namespace_decl_handler",
+    "xml_set_external_entity_ref_handler", "xml_set_notation_decl_handler", "xml_set_object",
+    "xml_set_processing_instruction_handler", "xml_set_start_namespace_decl_handler",
+    "xml_set_unparsed_entity_decl_handler",
 ];
 
 fn is_known_builtin(n: &str) -> bool {
@@ -12482,6 +12706,9 @@ fn php_const(n: &str) -> Option<Value> {
         "DATE_COOKIE" => Str(b"l, d-M-Y H:i:s T".to_vec()),
         "DATE_RSS" => Str(b"D, d M Y H:i:s O".to_vec()),
         "DATE_W3C" => Str(b"Y-m-d\\TH:i:sP".to_vec()),
+        // array_filter() callback modes
+        "ARRAY_FILTER_USE_BOTH" => Int(1),
+        "ARRAY_FILTER_USE_KEY" => Int(2),
         // htmlspecialchars() document-type flags
         "ENT_HTML401" => Int(0),
         "ENT_XML1" => Int(16),

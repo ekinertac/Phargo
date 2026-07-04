@@ -27,6 +27,33 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-05 (later that night) — References, for real this time.
+
+**3797 → 3835 (+38) — the biggest single batch since the trim fix — and the
+browsable site got its theme.** The user pointed at unstyled pages and HTML
+syntax errors; both trails led to foundational bugs:
+
+- **`sprintf('%1$s')` consumed the argument cursor**, so the SECOND `%1$s`
+  in WP's block-wrapper template printed nothing: every heading closed with
+  a literal `</ >`. Positional specifiers now select without consuming,
+  matching PHP's cursor rules exactly.
+- **`$ref = &$ref[$key]` didn't alias.** WP's `_wp_array_set` walks nested
+  arrays by re-binding a reference; our value-copy fallback wrote each
+  subtree THROUGH the by-ref parameter, replacing the whole theme.json tree
+  with its own leaf. That's why `WP_Theme_JSON` produced empty global
+  styles and the front-end had no CSS variables. The engine now has real
+  element aliasing: `=&` on `$arr[k]` / `$obj->prop` promotes the slot to a
+  shared Ref cell in place, and **by-ref parameters bind as true aliases**
+  of the caller's variable (re-binding inside the callee breaks the link,
+  like PHP; the old write-back cascade remains for non-variable lvalues).
+- `array_filter` ignored ARRAY_FILTER_USE_KEY/USE_BOTH (theme.json schema
+  filtering), and the whole `log`/`exp`/trig math family was missing
+  (theme.json's color pipeline calls `log()`).
+
+With twentytwentythree active: global-styles inline CSS, DM Sans fonts,
+zero warnings on front page and single post. The +38 says php-src's test
+suite leans on reference semantics as hard as WordPress does.
+
 ## 2026-07-05 (night) — Howdy, admin.
 
 **The wp-admin Dashboard renders: 70 KB, `<title>Dashboard ‹ Phargo Test
