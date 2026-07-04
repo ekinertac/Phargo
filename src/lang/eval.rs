@@ -4543,7 +4543,15 @@ impl Eval {
                 assigned[i] = true;
             }
         }
-        let r = self.run_chunk_inner(chunk, &mut slots, &mut assigned);
+        let this_rc: Option<Rc<RefCell<Obj>>> = if chunk.uses_this {
+            match self.vars().get("this") {
+                Some(Value::Object(rc)) => Some(rc.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let r = self.run_chunk_inner(chunk, &mut slots, &mut assigned, &this_rc);
         if sync_back {
             for (i, name) in chunk.slot_names.iter().enumerate() {
                 if assigned[i] {
@@ -4560,6 +4568,7 @@ impl Eval {
         chunk: &Rc<crate::lang::vm::Chunk>,
         slots: &mut [Value],
         assigned: &mut [bool],
+        this_rc: &Option<Rc<RefCell<Obj>>>,
     ) -> R<Value> {
         use crate::lang::vm::Op;
         let ops = &chunk.ops;
@@ -4845,6 +4854,86 @@ impl Eval {
                         slots[i] = Value::Str(s);
                     }
                     assigned[i] = true;
+                }
+                Op::LoadThis => {
+                    stack.push(match this_rc {
+                        Some(rc) => Value::Object(rc.clone()),
+                        None => Value::Null,
+                    });
+                }
+                Op::LoadThisProp(i) => {
+                    let name = &chunk.names[*i as usize];
+                    let v = this_rc
+                        .as_ref()
+                        .and_then(|rc| rc.borrow().get(name).map(|v| v.deref()))
+                        .unwrap_or(Value::Null);
+                    stack.push(v);
+                }
+                Op::StoreThisProp(i) => {
+                    let val = pop!();
+                    if let Some(rc) = this_rc {
+                        let name = chunk.names[*i as usize].clone();
+                        let class = rc.borrow().class.clone();
+                        let val = if self.class_has_typed_props(&class) {
+                            self.check_prop_write(&class, &name, val)?
+                        } else {
+                            val
+                        };
+                        rc.borrow_mut().set(&name, val);
+                    }
+                }
+                Op::LoadIndexThisProp(i) => {
+                    let kv = pop!();
+                    let k = Arr::norm_key(&kv);
+                    let name = &chunk.names[*i as usize];
+                    let v = this_rc
+                        .as_ref()
+                        .and_then(|rc| {
+                            let b = rc.borrow();
+                            match b.get(name) {
+                                Some(Value::Array(a)) => a.get(&k).map(|v| v.deref()),
+                                _ => None,
+                            }
+                        })
+                        .unwrap_or(Value::Null);
+                    stack.push(v);
+                }
+                Op::StoreIndexThisProp(i) => {
+                    let v = pop!();
+                    let kv = pop!();
+                    let k = Arr::norm_key(&kv);
+                    if let Some(rc) = this_rc {
+                        let name = &chunk.names[*i as usize];
+                        let mut b = rc.borrow_mut();
+                        if !matches!(b.get(name), Some(Value::Array(_))) {
+                            b.set(name, Value::Array(Arr::new()));
+                        }
+                        if let Some(Value::Array(a)) = b.get_mut(name) {
+                            a.insert(k, v);
+                        }
+                    }
+                }
+                Op::AppendThisProp(i) => {
+                    let v = pop!();
+                    if let Some(rc) = this_rc {
+                        let name = &chunk.names[*i as usize];
+                        let mut b = rc.borrow_mut();
+                        if !matches!(b.get(name), Some(Value::Array(_))) {
+                            b.set(name, Value::Array(Arr::new()));
+                        }
+                        if let Some(Value::Array(a)) = b.get_mut(name) {
+                            a.push(v);
+                        }
+                    }
+                }
+                Op::CallMethod { name, argc } => {
+                    let argc = *argc as usize;
+                    let at = stack.len() - argc;
+                    let argv: Vec<Value> = stack.split_off(at);
+                    let recv = pop!();
+                    let mname = chunk.names[*name as usize].clone();
+                    let r = self.call_method(recv, &mname, argv)?;
+                    stack.push(r);
                 }
                 Op::ConstLookup(i) => {
                     let name = &chunk.names[*i as usize];

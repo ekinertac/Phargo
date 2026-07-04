@@ -91,6 +91,23 @@ pub enum Op {
     /// $slot .= (pop): append bytes in place — the walker's O(n) `.=` fast
     /// path, kept (a Load+Concat+Store round trip clones the whole string).
     ConcatAssign(u16),
+    /// Push $this (the receiver object; Null in static contexts).
+    LoadThis,
+    /// $this->prop read/write (names[i]); missing props read Null silently,
+    /// writes run the same typed-property checks as the walker.
+    LoadThisProp(u16),
+    StoreThisProp(u16),
+    /// $this->prop[key] element ops, mutating the property array IN PLACE
+    /// (the 48x WordPress lesson: never clone a container on indexed write).
+    LoadIndexThisProp(u16),
+    StoreIndexThisProp(u16),
+    AppendThisProp(u16),
+    /// Method call: stack holds receiver then argc args. Dispatches through
+    /// Eval::call_method (same resolution/visibility path as the walker).
+    /// Compile-time restriction keeps by-ref parameter semantics safe: no
+    /// argument may be an lvalue (methods can't be resolved statically, so a
+    /// by-ref param writing back into a caller variable can't be honored).
+    CallMethod { name: u16, argc: u8 },
 }
 
 pub struct Chunk {
@@ -98,6 +115,8 @@ pub struct Chunk {
     pub consts: Vec<super::value::Value>,
     pub names: Vec<String>,
     pub slot_names: Vec<String>,
+    /// Whether any op touches $this (the interpreter resolves it at entry).
+    pub uses_this: bool,
     /// Owning function name, for diagnostics.
     pub debug_name: String,
 }
@@ -125,6 +144,7 @@ pub struct Compiler<'a> {
     loops: Vec<LoopCtx>,
     iter_depth: usize,
     top_level: bool,
+    uses_this: bool,
 }
 
 struct LoopCtx {
@@ -166,6 +186,7 @@ impl<'a> Compiler<'a> {
             loops: Vec::new(),
             iter_depth: 0,
             top_level,
+            uses_this: false,
         };
         c.block(body)?;
         c.ops.push(Op::RetNull);
@@ -174,6 +195,7 @@ impl<'a> Compiler<'a> {
             consts: c.consts,
             names: c.names,
             slot_names: c.slot_names,
+            uses_this: c.uses_this,
             debug_name: String::new(),
         })
     }
@@ -213,6 +235,34 @@ impl<'a> Compiler<'a> {
 
     fn here(&self) -> u32 {
         self.ops.len() as u32
+    }
+
+    fn is_this(e: &Expr) -> bool {
+        matches!(e, Expr::Var(n) if n == "this")
+    }
+
+    /// `$this->prop` with a static name, inside a method chunk.
+    fn this_prop(&mut self, e: &Expr) -> Option<u16> {
+        if let Expr::Prop(base, PropName::Id(p), false) = e {
+            if Self::is_this(base) && !self.top_level {
+                self.uses_this = true;
+                return self.name(p);
+            }
+        }
+        None
+    }
+
+    /// An expression that could act as a by-ref write-back target. Method
+    /// calls refuse these as arguments (see Op::CallMethod).
+    fn is_lvalue(e: &Expr) -> bool {
+        matches!(
+            e,
+            Expr::Var(_)
+                | Expr::VarVar(_)
+                | Expr::Index(..)
+                | Expr::Prop(..)
+                | Expr::StaticProp(..)
+        )
     }
 
     fn block(&mut self, stmts: &[Stmt]) -> Option<()> {
@@ -475,6 +525,20 @@ impl<'a> Compiler<'a> {
                     Some(())
                 }
                 Expr::Index(base, idx) => {
+                    if let Some(p) = self.this_prop(base) {
+                        match idx {
+                            Some(i) => {
+                                self.expr(i)?;
+                                self.expr(rhs)?;
+                                self.ops.push(Op::StoreIndexThisProp(p));
+                            }
+                            None => {
+                                self.expr(rhs)?;
+                                self.ops.push(Op::AppendThisProp(p));
+                            }
+                        }
+                        return Some(());
+                    }
                     let s = match &**base {
                         Expr::Var(n) => self.slot(n)?,
                         _ => return None,
@@ -492,8 +556,22 @@ impl<'a> Compiler<'a> {
                     }
                     Some(())
                 }
+                Expr::Prop(..) => {
+                    let p = self.this_prop(lhs)?;
+                    self.expr(rhs)?;
+                    self.ops.push(Op::StoreThisProp(p));
+                    Some(())
+                }
                 _ => None,
             },
+            Expr::AssignOp(op, lhs, rhs) if self.this_prop(lhs).is_some() => {
+                let p = self.this_prop(lhs)?;
+                self.ops.push(Op::LoadThisProp(p));
+                self.expr(rhs)?;
+                self.ops.push(Op::Bin(*op));
+                self.ops.push(Op::StoreThisProp(p));
+                Some(())
+            }
             Expr::AssignOp(op, lhs, rhs) => match &**lhs {
                 Expr::Var(n) => {
                     let s = self.slot(n)?;
@@ -557,8 +635,45 @@ impl<'a> Compiler<'a> {
                 self.ops.push(Op::Const(k));
             }
             Expr::Var(n) => {
-                let s = self.slot(n)?;
-                self.ops.push(Op::Load(s));
+                if n == "this" && !self.top_level {
+                    self.uses_this = true;
+                    self.ops.push(Op::LoadThis);
+                } else {
+                    let s = self.slot(n)?;
+                    self.ops.push(Op::Load(s));
+                }
+            }
+            Expr::Prop(..) => {
+                let p = self.this_prop(e)?;
+                self.ops.push(Op::LoadThisProp(p));
+            }
+            Expr::MethodCall(recv, PropName::Id(m), args, false) => {
+                // receiver: a local var, $this, or $this->prop
+                match &**recv {
+                    Expr::Var(n) if n == "this" => {
+                        self.uses_this = true;
+                        self.ops.push(Op::LoadThis);
+                    }
+                    Expr::Var(n) => {
+                        let s = self.slot(n)?;
+                        self.ops.push(Op::Load(s));
+                    }
+                    other => {
+                        let p = self.this_prop(other)?;
+                        self.ops.push(Op::LoadThisProp(p));
+                    }
+                }
+                if args.len() > u8::MAX as usize {
+                    return None;
+                }
+                for a in args {
+                    if a.spread || a.by_ref || a.name.is_some() || Self::is_lvalue(&a.value) {
+                        return None;
+                    }
+                    self.expr(&a.value)?;
+                }
+                let ni = self.name(m)?;
+                self.ops.push(Op::CallMethod { name: ni, argc: args.len() as u8 });
             }
             Expr::Template(parts) => {
                 // concat chain; each part compiles then Concat-folds
@@ -747,6 +862,11 @@ impl<'a> Compiler<'a> {
                 self.ops.push(Op::Store(s));
             }
             Expr::Index(base, Some(i)) => {
+                if let Some(p) = self.this_prop(base) {
+                    self.expr(i)?;
+                    self.ops.push(Op::LoadIndexThisProp(p));
+                    return Some(());
+                }
                 let s = match &**base {
                     Expr::Var(n) => self.slot(n)?,
                     _ => return None,
