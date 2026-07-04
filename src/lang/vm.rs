@@ -102,6 +102,24 @@ pub enum Op {
     LoadIndexThisProp(u16),
     StoreIndexThisProp(u16),
     AppendThisProp(u16),
+    /// Array literal construction, streaming: NewArr pushes an empty array;
+    /// ArrPush appends the popped value to the stack-top array; ArrSet pops
+    /// value then key and inserts.
+    NewArr,
+    ArrPush,
+    ArrSet,
+    /// isset variants beyond plain slots. IssetIndex pops the key;
+    /// IssetThisPropIndex pops the key and checks the property element.
+    IssetIndex(u16),
+    IssetThisProp(u16),
+    IssetThisPropIndex(u16),
+    /// new ClassName(args): names[i] resolved through the same namespace
+    /// machinery as the walker, then Eval::instantiate.
+    NewObj { class: u16, argc: u8 },
+    /// ClassName::method(args) — resolution mirrors resolve_class_name for
+    /// self/parent/static keywords. Non-lvalue args only (same by-ref rule
+    /// as CallMethod).
+    CallStatic { class: u16, method: u16, argc: u8 },
     /// Method call: stack holds receiver then argc args. Dispatches through
     /// Eval::call_method (same resolution/visibility path as the walker).
     /// Compile-time restriction keeps by-ref parameter semantics safe: no
@@ -634,6 +652,64 @@ impl<'a> Compiler<'a> {
                 let k = self.konst(Value::Str(s.clone()))?;
                 self.ops.push(Op::Const(k));
             }
+            Expr::Array(items) => {
+                self.ops.push(Op::NewArr);
+                for it in items {
+                    if it.by_ref || it.spread {
+                        return None;
+                    }
+                    match &it.key {
+                        Some(k) => {
+                            self.expr(k)?;
+                            self.expr(&it.value)?;
+                            self.ops.push(Op::ArrSet);
+                        }
+                        None => {
+                            self.expr(&it.value)?;
+                            self.ops.push(Op::ArrPush);
+                        }
+                    }
+                }
+            }
+            Expr::New(class, args) => {
+                let cname = match &**class {
+                    Expr::ConstFetch(n) if !n.fully_qualified && n.parts.len() == 1 => {
+                        n.last().to_string()
+                    }
+                    _ => return None,
+                };
+                if args.len() > u8::MAX as usize {
+                    return None;
+                }
+                for a in args {
+                    if a.spread || a.by_ref || a.name.is_some() || Self::is_lvalue(&a.value) {
+                        return None;
+                    }
+                    self.expr(&a.value)?;
+                }
+                let ci = self.name(&cname)?;
+                self.ops.push(Op::NewObj { class: ci, argc: args.len() as u8 });
+            }
+            Expr::StaticCall(class, PropName::Id(m), args) => {
+                let cname = match &**class {
+                    Expr::ConstFetch(n) if !n.fully_qualified && n.parts.len() == 1 => {
+                        n.last().to_string()
+                    }
+                    _ => return None,
+                };
+                if args.len() > u8::MAX as usize {
+                    return None;
+                }
+                for a in args {
+                    if a.spread || a.by_ref || a.name.is_some() || Self::is_lvalue(&a.value) {
+                        return None;
+                    }
+                    self.expr(&a.value)?;
+                }
+                let ci = self.name(&cname)?;
+                let mi = self.name(m)?;
+                self.ops.push(Op::CallStatic { class: ci, method: mi, argc: args.len() as u8 });
+            }
             Expr::Var(n) => {
                 if n == "this" && !self.top_level {
                     self.uses_this = true;
@@ -875,16 +951,52 @@ impl<'a> Compiler<'a> {
                 self.ops.push(Op::LoadIndex(s));
             }
             Expr::Isset(items) => {
-                // all-vars subset
-                if items.len() != 1 {
-                    return None;
-                }
-                match &items[0] {
-                    Expr::Var(n) => {
-                        let s = self.slot(n)?;
-                        self.ops.push(Op::IssetSlot(s));
+                // each item compiles to a bool; multiple items AND-chain with
+                // jumps (subset lvalues have no side effects, so evaluation
+                // order nuances don't observable-differ)
+                let mut false_patches = Vec::new();
+                for (idx, item) in items.iter().enumerate() {
+                    match item {
+                        Expr::Var(n) => {
+                            let s = self.slot(n)?;
+                            self.ops.push(Op::IssetSlot(s));
+                        }
+                        Expr::Index(base, Some(i)) => {
+                            if let Some(p) = self.this_prop(base) {
+                                self.expr(i)?;
+                                self.ops.push(Op::IssetThisPropIndex(p));
+                            } else {
+                                let s = match &**base {
+                                    Expr::Var(n) => self.slot(n)?,
+                                    _ => return None,
+                                };
+                                self.expr(i)?;
+                                self.ops.push(Op::IssetIndex(s));
+                            }
+                        }
+                        Expr::Prop(..) => {
+                            let p = self.this_prop(item)?;
+                            self.ops.push(Op::IssetThisProp(p));
+                        }
+                        _ => return None,
                     }
-                    _ => return None,
+                    if idx + 1 < items.len() {
+                        let fp = self.ops.len();
+                        self.ops.push(Op::JmpIfFalse(0));
+                        false_patches.push(fp);
+                    }
+                }
+                if !false_patches.is_empty() {
+                    let done = self.ops.len();
+                    self.ops.push(Op::Jmp(0));
+                    let fh = self.here();
+                    for p in false_patches {
+                        self.patch_jump(p, fh);
+                    }
+                    let kf = self.konst(super::value::Value::Bool(false))?;
+                    self.ops.push(Op::Const(kf));
+                    let end = self.here();
+                    self.patch_jump(done, end);
                 }
             }
             Expr::Empty(inner) => match &**inner {

@@ -4526,6 +4526,9 @@ impl Eval {
             c.debug_name = self.cur_fn.last().cloned().unwrap_or_else(|| "{top}".into());
             Rc::new(c)
         });
+        if std::env::var("PHARGO_VM_DEBUG").is_ok() && chunk.is_none() {
+            eprintln!("[vm bail] {}", self.cur_fn.last().cloned().unwrap_or_else(|| "{top}".into()));
+        }
         self.vm_cache.insert(key, (chunk.clone(), owner));
         chunk
     }
@@ -4854,6 +4857,104 @@ impl Eval {
                         slots[i] = Value::Str(s);
                     }
                     assigned[i] = true;
+                }
+                Op::NewArr => stack.push(Value::Array(Arr::new())),
+                Op::ArrPush => {
+                    let v = pop!();
+                    if let Some(Value::Array(a)) = stack.last_mut() {
+                        a.push(v);
+                        if a.len() > MAX_ARRAY_NODES {
+                            return Err(self.throw_error("Error", "Allocated array exceeds memory limit"));
+                        }
+                    }
+                }
+                Op::ArrSet => {
+                    let v = pop!();
+                    let kv = pop!();
+                    let k = Arr::norm_key(&kv);
+                    if let Some(Value::Array(a)) = stack.last_mut() {
+                        a.insert(k, v);
+                    }
+                }
+                Op::IssetIndex(i) => {
+                    let kv = pop!();
+                    let k = Arr::norm_key(&kv);
+                    let i = *i as usize;
+                    let b = match &slots[i] {
+                        Value::Array(a) => a.get(&k).map(|v| !matches!(v.deref(), Value::Null)).unwrap_or(false),
+                        Value::Str(s) => {
+                            let idx = to_i64(&kv);
+                            let idx = if idx < 0 { s.len() as i64 + idx } else { idx };
+                            idx >= 0 && (idx as usize) < s.len()
+                        }
+                        _ => false,
+                    };
+                    stack.push(Value::Bool(b));
+                }
+                Op::IssetThisProp(i) => {
+                    let name = &chunk.names[*i as usize];
+                    let b = this_rc
+                        .as_ref()
+                        .and_then(|rc| rc.borrow().get(name).map(|v| !matches!(v.deref(), Value::Null)))
+                        .unwrap_or(false);
+                    stack.push(Value::Bool(b));
+                }
+                Op::IssetThisPropIndex(i) => {
+                    let kv = pop!();
+                    let k = Arr::norm_key(&kv);
+                    let name = &chunk.names[*i as usize];
+                    let b = this_rc
+                        .as_ref()
+                        .and_then(|rc| {
+                            let ob = rc.borrow();
+                            match ob.get(name) {
+                                Some(Value::Array(a)) => {
+                                    Some(a.get(&k).map(|v| !matches!(v.deref(), Value::Null)).unwrap_or(false))
+                                }
+                                _ => None,
+                            }
+                        })
+                        .unwrap_or(false);
+                    stack.push(Value::Bool(b));
+                }
+                Op::NewObj { class, argc } => {
+                    let argc = *argc as usize;
+                    let at = stack.len() - argc;
+                    let argv: Vec<Value> = stack.split_off(at);
+                    let raw = chunk.names[*class as usize].clone();
+                    let n = Name { parts: vec![raw], fully_qualified: false };
+                    let cname = self.resolve_ns_class(&n);
+                    let v = self.instantiate(&cname, argv)?;
+                    stack.push(v);
+                }
+                Op::CallStatic { class, method, argc } => {
+                    let argc = *argc as usize;
+                    let at = stack.len() - argc;
+                    let argv: Vec<Value> = stack.split_off(at);
+                    let raw = chunk.names[*class as usize].clone();
+                    let mname = chunk.names[*method as usize].clone();
+                    // self/parent/static resolve like resolve_class_name
+                    let cname = match raw.to_ascii_lowercase().as_str() {
+                        "self" => self.current_class.clone().unwrap_or(raw),
+                        "static" => self
+                            .called_class
+                            .clone()
+                            .or_else(|| self.current_class.clone())
+                            .unwrap_or(raw),
+                        "parent" => {
+                            let cur = self.current_class.clone().unwrap_or_default();
+                            self.find_class(&cur)
+                                .and_then(|c| c.parent.as_ref().map(|p| p.parts.join("\\")))
+                                .unwrap_or(cur)
+                        }
+                        _ => {
+                            let n = Name { parts: vec![raw.clone()], fully_qualified: false };
+                            self.resolve_ns_class(&n)
+                        }
+                    };
+                    let this = self.vars().get("this").cloned();
+                    let v = self.call_static(&cname, &mname, argv, this, None)?;
+                    stack.push(v);
                 }
                 Op::LoadThis => {
                     stack.push(match this_rc {
