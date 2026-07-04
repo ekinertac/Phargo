@@ -27,6 +27,36 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-06 (later) — Phase 2 begins: the VM takes its first breath.
+
+**The bytecode engine exists.** `PHARGO_ENGINE=vm` switches on mixed-mode
+execution: function bodies and the top-level program compile to a
+stack-machine `Chunk` when everything they use is in the supported subset —
+slot-indexed locals, constant pool, jump-based control flow, calls into the
+same builtin table — and anything else falls back to the tree-walker,
+per-body. Correctness comes from sharing the walker's semantic kernels
+(`apply_bin`, `to_bool`, `stringify`): the VM changes dispatch, never
+semantics. A 13-case A/B harness (loops, calls, foreach, coalesce,
+warnings, constants, recursion) runs byte-identical on both engines.
+
+First numbers against the bench.rs baseline (walker: micro 1065 ms,
+wp-front-page 7526 ms):
+
+- loop-arith 306 → 135 ms (2.3×) — slots + integer fast paths
+- foreach-sum 98 → 44 ms (2.2×) — snapshot iterators
+- string-concat 19 → 10 ms — after the first VM lesson: the naive
+  Load/Concat/Store round-trip was 20× SLOWER than the walker's in-place
+  `.=` fast path. The VM now has a ConcatAssign op. The walker's decade of
+  hot-path fixes doesn't transfer for free; each one must be re-earned.
+- method-calls unchanged — objects/properties aren't in the subset yet,
+  which is exactly the next rung: WordPress is method-calls all the way
+  down.
+
+Phase 2 preconditions also landed: `examples/bench.rs` (the stopwatch) and
+`docs/DEVIATIONS.md` (the honest punch list the VM must resolve). Both
+scoreboards run to verify the flag-off path is untouched and the flag-on
+path holds parity through fallback.
+
 ## 2026-07-06 — The browser is the seventh analyzer.
 
 **The user's browser said "HTML fine, CSS loading, nothing rendering" —

@@ -1,0 +1,838 @@
+//! Path C phase 1: a bytecode compiler for the hot subset of PHP.
+//!
+//! The strategy is MIXED-MODE execution: function bodies (and the top-level
+//! program) compile to a stack-machine `Chunk` when every construct they use
+//! is in the supported subset; anything else returns `None` and the
+//! tree-walker runs that body exactly as before. Correctness comes from
+//! sharing semantic kernels with the walker (`apply_bin`, `to_bool`,
+//! `stringify`, the builtin table) — the VM changes *dispatch*, never
+//! semantics.
+//!
+//! What the subset buys (and why): locals become compile-time slot indices
+//! (no per-access HashMap lookups), literals become constant-pool loads (no
+//! per-iteration allocation), control flow becomes jumps (no recursive
+//! enum matching). Those three are the walker's measured hot costs on the
+//! bench.rs micro suite.
+//!
+//! The compiler BAILS (returns None) on anything with reference semantics,
+//! scope introspection, or dynamic dispatch it can't prove safe: `&`
+//! anywhere, `global`/`static`, closures, method/static calls, property
+//! access, VarVar, try/catch, switch, match, generators, and calls to
+//! builtins with by-ref out-params or scope access (compact/extract/...).
+//! The interpreter lives in eval.rs (`Eval::run_chunk`) because it needs the
+//! evaluator's state; this module is pure data + compilation.
+
+use super::ast::*;
+use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+pub enum Op {
+    /// Push consts[i].
+    Const(u16),
+    /// Push a clone of slot i, warning once if it was never assigned
+    /// (mirrors the walker's undefined-variable warning).
+    Load(u16),
+    /// Push slot i without the undefined warning (isset/empty/?? sites).
+    LoadQuiet(u16),
+    /// Pop into slot i.
+    Store(u16),
+    Dup,
+    Pop,
+    /// Binary op via Eval::apply_bin — identical semantics to the walker.
+    Bin(BinOp),
+    /// Logical/unary helpers.
+    Not,
+    Neg,
+    IsNull,
+    /// isset($x): slot assigned AND not null → bool.
+    IssetSlot(u16),
+    UnsetSlot(u16),
+    /// Unconditional / conditional jumps (absolute op index). Conditionals pop.
+    Jmp(u32),
+    JmpIfFalse(u32),
+    JmpIfTrue(u32),
+    /// Call a named function (user or builtin) with argc stack args
+    /// (pushed left-to-right). Name resolved per call via names[i].
+    CallFn { name: u16, argc: u8 },
+    /// Echo the top n stack values (in push order).
+    Echo(u8),
+    /// $slot[key]: pop key, push element (Null + no warning if absent — the
+    /// compiler only emits this in quiet positions; checked reads use
+    /// LoadIndexChecked).
+    LoadIndexQuiet(u16),
+    /// Checked variant: warns on missing key like the walker.
+    LoadIndex(u16),
+    /// $slot[key] = v: pop v, pop key, insert into the slot's array in place
+    /// (creating the array if the slot is null/unset).
+    StoreIndex(u16),
+    /// $slot[] = v: pop v, append in place.
+    Append(u16),
+    /// Casts (subset).
+    CastInt,
+    CastFloat,
+    CastString,
+    CastBool,
+    /// foreach ($slot as [$k =>] $v) over a snapshot: pushes an iterator.
+    /// Jump target = loop end (when exhausted).
+    IterInit { slot: u16, end: u32 },
+    /// Advance: bind next key/value into slots, or jump to end and pop the
+    /// iterator. key_slot == u16::MAX means "no key binding".
+    IterNext { val_slot: u16, key_slot: u16, end: u32 },
+    /// Pop the innermost iterator (break out of foreach).
+    PopIter,
+    /// Set current line (error attribution).
+    Line(u32),
+    /// Return top of stack / null.
+    Ret,
+    RetNull,
+    /// Runtime constant lookup (names[i]): TRUE/FALSE/etc handled as
+    /// literals at compile time; this covers user constants.
+    ConstLookup(u16),
+    /// $slot .= (pop): append bytes in place — the walker's O(n) `.=` fast
+    /// path, kept (a Load+Concat+Store round trip clones the whole string).
+    ConcatAssign(u16),
+}
+
+pub struct Chunk {
+    pub ops: Vec<Op>,
+    pub consts: Vec<super::value::Value>,
+    pub names: Vec<String>,
+    pub slot_names: Vec<String>,
+}
+
+/// What the compiler needs to know about a callable name, answered by the
+/// evaluator at compile time (lazily, at first execution, when the function
+/// table is populated).
+pub enum CalleeKind {
+    /// Safe to call by value: user function without by-ref params, or a
+    /// builtin outside the special-dispatch/by-ref table.
+    Safe,
+    /// Anything else — by-ref params, scope introspection, include/exit,
+    /// unknown name. The chunk bails.
+    Unsafe,
+}
+
+pub struct Compiler<'a> {
+    ops: Vec<Op>,
+    consts: Vec<super::value::Value>,
+    names: Vec<String>,
+    slots: HashMap<String, u16>,
+    slot_names: Vec<String>,
+    resolver: &'a dyn Fn(&str) -> CalleeKind,
+    /// (continue_target, break_patches, iter_depth_at_entry) per open loop.
+    loops: Vec<LoopCtx>,
+    iter_depth: usize,
+    top_level: bool,
+}
+
+struct LoopCtx {
+    continue_target: Option<u32>, // None until known (for/while post-parts)
+    continue_patches: Vec<usize>,
+    break_patches: Vec<usize>,
+    iter_depth: usize,
+}
+
+/// Builtins that must never be called from a chunk: by-ref out-params,
+/// scope introspection, control transfer, or special eval_call dispatch.
+const BAIL_CALLS: &[&str] = &[
+    "compact", "extract", "get_defined_vars", "func_get_args", "func_get_arg",
+    "func_num_args", "eval", "include", "include_once", "require", "require_once",
+    "exit", "die", "preg_match", "preg_match_all", "preg_replace", "str_replace",
+    "str_ireplace", "similar_text", "parse_str", "sscanf", "fscanf", "settype",
+    "array_multisort", "xml_parse_into_struct", "fsockopen", "stream_socket_client",
+    "array_push", "array_pop", "array_shift", "array_unshift", "array_splice",
+    "sort", "rsort", "asort", "arsort", "ksort", "krsort", "usort", "uasort",
+    "uksort", "shuffle", "natsort", "natcasesort", "array_walk",
+    "array_walk_recursive", "reset", "end", "next", "prev", "current", "key",
+    "each", "pos", "call_user_func", "call_user_func_array", "usleep", "sleep",
+    "debug_backtrace", "get_class", "flock",
+];
+
+impl<'a> Compiler<'a> {
+    pub fn compile(
+        body: &[Stmt],
+        top_level: bool,
+        resolver: &'a dyn Fn(&str) -> CalleeKind,
+    ) -> Option<Chunk> {
+        let mut c = Compiler {
+            ops: Vec::new(),
+            consts: Vec::new(),
+            names: Vec::new(),
+            slots: HashMap::new(),
+            slot_names: Vec::new(),
+            resolver,
+            loops: Vec::new(),
+            iter_depth: 0,
+            top_level,
+        };
+        c.block(body)?;
+        c.ops.push(Op::RetNull);
+        Some(Chunk {
+            ops: c.ops,
+            consts: c.consts,
+            names: c.names,
+            slot_names: c.slot_names,
+        })
+    }
+
+    fn slot(&mut self, name: &str) -> Option<u16> {
+        // superglobals only behave like locals at top level (functions read
+        // them from the global scope — unsupported in slots)
+        if !self.top_level && super::eval::is_superglobal(name) {
+            return None;
+        }
+        if name == "GLOBALS" || name == "this" {
+            return None;
+        }
+        if let Some(&i) = self.slots.get(name) {
+            return Some(i);
+        }
+        let i = u16::try_from(self.slot_names.len()).ok()?;
+        self.slots.insert(name.to_string(), i);
+        self.slot_names.push(name.to_string());
+        Some(i)
+    }
+
+    fn konst(&mut self, v: super::value::Value) -> Option<u16> {
+        let i = u16::try_from(self.consts.len()).ok()?;
+        self.consts.push(v);
+        Some(i)
+    }
+
+    fn name(&mut self, n: &str) -> Option<u16> {
+        if let Some(i) = self.names.iter().position(|x| x == n) {
+            return u16::try_from(i).ok();
+        }
+        let i = u16::try_from(self.names.len()).ok()?;
+        self.names.push(n.to_string());
+        Some(i)
+    }
+
+    fn here(&self) -> u32 {
+        self.ops.len() as u32
+    }
+
+    fn block(&mut self, stmts: &[Stmt]) -> Option<()> {
+        for s in stmts {
+            self.stmt(s)?;
+        }
+        Some(())
+    }
+
+    fn stmt(&mut self, s: &Stmt) -> Option<()> {
+        match s {
+            Stmt::Marked(line, inner) => {
+                self.ops.push(Op::Line(*line));
+                self.stmt(inner)
+            }
+            Stmt::Nop => Some(()),
+            Stmt::Block(b) => self.block(b),
+            Stmt::InlineHtml(bytes) => {
+                let k = self.konst(super::value::Value::Str(bytes.clone()))?;
+                self.ops.push(Op::Const(k));
+                self.ops.push(Op::Echo(1));
+                Some(())
+            }
+            Stmt::Echo(items) => {
+                if items.len() > u8::MAX as usize {
+                    return None;
+                }
+                for e in items {
+                    self.expr(e)?;
+                }
+                self.ops.push(Op::Echo(items.len() as u8));
+                Some(())
+            }
+            Stmt::Expr(e) => {
+                self.expr_stmt(e)?;
+                Some(())
+            }
+            Stmt::Return(e) => {
+                match e {
+                    Some(e) => {
+                        self.expr(e)?;
+                        self.ops.push(Op::Ret);
+                    }
+                    None => self.ops.push(Op::RetNull),
+                }
+                Some(())
+            }
+            Stmt::If { cond, then, elseifs, els } => {
+                // chain of cond → jmp-false to next arm
+                let mut end_patches = Vec::new();
+                self.expr(cond)?;
+                let mut false_patch = self.ops.len();
+                self.ops.push(Op::JmpIfFalse(0));
+                self.block(then)?;
+                end_patches.push(self.ops.len());
+                self.ops.push(Op::Jmp(0));
+                for (c, b) in elseifs {
+                    let here = self.here();
+                    self.patch_jump(false_patch, here);
+                    self.expr(c)?;
+                    false_patch = self.ops.len();
+                    self.ops.push(Op::JmpIfFalse(0));
+                    self.block(b)?;
+                    end_patches.push(self.ops.len());
+                    self.ops.push(Op::Jmp(0));
+                }
+                let here = self.here();
+                self.patch_jump(false_patch, here);
+                if let Some(b) = els {
+                    self.block(b)?;
+                }
+                let end = self.here();
+                for p in end_patches {
+                    self.patch_jump(p, end);
+                }
+                Some(())
+            }
+            Stmt::While { cond, body } => {
+                let start = self.here();
+                self.expr(cond)?;
+                let exit_patch = self.ops.len();
+                self.ops.push(Op::JmpIfFalse(0));
+                self.loops.push(LoopCtx {
+                    continue_target: Some(start),
+                    continue_patches: Vec::new(),
+                    break_patches: Vec::new(),
+                    iter_depth: self.iter_depth,
+                });
+                self.block(body)?;
+                self.ops.push(Op::Jmp(start));
+                let end = self.here();
+                self.patch_jump(exit_patch, end);
+                self.finish_loop(end, start);
+                Some(())
+            }
+            Stmt::DoWhile { body, cond } => {
+                let start = self.here();
+                self.loops.push(LoopCtx {
+                    continue_target: None,
+                    continue_patches: Vec::new(),
+                    break_patches: Vec::new(),
+                    iter_depth: self.iter_depth,
+                });
+                self.block(body)?;
+                let cond_at = self.here();
+                self.expr(cond)?;
+                self.ops.push(Op::JmpIfTrue(start));
+                let end = self.here();
+                self.finish_loop(end, cond_at);
+                Some(())
+            }
+            Stmt::For { init, cond, step, body } => {
+                for e in init {
+                    self.expr_stmt(e)?;
+                }
+                let start = self.here();
+                let exit_patch = if cond.is_empty() {
+                    None
+                } else {
+                    // PHP evaluates all cond exprs, last decides
+                    for (i, e) in cond.iter().enumerate() {
+                        self.expr(e)?;
+                        if i + 1 < cond.len() {
+                            self.ops.push(Op::Pop);
+                        }
+                    }
+                    let p = self.ops.len();
+                    self.ops.push(Op::JmpIfFalse(0));
+                    Some(p)
+                };
+                self.loops.push(LoopCtx {
+                    continue_target: None,
+                    continue_patches: Vec::new(),
+                    break_patches: Vec::new(),
+                    iter_depth: self.iter_depth,
+                });
+                self.block(body)?;
+                let step_at = self.here();
+                for e in step {
+                    self.expr_stmt(e)?;
+                }
+                self.ops.push(Op::Jmp(start));
+                let end = self.here();
+                if let Some(p) = exit_patch {
+                    self.patch_jump(p, end);
+                }
+                self.finish_loop(end, step_at);
+                Some(())
+            }
+            Stmt::Foreach { array, key, value, by_ref, body } => {
+                if *by_ref {
+                    return None;
+                }
+                // subset: iterate a plain local array variable
+                let arr_slot = match array {
+                    Expr::Var(n) => self.slot(n)?,
+                    _ => return None,
+                };
+                let val_slot = match value {
+                    Expr::Var(n) => self.slot(n)?,
+                    _ => return None,
+                };
+                let key_slot = match key {
+                    None => u16::MAX,
+                    Some(Expr::Var(n)) => self.slot(n)?,
+                    Some(_) => return None,
+                };
+                let init_patch = self.ops.len();
+                self.ops.push(Op::IterInit { slot: arr_slot, end: 0 });
+                let start = self.here();
+                let next_patch = self.ops.len();
+                self.ops.push(Op::IterNext { val_slot, key_slot, end: 0 });
+                self.iter_depth += 1;
+                self.loops.push(LoopCtx {
+                    continue_target: Some(start),
+                    continue_patches: Vec::new(),
+                    break_patches: Vec::new(),
+                    iter_depth: self.iter_depth,
+                });
+                self.block(body)?;
+                self.ops.push(Op::Jmp(start));
+                let end = self.here();
+                self.iter_depth -= 1;
+                match &mut self.ops[init_patch] {
+                    Op::IterInit { end: e, .. } => *e = end,
+                    _ => unreachable!(),
+                }
+                match &mut self.ops[next_patch] {
+                    Op::IterNext { end: e, .. } => *e = end,
+                    _ => unreachable!(),
+                }
+                self.finish_loop(end, start);
+                Some(())
+            }
+            Stmt::Break(n) => {
+                if *n != 1 {
+                    return None;
+                }
+                let ctx_iter_depth = self.loops.last()?.iter_depth;
+                // leaving a foreach: pop its iterator
+                if self.iter_depth > 0 && ctx_iter_depth == self.iter_depth {
+                    self.ops.push(Op::PopIter);
+                }
+                let p = self.ops.len();
+                self.ops.push(Op::Jmp(0));
+                self.loops.last_mut()?.break_patches.push(p);
+                Some(())
+            }
+            Stmt::Continue(n) => {
+                if *n != 1 {
+                    return None;
+                }
+                let target = self.loops.last()?.continue_target;
+                match target {
+                    Some(t) => self.ops.push(Op::Jmp(t)),
+                    None => {
+                        let p = self.ops.len();
+                        self.ops.push(Op::Jmp(0));
+                        self.loops.last_mut()?.continue_patches.push(p);
+                    }
+                }
+                Some(())
+            }
+            // top-level declarations were hoisted before execution; leaving
+            // them out of the chunk preserves behavior for the direct case.
+            // (Conditional declarations sit inside If bodies and bail there
+            // via this same match falling to None for nested positions —
+            // we only accept them when compiling the top level.)
+            Stmt::Func(_) | Stmt::Class(_) if self.top_level && self.loops.is_empty() => Some(()),
+            _ => None,
+        }
+    }
+
+    fn finish_loop(&mut self, end: u32, continue_to: u32) {
+        let ctx = self.loops.pop().unwrap();
+        for p in ctx.break_patches {
+            self.patch_jump(p, end);
+        }
+        for p in ctx.continue_patches {
+            self.patch_jump(p, continue_to);
+        }
+    }
+
+    fn patch_jump(&mut self, at: usize, target: u32) {
+        match &mut self.ops[at] {
+            Op::Jmp(t) | Op::JmpIfFalse(t) | Op::JmpIfTrue(t) => *t = target,
+            _ => unreachable!("patch target is not a jump"),
+        }
+    }
+
+    /// Compile an expression evaluated for its side effect (statement
+    /// position): avoids pushing values that are immediately popped.
+    fn expr_stmt(&mut self, e: &Expr) -> Option<()> {
+        match e {
+            Expr::Assign(lhs, rhs) => match &**lhs {
+                Expr::Var(n) => {
+                    let s = self.slot(n)?;
+                    self.expr(rhs)?;
+                    self.ops.push(Op::Store(s));
+                    Some(())
+                }
+                Expr::Index(base, idx) => {
+                    let s = match &**base {
+                        Expr::Var(n) => self.slot(n)?,
+                        _ => return None,
+                    };
+                    match idx {
+                        Some(i) => {
+                            self.expr(i)?;
+                            self.expr(rhs)?;
+                            self.ops.push(Op::StoreIndex(s));
+                        }
+                        None => {
+                            self.expr(rhs)?;
+                            self.ops.push(Op::Append(s));
+                        }
+                    }
+                    Some(())
+                }
+                _ => None,
+            },
+            Expr::AssignOp(op, lhs, rhs) => match &**lhs {
+                Expr::Var(n) => {
+                    let s = self.slot(n)?;
+                    if matches!(op, BinOp::Concat) {
+                        self.expr(rhs)?;
+                        self.ops.push(Op::ConcatAssign(s));
+                        return Some(());
+                    }
+                    self.ops.push(Op::LoadQuiet(s));
+                    self.expr(rhs)?;
+                    self.ops.push(Op::Bin(*op));
+                    self.ops.push(Op::Store(s));
+                    Some(())
+                }
+                _ => None,
+            },
+            Expr::PreInc(v) | Expr::PostInc(v) => self.inc_dec_stmt(v, BinOp::Add),
+            Expr::PreDec(v) | Expr::PostDec(v) => self.inc_dec_stmt(v, BinOp::Sub),
+            _ => {
+                self.expr(e)?;
+                self.ops.push(Op::Pop);
+                Some(())
+            }
+        }
+    }
+
+    fn inc_dec_stmt(&mut self, v: &Expr, op: BinOp) -> Option<()> {
+        let s = match v {
+            Expr::Var(n) => self.slot(n)?,
+            _ => return None,
+        };
+        let one = self.konst(super::value::Value::Int(1))?;
+        self.ops.push(Op::LoadQuiet(s));
+        self.ops.push(Op::Const(one));
+        self.ops.push(Op::Bin(op));
+        self.ops.push(Op::Store(s));
+        Some(())
+    }
+
+    fn expr(&mut self, e: &Expr) -> Option<()> {
+        use super::value::Value;
+        match e {
+            Expr::Null => {
+                let k = self.konst(Value::Null)?;
+                self.ops.push(Op::Const(k));
+            }
+            Expr::Bool(b) => {
+                let k = self.konst(Value::Bool(*b))?;
+                self.ops.push(Op::Const(k));
+            }
+            Expr::Int(n) => {
+                let k = self.konst(Value::Int(*n))?;
+                self.ops.push(Op::Const(k));
+            }
+            Expr::Float(f) => {
+                let k = self.konst(Value::Float(*f))?;
+                self.ops.push(Op::Const(k));
+            }
+            Expr::Str(s) => {
+                let k = self.konst(Value::Str(s.clone()))?;
+                self.ops.push(Op::Const(k));
+            }
+            Expr::Var(n) => {
+                let s = self.slot(n)?;
+                self.ops.push(Op::Load(s));
+            }
+            Expr::Template(parts) => {
+                // concat chain; each part compiles then Concat-folds
+                let mut first = true;
+                for p in parts {
+                    match p {
+                        TplPart::Lit(bytes) => {
+                            let k = self.konst(Value::Str(bytes.clone()))?;
+                            self.ops.push(Op::Const(k));
+                        }
+                        TplPart::Expr(e) => self.expr(e)?,
+                    }
+                    if !first {
+                        self.ops.push(Op::Bin(BinOp::Concat));
+                    }
+                    first = false;
+                }
+                if first {
+                    let k = self.konst(Value::Str(Vec::new()))?;
+                    self.ops.push(Op::Const(k));
+                }
+            }
+            Expr::Unary(op, inner) => {
+                match op {
+                    UnOp::Not => {
+                        self.expr(inner)?;
+                        self.ops.push(Op::Not);
+                    }
+                    UnOp::Neg => {
+                        self.expr(inner)?;
+                        self.ops.push(Op::Neg);
+                    }
+                    UnOp::Pos => {
+                        // +$x is an arithmetic no-op after numeric coercion:
+                        // 0 + $x preserves PHP semantics
+                        let k = self.konst(Value::Int(0))?;
+                        self.ops.push(Op::Const(k));
+                        self.expr(inner)?;
+                        self.ops.push(Op::Bin(BinOp::Add));
+                    }
+                    _ => return None,
+                }
+            }
+            Expr::Binary(op, l, r) => match op {
+                BinOp::And => {
+                    self.expr(l)?;
+                    let f1 = self.ops.len();
+                    self.ops.push(Op::JmpIfFalse(0));
+                    self.expr(r)?;
+                    let f2 = self.ops.len();
+                    self.ops.push(Op::JmpIfFalse(0));
+                    let kt = self.konst(Value::Bool(true))?;
+                    self.ops.push(Op::Const(kt));
+                    let done = self.ops.len();
+                    self.ops.push(Op::Jmp(0));
+                    let fh = self.here();
+                    self.patch_jump(f1, fh);
+                    self.patch_jump(f2, fh);
+                    let kf = self.konst(Value::Bool(false))?;
+                    self.ops.push(Op::Const(kf));
+                    let end = self.here();
+                    self.patch_jump(done, end);
+                }
+                BinOp::Or => {
+                    self.expr(l)?;
+                    let t1 = self.ops.len();
+                    self.ops.push(Op::JmpIfTrue(0));
+                    self.expr(r)?;
+                    let t2 = self.ops.len();
+                    self.ops.push(Op::JmpIfTrue(0));
+                    let kf = self.konst(Value::Bool(false))?;
+                    self.ops.push(Op::Const(kf));
+                    let done = self.ops.len();
+                    self.ops.push(Op::Jmp(0));
+                    let th = self.here();
+                    self.patch_jump(t1, th);
+                    self.patch_jump(t2, th);
+                    let kt = self.konst(Value::Bool(true))?;
+                    self.ops.push(Op::Const(kt));
+                    let end = self.here();
+                    self.patch_jump(done, end);
+                }
+                BinOp::Coalesce => {
+                    // only quiet lvalue shapes on the left
+                    match &**l {
+                        Expr::Var(n) => {
+                            let s = self.slot(n)?;
+                            self.ops.push(Op::LoadQuiet(s));
+                        }
+                        Expr::Index(base, Some(i)) => {
+                            let s = match &**base {
+                                Expr::Var(n) => self.slot(n)?,
+                                _ => return None,
+                            };
+                            self.expr(i)?;
+                            self.ops.push(Op::LoadIndexQuiet(s));
+                        }
+                        _ => return None,
+                    }
+                    self.ops.push(Op::Dup);
+                    self.ops.push(Op::IsNull);
+                    let use_default = self.ops.len();
+                    self.ops.push(Op::JmpIfTrue(0));
+                    let done = self.ops.len();
+                    self.ops.push(Op::Jmp(0));
+                    let dh = self.here();
+                    self.patch_jump(use_default, dh);
+                    self.ops.push(Op::Pop);
+                    self.expr(r)?;
+                    let end = self.here();
+                    self.patch_jump(done, end);
+                }
+                _ => {
+                    self.expr(l)?;
+                    self.expr(r)?;
+                    self.ops.push(Op::Bin(*op));
+                }
+            },
+            Expr::Ternary(c, mid, els) => {
+                self.expr(c)?;
+                match mid {
+                    Some(m) => {
+                        let fp = self.ops.len();
+                        self.ops.push(Op::JmpIfFalse(0));
+                        self.expr(m)?;
+                        let done = self.ops.len();
+                        self.ops.push(Op::Jmp(0));
+                        let fh = self.here();
+                        self.patch_jump(fp, fh);
+                        self.expr(els)?;
+                        let end = self.here();
+                        self.patch_jump(done, end);
+                    }
+                    None => {
+                        // a ?: b — a evaluated once
+                        self.ops.push(Op::Dup);
+                        let fp = self.ops.len();
+                        self.ops.push(Op::JmpIfFalse(0));
+                        let done = self.ops.len();
+                        self.ops.push(Op::Jmp(0));
+                        let fh = self.here();
+                        self.patch_jump(fp, fh);
+                        self.ops.push(Op::Pop);
+                        self.expr(els)?;
+                        let end = self.here();
+                        self.patch_jump(done, end);
+                    }
+                }
+            }
+            Expr::Assign(..) | Expr::AssignOp(..) => {
+                // value-position assignment: compile the store, then reload
+                match e {
+                    Expr::Assign(lhs, _) | Expr::AssignOp(_, lhs, _) => {
+                        let n = match &**lhs {
+                            Expr::Var(n) => n.clone(),
+                            _ => return None,
+                        };
+                        self.expr_stmt(e)?;
+                        let s = self.slot(&n)?;
+                        self.ops.push(Op::LoadQuiet(s));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Expr::PreInc(v) | Expr::PreDec(v) => {
+                let op = if matches!(e, Expr::PreInc(_)) { BinOp::Add } else { BinOp::Sub };
+                let n = match &**v {
+                    Expr::Var(n) => n.clone(),
+                    _ => return None,
+                };
+                self.inc_dec_stmt(v, op)?;
+                let s = self.slot(&n)?;
+                self.ops.push(Op::LoadQuiet(s));
+            }
+            Expr::PostInc(v) | Expr::PostDec(v) => {
+                let op = if matches!(e, Expr::PostInc(_)) { BinOp::Add } else { BinOp::Sub };
+                let s = match &**v {
+                    Expr::Var(n) => self.slot(n)?,
+                    _ => return None,
+                };
+                let one = self.konst(Value::Int(1))?;
+                self.ops.push(Op::LoadQuiet(s)); // old value (result)
+                self.ops.push(Op::Dup);
+                self.ops.push(Op::Const(one));
+                self.ops.push(Op::Bin(op));
+                self.ops.push(Op::Store(s));
+            }
+            Expr::Index(base, Some(i)) => {
+                let s = match &**base {
+                    Expr::Var(n) => self.slot(n)?,
+                    _ => return None,
+                };
+                self.expr(i)?;
+                self.ops.push(Op::LoadIndex(s));
+            }
+            Expr::Isset(items) => {
+                // all-vars subset
+                if items.len() != 1 {
+                    return None;
+                }
+                match &items[0] {
+                    Expr::Var(n) => {
+                        let s = self.slot(n)?;
+                        self.ops.push(Op::IssetSlot(s));
+                    }
+                    _ => return None,
+                }
+            }
+            Expr::Empty(inner) => match &**inner {
+                Expr::Var(n) => {
+                    let s = self.slot(n)?;
+                    self.ops.push(Op::LoadQuiet(s));
+                    self.ops.push(Op::Not);
+                }
+                _ => return None,
+            },
+            Expr::Cast(t, inner) => {
+                self.expr(inner)?;
+                match t {
+                    CastType::Int => self.ops.push(Op::CastInt),
+                    CastType::Float => self.ops.push(Op::CastFloat),
+                    CastType::String => self.ops.push(Op::CastString),
+                    CastType::Bool => self.ops.push(Op::CastBool),
+                    _ => return None,
+                }
+            }
+            Expr::ConstFetch(n) => {
+                if n.parts.len() != 1 {
+                    return None;
+                }
+                let bare = n.last();
+                match bare.to_ascii_lowercase().as_str() {
+                    "true" => {
+                        let k = self.konst(Value::Bool(true))?;
+                        self.ops.push(Op::Const(k));
+                    }
+                    "false" => {
+                        let k = self.konst(Value::Bool(false))?;
+                        self.ops.push(Op::Const(k));
+                    }
+                    "null" => {
+                        let k = self.konst(Value::Null)?;
+                        self.ops.push(Op::Const(k));
+                    }
+                    _ => {
+                        let ni = self.name(bare)?;
+                        self.ops.push(Op::ConstLookup(ni));
+                    }
+                }
+            }
+            Expr::Call(callee, args) => {
+                let name = match &**callee {
+                    Expr::ConstFetch(n) if !n.fully_qualified && n.parts.len() == 1 => {
+                        n.last().to_ascii_lowercase()
+                    }
+                    _ => return None,
+                };
+                if BAIL_CALLS.contains(&name.as_str()) {
+                    return None;
+                }
+                if !matches!((self.resolver)(&name), CalleeKind::Safe) {
+                    return None;
+                }
+                if args.len() > u8::MAX as usize {
+                    return None;
+                }
+                for a in args {
+                    if a.spread || a.by_ref || a.name.is_some() {
+                        return None;
+                    }
+                    self.expr(&a.value)?;
+                }
+                let ni = self.name(&name)?;
+                self.ops.push(Op::CallFn { name: ni, argc: args.len() as u8 });
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+}

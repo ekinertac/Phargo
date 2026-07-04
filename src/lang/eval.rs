@@ -93,6 +93,10 @@ pub struct Eval {
     bc_scale: usize,
     /// strtok() resumable state: (subject, cursor).
     strtok_state: Option<(Vec<u8>, usize)>,
+    /// Path C mixed-mode: bytecode engine enabled (PHARGO_ENGINE=vm) and the
+    /// per-body compilation cache (body ptr → chunk, None = walker-only).
+    vm_enabled: bool,
+    vm_cache: HashMap<usize, Option<Rc<crate::lang::vm::Chunk>>>,
     /// (class, method) → resolved Rc'd declaration; cleared on class changes.
     method_cache: RefCell<HashMap<(String, String), Option<(String, Rc<MethodDecl>)>>>,
     /// `fn:<name>` / `class:<name>` (lowercase) → definition-site context.
@@ -2067,6 +2071,8 @@ impl Eval {
             use_map: HashMap::new(),
             bc_scale: 0,
             strtok_state: None,
+            vm_enabled: std::env::var("PHARGO_ENGINE").map(|v| v == "vm").unwrap_or(false),
+            vm_cache: HashMap::new(),
             method_cache: RefCell::new(HashMap::new()),
             def_ctx: HashMap::new(),
             frames: Vec::new(),
@@ -2325,7 +2331,15 @@ impl Eval {
         super::value::reset_object_ids();
         crate::pdo::reset();
         e.hoist(program);
-        match e.exec_block(program) {
+        let top_result = if e.vm_enabled {
+            match e.vm_chunk_for(program, true) {
+                Some(chunk) => e.run_chunk(&chunk, true).map(|_| Flow::Normal),
+                None => e.exec_block(program),
+            }
+        } else {
+            e.exec_block(program)
+        };
+        match top_result {
             Ok(_) => {
                 e.run_shutdown();
                 Ok(e.out)
@@ -4465,6 +4479,357 @@ impl Eval {
         php_const(n)
     }
 
+
+    // ---- Path C: bytecode interpreter (mixed-mode) ------------------------
+
+    /// Compile a body once (cached by AST address); None = walker-only.
+    fn vm_chunk_for(&mut self, body: &[Stmt], top_level: bool) -> Option<Rc<crate::lang::vm::Chunk>> {
+        let key = body.as_ptr() as usize;
+        if let Some(hit) = self.vm_cache.get(&key) {
+            return hit.clone();
+        }
+        // the resolver decides which callables a chunk may invoke by value
+        let funcs = &self.funcs;
+        let resolver = |name: &str| -> crate::lang::vm::CalleeKind {
+            if let Some(f) = funcs.get(name) {
+                if f.params.iter().any(|p| p.by_ref) {
+                    return crate::lang::vm::CalleeKind::Unsafe;
+                }
+                return crate::lang::vm::CalleeKind::Safe;
+            }
+            if is_known_builtin(name) {
+                return crate::lang::vm::CalleeKind::Safe;
+            }
+            crate::lang::vm::CalleeKind::Unsafe
+        };
+        let chunk = crate::lang::vm::Compiler::compile(body, top_level, &resolver).map(Rc::new);
+        self.vm_cache.insert(key, chunk.clone());
+        chunk
+    }
+
+    /// Run a compiled chunk. `sync_back` (top level) writes final slot values
+    /// back into the scope so includes/shutdown observe them.
+    fn run_chunk(&mut self, chunk: &Rc<crate::lang::vm::Chunk>, sync_back: bool) -> R<Value> {
+        use crate::lang::vm::Op;
+        let n = chunk.slot_names.len();
+        let mut slots: Vec<Value> = vec![Value::Null; n];
+        let mut assigned: Vec<bool> = vec![false; n];
+        for (i, name) in chunk.slot_names.iter().enumerate() {
+            if let Some(v) = self.vars().get(name) {
+                slots[i] = v.deref();
+                assigned[i] = true;
+            }
+        }
+        let r = self.run_chunk_inner(chunk, &mut slots, &mut assigned);
+        if sync_back {
+            for (i, name) in chunk.slot_names.iter().enumerate() {
+                if assigned[i] {
+                    let v = std::mem::replace(&mut slots[i], Value::Null);
+                    self.vars().insert(name.clone(), v);
+                }
+            }
+        }
+        r
+    }
+
+    fn run_chunk_inner(
+        &mut self,
+        chunk: &Rc<crate::lang::vm::Chunk>,
+        slots: &mut [Value],
+        assigned: &mut [bool],
+    ) -> R<Value> {
+        use crate::lang::vm::Op;
+        let ops = &chunk.ops;
+        let mut stack: Vec<Value> = Vec::with_capacity(16);
+        let mut iters: Vec<(Vec<(Key, Value)>, usize)> = Vec::new();
+        let mut pc: usize = 0;
+        let mut budget: u32 = 0;
+        macro_rules! pop {
+            () => {
+                stack.pop().unwrap_or(Value::Null)
+            };
+        }
+        loop {
+            budget += 1;
+            if budget >= 512 {
+                budget = 0;
+                self.tick()?;
+            }
+            let op = &ops[pc];
+            pc += 1;
+            match op {
+                Op::Const(i) => stack.push(chunk.consts[*i as usize].clone()),
+                Op::Load(i) => {
+                    let i = *i as usize;
+                    if !assigned[i] {
+                        self.warn(&format!("Undefined variable ${}", chunk.slot_names[i]))?;
+                    }
+                    stack.push(slots[i].clone());
+                }
+                Op::LoadQuiet(i) => stack.push(slots[*i as usize].clone()),
+                Op::Store(i) => {
+                    let i = *i as usize;
+                    slots[i] = pop!();
+                    assigned[i] = true;
+                }
+                Op::Dup => {
+                    let v = stack.last().cloned().unwrap_or(Value::Null);
+                    stack.push(v);
+                }
+                Op::Pop => {
+                    stack.pop();
+                }
+                Op::Bin(b) => {
+                    let r = pop!();
+                    let l = pop!();
+                    // integer fast paths: the loop-counter shapes that dominate
+                    // hot code, with overflow falling back to PHP's float rule
+                    if let (Value::Int(x), Value::Int(y)) = (&l, &r) {
+                        let (x, y) = (*x, *y);
+                        let fast = match b {
+                            BinOp::Add => Some(match x.checked_add(y) {
+                                Some(s) => Value::Int(s),
+                                None => Value::Float(x as f64 + y as f64),
+                            }),
+                            BinOp::Sub => Some(match x.checked_sub(y) {
+                                Some(s) => Value::Int(s),
+                                None => Value::Float(x as f64 - y as f64),
+                            }),
+                            BinOp::Mul => Some(match x.checked_mul(y) {
+                                Some(s) => Value::Int(s),
+                                None => Value::Float(x as f64 * y as f64),
+                            }),
+                            BinOp::Lt => Some(Value::Bool(x < y)),
+                            BinOp::Le => Some(Value::Bool(x <= y)),
+                            BinOp::Gt => Some(Value::Bool(x > y)),
+                            BinOp::Ge => Some(Value::Bool(x >= y)),
+                            BinOp::Eq | BinOp::Identical => Some(Value::Bool(x == y)),
+                            BinOp::NotEq | BinOp::NotIdentical => Some(Value::Bool(x != y)),
+                            _ => None,
+                        };
+                        if let Some(v) = fast {
+                            stack.push(v);
+                            continue;
+                        }
+                    }
+                    stack.push(self.apply_bin(*b, &l, &r)?);
+                }
+                Op::Not => {
+                    let v = pop!();
+                    stack.push(Value::Bool(!to_bool(&v)));
+                }
+                Op::Neg => {
+                    let v = pop!();
+                    stack.push(match v {
+                        Value::Int(n) => Value::Int(n.wrapping_neg()),
+                        Value::Float(f) => Value::Float(-f),
+                        other => self.apply_bin(BinOp::Sub, &Value::Int(0), &other)?,
+                    });
+                }
+                Op::IsNull => {
+                    let v = pop!();
+                    stack.push(Value::Bool(matches!(v, Value::Null)));
+                }
+                Op::IssetSlot(i) => {
+                    let i = *i as usize;
+                    stack.push(Value::Bool(assigned[i] && !matches!(slots[i], Value::Null)));
+                }
+                Op::UnsetSlot(i) => {
+                    let i = *i as usize;
+                    slots[i] = Value::Null;
+                    assigned[i] = false;
+                }
+                Op::Jmp(t) => pc = *t as usize,
+                Op::JmpIfFalse(t) => {
+                    let v = pop!();
+                    if !to_bool(&v) {
+                        pc = *t as usize;
+                    }
+                }
+                Op::JmpIfTrue(t) => {
+                    let v = pop!();
+                    if to_bool(&v) {
+                        pc = *t as usize;
+                    }
+                }
+                Op::CallFn { name, argc } => {
+                    let argc = *argc as usize;
+                    let at = stack.len() - argc;
+                    let argv: Vec<Value> = stack.split_off(at);
+                    let fname = &chunk.names[*name as usize];
+                    let r = if let Some(f) = self.funcs.get(fname).cloned() {
+                        self.call_user(&f, argv, None)?
+                    } else {
+                        self.builtin(fname, argv)?
+                    };
+                    stack.push(r);
+                }
+                Op::Echo(nvals) => {
+                    let nvals = *nvals as usize;
+                    let at = stack.len() - nvals;
+                    let vals: Vec<Value> = stack.split_off(at);
+                    for v in vals {
+                        let b = self.stringify(&v)?;
+                        self.out.extend_from_slice(&b);
+                    }
+                    if self.out.len() > MAX_OUTPUT {
+                        return Err(RunError("output limit exceeded".into()));
+                    }
+                }
+                Op::LoadIndexQuiet(i) | Op::LoadIndex(i) => {
+                    let checked = matches!(op, Op::LoadIndex(_));
+                    let kv = pop!();
+                    let k = Arr::norm_key(&kv);
+                    let i = *i as usize;
+                    let got = match &slots[i] {
+                        Value::Array(a) => a.get(&k).map(|v| v.deref()),
+                        Value::Str(s) => {
+                            // string offset read
+                            let idx = to_i64(&kv);
+                            let idx = if idx < 0 { s.len() as i64 + idx } else { idx };
+                            if idx >= 0 && (idx as usize) < s.len() {
+                                Some(Value::Str(vec![s[idx as usize]]))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    match got {
+                        Some(v) => stack.push(v),
+                        None => {
+                            if checked && matches!(slots[i], Value::Array(_)) {
+                                let msg = match &k {
+                                    Key::Int(n) => format!("Undefined array key {n}"),
+                                    Key::Str(s) => format!(
+                                        "Undefined array key \"{}\"",
+                                        String::from_utf8_lossy(s)
+                                    ),
+                                };
+                                self.warn(&msg)?;
+                            }
+                            stack.push(Value::Null);
+                        }
+                    }
+                }
+                Op::StoreIndex(i) => {
+                    let v = pop!();
+                    let kv = pop!();
+                    let k = Arr::norm_key(&kv);
+                    let i = *i as usize;
+                    if !matches!(slots[i], Value::Array(_)) {
+                        slots[i] = Value::Array(Arr::new());
+                    }
+                    assigned[i] = true;
+                    if let Value::Array(a) = &mut slots[i] {
+                        a.insert(k, v);
+                        if a.len() > MAX_ARRAY_NODES {
+                            return Err(self.throw_error("Error", "Allocated array exceeds memory limit"));
+                        }
+                    }
+                }
+                Op::Append(i) => {
+                    let v = pop!();
+                    let i = *i as usize;
+                    if !matches!(slots[i], Value::Array(_)) {
+                        slots[i] = Value::Array(Arr::new());
+                    }
+                    assigned[i] = true;
+                    if let Value::Array(a) = &mut slots[i] {
+                        a.push(v);
+                        if a.len() > MAX_ARRAY_NODES {
+                            return Err(self.throw_error("Error", "Allocated array exceeds memory limit"));
+                        }
+                    }
+                }
+                Op::CastInt => {
+                    let v = pop!();
+                    stack.push(Value::Int(to_i64(&v)));
+                }
+                Op::CastFloat => {
+                    let v = pop!();
+                    stack.push(Value::Float(to_f64(&v)));
+                }
+                Op::CastString => {
+                    let v = pop!();
+                    let b = self.stringify(&v)?;
+                    stack.push(Value::Str(b));
+                }
+                Op::CastBool => {
+                    let v = pop!();
+                    stack.push(Value::Bool(to_bool(&v)));
+                }
+                Op::IterInit { slot, end } => {
+                    let i = *slot as usize;
+                    match &slots[i] {
+                        Value::Array(a) => {
+                            iters.push((a.entries.clone(), 0));
+                        }
+                        other => {
+                            let t = self.given_type(other);
+                            self.warn(&format!(
+                                "foreach() argument must be of type array|object, {t} given"
+                            ))?;
+                            pc = *end as usize;
+                        }
+                    }
+                }
+                Op::IterNext { val_slot, key_slot, end } => {
+                    let (entries, idx) = iters.last_mut().expect("iter underflow");
+                    if *idx < entries.len() {
+                        let (k, v) = &entries[*idx];
+                        *idx += 1;
+                        let vi = *val_slot as usize;
+                        slots[vi] = v.deref();
+                        assigned[vi] = true;
+                        if *key_slot != u16::MAX {
+                            let ki = *key_slot as usize;
+                            slots[ki] = akey_to_value(k);
+                            assigned[ki] = true;
+                        }
+                    } else {
+                        iters.pop();
+                        pc = *end as usize;
+                    }
+                }
+                Op::PopIter => {
+                    iters.pop();
+                }
+                Op::Line(l) => self.cur_line = *l,
+                Op::Ret => return Ok(pop!()),
+                Op::RetNull => return Ok(Value::Null),
+                Op::ConcatAssign(i) => {
+                    let rhs = pop!();
+                    let b = self.stringify(&rhs)?;
+                    let i = *i as usize;
+                    if let Value::Str(s) = &mut slots[i] {
+                        if s.len() + b.len() <= MAX_STR {
+                            s.extend_from_slice(&b);
+                        }
+                    } else {
+                        let mut s = to_bytes(&slots[i]);
+                        s.extend_from_slice(&b);
+                        slots[i] = Value::Str(s);
+                    }
+                    assigned[i] = true;
+                }
+                Op::ConstLookup(i) => {
+                    let name = &chunk.names[*i as usize];
+                    let n = Name { parts: vec![name.clone()], fully_qualified: false };
+                    match self.const_fetch(&n) {
+                        Some(v) => stack.push(v),
+                        None => {
+                            return Err(self.throw_error(
+                                "Error",
+                                &format!("Undefined constant \"{name}\""),
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ---- assignment targets --------------------------------------------
     fn assign_to(&mut self, target: &Expr, val: Value) -> R<()> {
         // plain assignment copies the VALUE — a Ref cell arriving here (from
@@ -5621,6 +5986,12 @@ impl Eval {
     }
 
     fn run_fn_body_inner(&mut self, body: &[Stmt]) -> R<Value> {
+        // Path C mixed-mode: run compiled bodies on the bytecode VM
+        if self.vm_enabled && !has_yield(body) {
+            if let Some(chunk) = self.vm_chunk_for(body, false) {
+                return self.run_chunk(&chunk, false);
+            }
+        }
         if has_yield(body) {
             let prev = self.gen_buf.take();
             let prev_nodes = self.gen_nodes;
@@ -11518,7 +11889,7 @@ fn display_class(name: &str) -> String {
 }
 
 /// PHP superglobals resolve to the global scope from any function scope.
-fn is_superglobal(name: &str) -> bool {
+pub(crate) fn is_superglobal(name: &str) -> bool {
     matches!(
         name,
         "GLOBALS" | "_SERVER" | "_GET" | "_POST" | "_REQUEST" | "_SESSION" | "_COOKIE" | "_ENV" | "_FILES"
