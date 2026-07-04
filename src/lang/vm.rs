@@ -120,6 +120,18 @@ pub enum Op {
     /// self/parent/static keywords. Non-lvalue args only (same by-ref rule
     /// as CallMethod).
     CallStatic { class: u16, method: u16, argc: u8 },
+    /// Chained index paths: keys are pushed left-to-right; navigation is
+    /// in place (never clones intermediate containers — the 48x rule).
+    /// depth = number of keys on the stack.
+    LoadPath { slot: u16, depth: u8 },
+    StorePath { slot: u16, depth: u8 },
+    AppendPath { slot: u16, depth: u8 },
+    LoadPathThisProp { name: u16, depth: u8 },
+    StorePathThisProp { name: u16, depth: u8 },
+    AppendPathThisProp { name: u16, depth: u8 },
+    /// Class constant CLS::NAME (self/parent/static keywords resolve like
+    /// the walker's resolve_class_name).
+    ClassConstOp { class: u16, name: u16 },
     /// Method call: stack holds receiver then argc args. Dispatches through
     /// Eval::call_method (same resolution/visibility path as the walker).
     /// Compile-time restriction keeps by-ref parameter semantics safe: no
@@ -165,11 +177,17 @@ pub struct Compiler<'a> {
     uses_this: bool,
 }
 
+enum PathRoot {
+    Slot(u16),
+    ThisProp(u16),
+}
+
 struct LoopCtx {
     continue_target: Option<u32>, // None until known (for/while post-parts)
     continue_patches: Vec<usize>,
     break_patches: Vec<usize>,
     iter_depth: usize,
+    is_switch: bool,
 }
 
 /// Builtins that must never be called from a chunk: by-ref out-params,
@@ -270,6 +288,22 @@ impl<'a> Compiler<'a> {
         None
     }
 
+    /// Decompose `$root[k1][k2]…` into its root and key expressions
+    /// (left-to-right). Roots: a local slot or `$this->prop`. The final
+    /// Option is None for the append position (`…[] =`).
+    fn index_path<'e>(&mut self, e: &'e Expr) -> Option<(PathRoot, Vec<&'e Expr>)> {
+        match e {
+            Expr::Index(base, Some(k)) => {
+                let (root, mut keys) = self.index_path(base)?;
+                keys.push(k);
+                Some((root, keys))
+            }
+            Expr::Var(n) if n != "this" => Some((PathRoot::Slot(self.slot(n)?), Vec::new())),
+            Expr::Prop(..) => Some((PathRoot::ThisProp(self.this_prop(e)?), Vec::new())),
+            _ => None,
+        }
+    }
+
     /// An expression that could act as a by-ref write-back target. Method
     /// calls refuse these as arguments (see Op::CallMethod).
     fn is_lvalue(e: &Expr) -> bool {
@@ -368,6 +402,7 @@ impl<'a> Compiler<'a> {
                     continue_patches: Vec::new(),
                     break_patches: Vec::new(),
                     iter_depth: self.iter_depth,
+                    is_switch: false,
                 });
                 self.block(body)?;
                 self.ops.push(Op::Jmp(start));
@@ -383,6 +418,7 @@ impl<'a> Compiler<'a> {
                     continue_patches: Vec::new(),
                     break_patches: Vec::new(),
                     iter_depth: self.iter_depth,
+                    is_switch: false,
                 });
                 self.block(body)?;
                 let cond_at = self.here();
@@ -416,6 +452,7 @@ impl<'a> Compiler<'a> {
                     continue_patches: Vec::new(),
                     break_patches: Vec::new(),
                     iter_depth: self.iter_depth,
+                    is_switch: false,
                 });
                 self.block(body)?;
                 let step_at = self.here();
@@ -459,6 +496,7 @@ impl<'a> Compiler<'a> {
                     continue_patches: Vec::new(),
                     break_patches: Vec::new(),
                     iter_depth: self.iter_depth,
+                    is_switch: false,
                 });
                 self.block(body)?;
                 self.ops.push(Op::Jmp(start));
@@ -473,6 +511,60 @@ impl<'a> Compiler<'a> {
                     _ => unreachable!(),
                 }
                 self.finish_loop(end, start);
+                Some(())
+            }
+            Stmt::Switch { subject, cases } => {
+                // subject into an anonymous temp slot, dispatch via loose Eq,
+                // bodies in order with PHP fall-through; break jumps to end
+                let tmp = self.slot(&format!("\x00switch{}", self.ops.len()))?;
+                self.expr(subject)?;
+                self.ops.push(Op::Store(tmp));
+                let mut body_patches: Vec<usize> = Vec::new(); // JmpIfTrue per case
+                let mut default_idx: Option<usize> = None;
+                for (i, c) in cases.iter().enumerate() {
+                    match &c.test {
+                        Some(t) => {
+                            self.ops.push(Op::LoadQuiet(tmp));
+                            self.expr(t)?;
+                            self.ops.push(Op::Bin(BinOp::Eq));
+                            body_patches.push(self.ops.len());
+                            self.ops.push(Op::JmpIfTrue(0));
+                        }
+                        None => {
+                            default_idx = Some(i);
+                            body_patches.push(usize::MAX); // placeholder
+                        }
+                    }
+                }
+                let dispatch_end = self.ops.len();
+                self.ops.push(Op::Jmp(0)); // to default body or end
+                self.loops.push(LoopCtx {
+                    continue_target: None,
+                    continue_patches: Vec::new(),
+                    break_patches: Vec::new(),
+                    iter_depth: self.iter_depth,
+                    is_switch: true,
+                });
+                let mut body_starts: Vec<u32> = Vec::new();
+                for c in cases {
+                    body_starts.push(self.here());
+                    self.block(&c.body)?;
+                }
+                let end = self.here();
+                for (i, p) in body_patches.iter().enumerate() {
+                    if *p != usize::MAX {
+                        self.patch_jump(*p, body_starts[i]);
+                    }
+                }
+                let default_target = default_idx.map(|i| body_starts[i]).unwrap_or(end);
+                self.patch_jump(dispatch_end, default_target);
+                let ctx = self.loops.pop().unwrap();
+                for p in ctx.break_patches {
+                    self.patch_jump(p, end);
+                }
+                if !ctx.continue_patches.is_empty() {
+                    return None;
+                }
                 Some(())
             }
             Stmt::Break(n) => {
@@ -492,6 +584,9 @@ impl<'a> Compiler<'a> {
             Stmt::Continue(n) => {
                 if *n != 1 {
                     return None;
+                }
+                if self.loops.last()?.is_switch {
+                    return None; // continue-in-switch targets the outer loop
                 }
                 let target = self.loops.last()?.continue_target;
                 match target {
@@ -543,33 +638,41 @@ impl<'a> Compiler<'a> {
                     Some(())
                 }
                 Expr::Index(base, idx) => {
-                    if let Some(p) = self.this_prop(base) {
-                        match idx {
-                            Some(i) => {
-                                self.expr(i)?;
-                                self.expr(rhs)?;
-                                self.ops.push(Op::StoreIndexThisProp(p));
-                            }
-                            None => {
-                                self.expr(rhs)?;
-                                self.ops.push(Op::AppendThisProp(p));
-                            }
-                        }
-                        return Some(());
+                    // decompose into root + full key path; idx None = append
+                    let (root, keys) = self.index_path(base)?;
+                    let mut depth = keys.len();
+                    if keys.len() > u8::MAX as usize {
+                        return None;
                     }
-                    let s = match &**base {
-                        Expr::Var(n) => self.slot(n)?,
-                        _ => return None,
-                    };
-                    match idx {
-                        Some(i) => {
-                            self.expr(i)?;
-                            self.expr(rhs)?;
-                            self.ops.push(Op::StoreIndex(s));
+                    for k in &keys {
+                        self.expr(k)?;
+                    }
+                    if let Some(i) = idx {
+                        self.expr(i)?;
+                        depth += 1;
+                    }
+                    self.expr(rhs)?;
+                    let d = depth as u8;
+                    match (root, idx.is_some(), d) {
+                        (PathRoot::Slot(s), true, 1) => self.ops.push(Op::StoreIndex(s)),
+                        (PathRoot::ThisProp(p), true, 1) => {
+                            self.ops.push(Op::StoreIndexThisProp(p))
                         }
-                        None => {
-                            self.expr(rhs)?;
-                            self.ops.push(Op::Append(s));
+                        (PathRoot::Slot(s), false, 0) => self.ops.push(Op::Append(s)),
+                        (PathRoot::ThisProp(p), false, 0) => {
+                            self.ops.push(Op::AppendThisProp(p))
+                        }
+                        (PathRoot::Slot(s), true, d) => {
+                            self.ops.push(Op::StorePath { slot: s, depth: d })
+                        }
+                        (PathRoot::ThisProp(p), true, d) => {
+                            self.ops.push(Op::StorePathThisProp { name: p, depth: d })
+                        }
+                        (PathRoot::Slot(s), false, d) => {
+                            self.ops.push(Op::AppendPath { slot: s, depth: d })
+                        }
+                        (PathRoot::ThisProp(p), false, d) => {
+                            self.ops.push(Op::AppendPathThisProp { name: p, depth: d })
                         }
                     }
                     Some(())
@@ -937,18 +1040,24 @@ impl<'a> Compiler<'a> {
                 self.ops.push(Op::Bin(op));
                 self.ops.push(Op::Store(s));
             }
-            Expr::Index(base, Some(i)) => {
-                if let Some(p) = self.this_prop(base) {
-                    self.expr(i)?;
-                    self.ops.push(Op::LoadIndexThisProp(p));
-                    return Some(());
+            Expr::Index(..) => {
+                let (root, keys) = self.index_path(e)?;
+                if keys.is_empty() || keys.len() > u8::MAX as usize {
+                    return None;
                 }
-                let s = match &**base {
-                    Expr::Var(n) => self.slot(n)?,
-                    _ => return None,
-                };
-                self.expr(i)?;
-                self.ops.push(Op::LoadIndex(s));
+                for k in &keys {
+                    self.expr(k)?;
+                }
+                match (root, keys.len()) {
+                    (PathRoot::Slot(s), 1) => self.ops.push(Op::LoadIndex(s)),
+                    (PathRoot::ThisProp(p), 1) => self.ops.push(Op::LoadIndexThisProp(p)),
+                    (PathRoot::Slot(s), d) => {
+                        self.ops.push(Op::LoadPath { slot: s, depth: d as u8 })
+                    }
+                    (PathRoot::ThisProp(p), d) => {
+                        self.ops.push(Op::LoadPathThisProp { name: p, depth: d as u8 })
+                    }
+                }
             }
             Expr::Isset(items) => {
                 // each item compiles to a bool; multiple items AND-chain with
@@ -1016,6 +1125,17 @@ impl<'a> Compiler<'a> {
                     CastType::Bool => self.ops.push(Op::CastBool),
                     _ => return None,
                 }
+            }
+            Expr::ClassConst(class, cname) if cname != "class" => {
+                let raw = match &**class {
+                    Expr::ConstFetch(n) if !n.fully_qualified && n.parts.len() == 1 => {
+                        n.last().to_string()
+                    }
+                    _ => return None,
+                };
+                let ci = self.name(&raw)?;
+                let ni = self.name(cname)?;
+                self.ops.push(Op::ClassConstOp { class: ci, name: ni });
             }
             Expr::ConstFetch(n) => {
                 if n.parts.len() != 1 {

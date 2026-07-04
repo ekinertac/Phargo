@@ -4858,6 +4858,92 @@ impl Eval {
                     }
                     assigned[i] = true;
                 }
+                Op::LoadPath { slot, depth } | Op::LoadPathThisProp { name: slot, depth } => {
+                    let d = *depth as usize;
+                    let at = stack.len() - d;
+                    let keys: Vec<Key> = stack.split_off(at).iter().map(Arr::norm_key).collect();
+                    let is_prop = matches!(op, crate::lang::vm::Op::LoadPathThisProp { .. });
+                    let v = if is_prop {
+                        let name = &chunk.names[*slot as usize];
+                        this_rc
+                            .as_ref()
+                            .and_then(|rc| {
+                                let b = rc.borrow();
+                                b.get(name).map(|base| read_index_value(base, &keys))
+                            })
+                            .unwrap_or(Value::Null)
+                    } else {
+                        read_index_value(&slots[*slot as usize], &keys)
+                    };
+                    stack.push(v);
+                }
+                Op::StorePath { slot, depth }
+                | Op::AppendPath { slot, depth }
+                | Op::StorePathThisProp { name: slot, depth }
+                | Op::AppendPathThisProp { name: slot, depth } => {
+                    let v = pop!();
+                    let d = *depth as usize;
+                    let at = stack.len() - d;
+                    let keys: Vec<Key> = stack.split_off(at).iter().map(Arr::norm_key).collect();
+                    let append = matches!(
+                        op,
+                        crate::lang::vm::Op::AppendPath { .. }
+                            | crate::lang::vm::Op::AppendPathThisProp { .. }
+                    );
+                    let is_prop = matches!(
+                        op,
+                        crate::lang::vm::Op::StorePathThisProp { .. }
+                            | crate::lang::vm::Op::AppendPathThisProp { .. }
+                    );
+                    if is_prop {
+                        if let Some(rc) = this_rc {
+                            let name = &chunk.names[*slot as usize];
+                            let mut b = rc.borrow_mut();
+                            if !matches!(b.get(name), Some(Value::Array(_))) {
+                                b.set(name, Value::Array(Arr::new()));
+                            }
+                            if let Some(Value::Array(a)) = b.get_mut(name) {
+                                write_index_path(a, &keys, v, append);
+                            }
+                        }
+                    } else {
+                        let i = *slot as usize;
+                        if !matches!(slots[i], Value::Array(_)) {
+                            slots[i] = Value::Array(Arr::new());
+                        }
+                        assigned[i] = true;
+                        if let Value::Array(a) = &mut slots[i] {
+                            write_index_path(a, &keys, v, append);
+                            if a.len() > MAX_ARRAY_NODES {
+                                return Err(self.throw_error("Error", "Allocated array exceeds memory limit"));
+                            }
+                        }
+                    }
+                }
+                Op::ClassConstOp { class, name } => {
+                    let raw = chunk.names[*class as usize].clone();
+                    let cname = match raw.to_ascii_lowercase().as_str() {
+                        "self" => self.current_class.clone().unwrap_or(raw),
+                        "static" => self
+                            .called_class
+                            .clone()
+                            .or_else(|| self.current_class.clone())
+                            .unwrap_or(raw),
+                        "parent" => {
+                            let cur = self.current_class.clone().unwrap_or_default();
+                            self.find_class(&cur)
+                                .and_then(|c| c.parent.as_ref().map(|p| p.parts.join("\\")))
+                                .unwrap_or(cur)
+                        }
+                        _ => {
+                            let n = Name { parts: vec![raw.clone()], fully_qualified: false };
+                            self.resolve_ns_class(&n)
+                        }
+                    };
+                    let cn = chunk.names[*name as usize].clone();
+                    let v = self.class_const(&cname, &cn)?;
+                    stack.push(v);
+                }
                 Op::NewArr => stack.push(Value::Array(Arr::new())),
                 Op::ArrPush => {
                     let v = pop!();
@@ -12116,6 +12202,39 @@ fn trim_bytes(s: &[u8], left: bool, right: bool) -> Vec<u8> {
         }
     }
     s[start..end].to_vec()
+}
+
+/// Write through a key path, creating intermediate arrays as PHP does
+/// (non-array intermediates are replaced, matching assign_index). The final
+/// step inserts or appends. In place — no container clones.
+fn write_index_path(root: &mut Arr, keys: &[Key], val: Value, append: bool) {
+    if keys.is_empty() {
+        if append {
+            root.push(val);
+        }
+        return;
+    }
+    let mut cur: &mut Arr = root;
+    for k in &keys[..keys.len() - 1] {
+        if !matches!(cur.get(k), Some(Value::Array(_))) {
+            cur.insert(k.clone(), Value::Array(Arr::new()));
+        }
+        match cur.get_mut(k) {
+            Some(Value::Array(a)) => cur = a,
+            _ => return,
+        }
+    }
+    let last = &keys[keys.len() - 1];
+    if append {
+        if !matches!(cur.get(last), Some(Value::Array(_))) {
+            cur.insert(last.clone(), Value::Array(Arr::new()));
+        }
+        if let Some(Value::Array(a)) = cur.get_mut(last) {
+            a.push(val);
+        }
+    } else {
+        cur.insert(last.clone(), val);
+    }
 }
 
 /// Navigate a value by a sequence of already-normalized keys (array/string).
