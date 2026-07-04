@@ -2498,6 +2498,7 @@ impl Eval {
                     self.record_def_ctx(format!("class:{}", c.name.to_ascii_lowercase()), &ns, &uses);
                     self.classes.insert(c.name.to_ascii_lowercase(), Rc::new(c));
                     self.method_cache.borrow_mut().clear();
+                self.funcs_generation += 1;
                 }
                 _ => {}
             }
@@ -3015,6 +3016,7 @@ impl Eval {
                 self.record_def_ctx(format!("class:{}", c.name.to_ascii_lowercase()), &ns, &uses);
                 self.classes.insert(c.name.to_ascii_lowercase(), Rc::new(c));
                 self.method_cache.borrow_mut().clear();
+                self.funcs_generation += 1;
             }
             Stmt::Throw(e) => {
                 let v = self.eval(e)?;
@@ -4626,6 +4628,72 @@ impl Eval {
         r
     }
 
+    /// Fast method dispatch (see vm_fast_call): public untyped instance
+    /// methods on a compiled chunk, with $this and LSB scope bound directly.
+    #[allow(clippy::too_many_arguments)]
+    fn vm_fast_method(
+        &mut self,
+        recv: &Rc<RefCell<Obj>>,
+        decl_class: &str,
+        frame_name: &str,
+        m: &Rc<MethodDecl>,
+        cc: &Rc<crate::lang::vm::Chunk>,
+        mut argv: Vec<Value>,
+    ) -> R<Value> {
+        let np = cc.nparams as usize;
+        if argv.len() < np {
+            for i in argv.len()..np {
+                match &cc.param_defaults[i] {
+                    Some(d) => argv.push(d.clone()),
+                    None => {
+                        // exact error path through the walker
+                        return self.call_method(
+                            Value::Object(recv.clone()),
+                            &m.name,
+                            argv,
+                        );
+                    }
+                }
+            }
+        }
+        self.enter_call()?;
+        self.cur_fn.push(m.name.clone());
+        self.frames.push((frame_name.to_string(), self.cur_line, self.cur_file_str()));
+        let prev_df = if cc.needs_ctx {
+            self.enter_def_ctx(&format!("class:{}", decl_class.to_ascii_lowercase()))
+        } else {
+            None
+        };
+        let prev_class = self.current_class.replace(decl_class.to_string());
+        let prev_called = std::mem::replace(
+            &mut self.called_class,
+            Some(recv.borrow().class.clone()),
+        );
+        let n = cc.slot_names.len();
+        let mut slots: Vec<Value> = vec![Value::Null; n];
+        let mut assigned: Vec<bool> = vec![false; n];
+        for (i, v) in argv.into_iter().enumerate() {
+            if i >= np {
+                break;
+            }
+            slots[i] = if let Value::Ref(c) = &v { c.borrow().clone() } else { v };
+            assigned[i] = true;
+        }
+        let this = Some(recv.clone());
+        let r = self.run_chunk_inner(cc, &mut slots, &mut assigned, &this);
+        self.current_class = prev_class;
+        self.called_class = prev_called;
+        if let Some((pf, pns, puse)) = prev_df {
+            self.cur_file = pf;
+            self.cur_ns = pns;
+            self.use_map = puse;
+        }
+        self.cur_fn.pop();
+        self.frames.pop();
+        self.call_depth -= 1;
+        r
+    }
+
     fn run_chunk_inner(
         &mut self,
         chunk: &Rc<crate::lang::vm::Chunk>,
@@ -4801,7 +4869,9 @@ impl Eval {
                             let fname = &chunk.names[*name as usize];
                             self.builtin(fname, argv)?
                         }
-                        crate::lang::vm::Callee::Unresolved => unreachable!(),
+                        crate::lang::vm::Callee::Unresolved
+                        | crate::lang::vm::Callee::FastMethod { .. }
+                        | crate::lang::vm::Callee::SlowMethod { .. } => unreachable!(),
                     };
                     stack.push(r);
                 }
@@ -5209,11 +5279,109 @@ impl Eval {
                         }
                     }
                 }
-                Op::CallMethod { name, argc } => {
+                Op::CallMethod { name, argc, site } => {
                     let argc = *argc as usize;
                     let at = stack.len() - argc;
                     let argv: Vec<Value> = stack.split_off(at);
                     let recv = pop!();
+                    // monomorphic inline cache keyed on the receiver class
+                    let rclass = match &recv {
+                        Value::Object(rc) => Some(rc.borrow().class.to_ascii_lowercase()),
+                        _ => None,
+                    };
+                    if let (Some(rclass), Value::Object(rc)) = (rclass, &recv) {
+                        let cached = {
+                            let sites = chunk.sites.borrow();
+                            let m = &sites[*site as usize];
+                            if m.generation == self.funcs_generation {
+                                match &m.target {
+                                    crate::lang::vm::Callee::FastMethod { recv_class, .. }
+                                        if *recv_class == rclass =>
+                                    {
+                                        Some(m.target.clone())
+                                    }
+                                    crate::lang::vm::Callee::SlowMethod { recv_class }
+                                        if *recv_class == rclass =>
+                                    {
+                                        Some(m.target.clone())
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
+                        };
+                        let target = match cached {
+                            Some(t) => t,
+                            None => {
+                                let mname = &chunk.names[*name as usize];
+                                let t = match self.find_method(&rclass, mname) {
+                                    Some((decl_class, m))
+                                        if m.visibility == Visibility::Public
+                                            && m.body.is_some()
+                                            && !m.is_static
+                                            && m.ret_type.is_none()
+                                            && !m.by_ref_return
+                                            && !self
+                                                .prelude_classes
+                                                .contains(&decl_class.to_ascii_lowercase()) =>
+                                    {
+                                        match self.vm_chunk_for(
+                                            m.body.as_deref().unwrap_or(&[]),
+                                            false,
+                                            VmOwner::Method(m.clone()),
+                                        ) {
+                                            Some(cc) if cc.fast_callable => {
+                                                crate::lang::vm::Callee::FastMethod {
+                                                    recv_class: rclass.clone(),
+                                                    frame_name: format!(
+                                                        "{}->{}",
+                                                        display_class(&decl_class),
+                                                        m.name
+                                                    ),
+                                                    decl_class,
+                                                    decl: m,
+                                                    chunk: cc,
+                                                }
+                                            }
+                                            _ => crate::lang::vm::Callee::SlowMethod {
+                                                recv_class: rclass.clone(),
+                                            },
+                                        }
+                                    }
+                                    _ => crate::lang::vm::Callee::SlowMethod {
+                                        recv_class: rclass.clone(),
+                                    },
+                                };
+                                chunk.sites.borrow_mut()[*site as usize] =
+                                    crate::lang::vm::SiteMemo {
+                                        generation: self.funcs_generation,
+                                        target: t.clone(),
+                                    };
+                                t
+                            }
+                        };
+                        if let crate::lang::vm::Callee::FastMethod {
+                            decl_class,
+                            frame_name,
+                            decl,
+                            chunk: cc,
+                            ..
+                        } = target
+                        {
+                            let rc = rc.clone();
+                            let r = self.vm_fast_method(
+                                &rc,
+                                &decl_class,
+                                &frame_name,
+                                &decl,
+                                &cc,
+                                argv,
+                            )?;
+                            stack.push(r);
+                            continue;
+                        }
+                    }
                     let mname = chunk.names[*name as usize].clone();
                     let r = self.call_method(recv, &mname, argv)?;
                     stack.push(r);
@@ -7029,6 +7197,7 @@ impl Eval {
         }
         if loaded_any {
             self.method_cache.borrow_mut().clear();
+                self.funcs_generation += 1;
             return self.find_method(class, method);
         }
         None

@@ -138,7 +138,7 @@ pub enum Op {
     /// Compile-time restriction keeps by-ref parameter semantics safe: no
     /// argument may be an lvalue (methods can't be resolved statically, so a
     /// by-ref param writing back into a caller variable can't be honored).
-    CallMethod { name: u16, argc: u8 },
+    CallMethod { name: u16, argc: u8, site: u16 },
 }
 
 pub struct Chunk {
@@ -179,6 +179,18 @@ pub enum Callee {
     /// User function that must go through the walker's call machinery.
     Slow(std::rc::Rc<FuncDecl>),
     Builtin,
+    /// Monomorphic method cache: valid for receivers of exactly this class
+    /// (lowercase). frame_name is the precomputed "Class->method" label.
+    FastMethod {
+        recv_class: String,
+        decl_class: String,
+        frame_name: String,
+        decl: std::rc::Rc<MethodDecl>,
+        chunk: std::rc::Rc<Chunk>,
+    },
+    /// This class+method must use the walker's dispatch (visibility,
+    /// magic, typed params…); still keyed to the receiver class.
+    SlowMethod { recv_class: String },
 }
 
 /// What the compiler needs to know about a callable name, answered by the
@@ -936,7 +948,9 @@ impl<'a> Compiler<'a> {
                     self.expr(&a.value)?;
                 }
                 let ni = self.name(m)?;
-                self.ops.push(Op::CallMethod { name: ni, argc: args.len() as u8 });
+                let site = self.n_sites;
+                self.n_sites = self.n_sites.checked_add(1)?;
+                self.ops.push(Op::CallMethod { name: ni, argc: args.len() as u8, site });
             }
             Expr::Template(parts) => {
                 // concat chain; each part compiles then Concat-folds
