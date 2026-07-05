@@ -8184,7 +8184,17 @@ impl Eval {
         if m.body.is_none() {
             return Ok(Value::Null);
         }
-        self.check_method_sig(decl_class, &m.name, args.len())?;
+        // enforce only when the receiver IS the prelude class itself:
+        // subclasses may declare their own signatures (and a WP Requests
+        // exception exposed a resolution corner where a subclass ctor call
+        // landed on Exception::__construct and killed the page render)
+        let exact = match &recv {
+            Value::Object(rc) => rc.borrow().class.eq_ignore_ascii_case(decl_class),
+            _ => true,
+        };
+        if exact {
+            self.check_method_sig(decl_class, &m.name, args.len())?;
+        }
         self.enter_call()?;
         self.cur_args.push(Rc::new(args.clone()));
         self.cur_fn.push(m.name.clone());
