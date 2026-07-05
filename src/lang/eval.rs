@@ -6713,6 +6713,16 @@ impl Eval {
                 let joined = n.parts.join("\\").to_ascii_lowercase();
                 if n.fully_qualified {
                     joined
+                } else if n.parts.len() == 1
+                    && self
+                        .use_map
+                        .get(&last)
+                        .map(|fq| self.funcs.contains_key(&fq.to_ascii_lowercase()))
+                        .unwrap_or(false)
+                {
+                    // `use function A\B\f;` (incl. group form) aliases resolve
+                    // first for unqualified calls that match a known function
+                    self.use_map.get(&last).unwrap().to_ascii_lowercase()
                 } else if !self.cur_ns.is_empty()
                     && self.funcs.contains_key(&format!("{}\\{joined}", self.cur_ns).to_ascii_lowercase())
                 {

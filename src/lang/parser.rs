@@ -663,13 +663,57 @@ impl Parser {
         self.eat_kw("const");
         let mut items = Vec::new();
         loop {
-            let name = self.parse_name()?;
-            let alias = if self.eat_kw("as") {
-                Some(self.ident()?)
+            // parse the leading name manually so the group form
+            // `use A\B\{C, D as E, function f};` can branch at `\{`
+            let fq = self.eat(&Kind::Backslash);
+            let mut parts = Vec::new();
+            match self.bump() {
+                Kind::Ident(s) => parts.push(s),
+                other => return Err(self.errk("expected name", &other)),
+            }
+            let mut group = false;
+            while matches!(self.kind(), Kind::Backslash) {
+                self.bump();
+                match self.kind().clone() {
+                    Kind::Ident(s) => {
+                        self.bump();
+                        parts.push(s);
+                    }
+                    Kind::LBrace => {
+                        self.bump();
+                        group = true;
+                        break;
+                    }
+                    other => return Err(self.errk("expected name segment", &other)),
+                }
+            }
+            if group {
+                while !matches!(self.kind(), Kind::RBrace) {
+                    self.eat_kw("function");
+                    self.eat_kw("const");
+                    let mut sub = parts.clone();
+                    match self.bump() {
+                        Kind::Ident(s) => sub.push(s),
+                        other => return Err(self.errk("expected name", &other)),
+                    }
+                    while matches!(self.kind(), Kind::Backslash) {
+                        self.bump();
+                        match self.bump() {
+                            Kind::Ident(s) => sub.push(s),
+                            other => return Err(self.errk("expected name segment", &other)),
+                        }
+                    }
+                    let alias = if self.eat_kw("as") { Some(self.ident()?) } else { None };
+                    items.push(UseItem { name: Name { parts: sub, fully_qualified: fq }, alias });
+                    if !self.eat(&Kind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&Kind::RBrace)?;
             } else {
-                None
-            };
-            items.push(UseItem { name, alias });
+                let alias = if self.eat_kw("as") { Some(self.ident()?) } else { None };
+                items.push(UseItem { name: Name { parts, fully_qualified: fq }, alias });
+            }
             if !self.eat(&Kind::Comma) {
                 break;
             }
@@ -1853,7 +1897,17 @@ impl Parser {
                                 continue;
                             }
                         }
-                        e = Expr::StaticProp(Box::new(e), v);
+                        // C::$m(...) — dynamic static method call
+                        if matches!(self.kind(), Kind::LParen) {
+                            let args = self.parse_args()?;
+                            e = Expr::StaticCall(
+                                Box::new(e),
+                                PropName::Expr(Box::new(Expr::Var(v))),
+                                args,
+                            );
+                        } else {
+                            e = Expr::StaticProp(Box::new(e), v);
+                        }
                     } else if matches!(self.kind(), Kind::LBrace) {
                         self.bump();
                         let inner = self.expr()?;
