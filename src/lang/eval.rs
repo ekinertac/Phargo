@@ -3027,6 +3027,20 @@ impl Eval {
                             let o = self.eval(obj)?;
                             let pname = self.prop_name_str(name)?;
                             if let Value::Object(rc) = o {
+                                let class = rc.borrow().class.clone();
+                                // enum case props are readonly: unset throws
+                                if self
+                                    .find_class(&class)
+                                    .map(|c| c.kind == ClassKind::Enum)
+                                    .unwrap_or(false)
+                                {
+                                    return Err(self.throw_error(
+                                        "Error",
+                                        &format!(
+                                            "Cannot unset readonly property {class}::${pname}"
+                                        ),
+                                    ));
+                                }
                                 rc.borrow_mut().props.retain(|(k, _)| k != &pname);
                             }
                         }
@@ -11296,9 +11310,26 @@ impl Eval {
             "array_unique" => {
                 let mut out = Arr::new();
                 let mut seen: HashSet<Vec<u8>> = HashSet::new();
+                // objects without __toString can't string-compare — PHP
+                // (GH-9775) falls back to identity for them (enums in
+                // array_unique keep every distinct case)
+                let mut kept_objs: Vec<Value> = Vec::new();
                 if let Value::Array(arr) = a(0) {
                     for (k, v) in arr.into_entries() {
-                        if seen.insert(to_bytes(&v)) {
+                        let stringable = match &v {
+                            Value::Object(rc) => {
+                                let class = rc.borrow().class.clone();
+                                self.find_method(&class, "__tostring").is_some()
+                            }
+                            _ => true,
+                        };
+                        if stringable {
+                            let b = self.stringify(&v)?;
+                            if seen.insert(b) {
+                                out.insert(k, v);
+                            }
+                        } else if !kept_objs.iter().any(|o| strict_eq(o, &v)) {
+                            kept_objs.push(v.clone());
                             out.insert(k, v);
                         }
                     }
