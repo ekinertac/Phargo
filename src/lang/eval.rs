@@ -4156,10 +4156,10 @@ impl Eval {
                     }
                     return Ok(Value::Array(out));
                 }
-                num_arith(l, r, |a, b| a.wrapping_add(b), |a, b| a + b)
+                num_arith(l, r, |a, b| a.checked_add(b), |a, b| a + b)
             }
-            Sub => num_arith(l, r, |a, b| a.wrapping_sub(b), |a, b| a - b),
-            Mul => num_arith(l, r, |a, b| a.wrapping_mul(b), |a, b| a * b),
+            Sub => num_arith(l, r, |a, b| a.checked_sub(b), |a, b| a - b),
+            Mul => num_arith(l, r, |a, b| a.checked_mul(b), |a, b| a * b),
             Div => {
                 let rf = to_f64(r);
                 if rf == 0.0 {
@@ -14918,25 +14918,35 @@ fn string_char(s: &[u8], k: &Key) -> Value {
 }
 
 fn inc(v: &Value, by: i64) -> Value {
+    let step = |n: i64| match n.checked_add(by) {
+        Some(r) => Value::Int(r),
+        // ++ past the integer edge promotes to float, as PHP does
+        None => Value::Float(n as f64 + by as f64),
+    };
     match v {
-        Value::Int(n) => Value::Int(n + by),
+        Value::Int(n) => step(*n),
         Value::Float(f) => Value::Float(f + by as f64),
         Value::Null if by > 0 => Value::Int(1),
         Value::Null => Value::Null, // PHP: --$null stays null
         _ => match to_num(v) {
-            Num::Int(n) => Value::Int(n + by),
+            Num::Int(n) => step(n),
             Num::Float(f) => Value::Float(f + by as f64),
         },
     }
 }
 
-fn num_arith(l: &Value, r: &Value, fi: fn(i64, i64) -> i64, ff: fn(f64, f64) -> f64) -> Value {
+fn num_arith(
+    l: &Value,
+    r: &Value,
+    fi: fn(i64, i64) -> Option<i64>,
+    ff: fn(f64, f64) -> f64,
+) -> Value {
     match (to_num(l), to_num(r)) {
-        (Num::Int(a), Num::Int(b)) => {
-            // detect overflow for + - * by checking against float
-            let res = fi(a, b);
-            Value::Int(res)
-        }
+        (Num::Int(a), Num::Int(b)) => match fi(a, b) {
+            Some(res) => Value::Int(res),
+            // integer overflow promotes to float, as PHP does
+            None => Value::Float(ff(a as f64, b as f64)),
+        },
         (a, b) => Value::Float(ff(a.as_f64(), b.as_f64())),
     }
 }

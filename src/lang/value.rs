@@ -483,15 +483,32 @@ fn loose_eq_d(a: &Value, b: &Value, depth: usize) -> bool {
         (Bool(_), _) | (_, Bool(_)) => to_bool(a) == to_bool(b),
         (Null, _) => !to_bool(b) && matches!(b, Null | Bool(false)) || is_nullish(b),
         (_, Null) => loose_eq_d(b, a, depth),
+        // Int/Int compares EXACTLY — a round trip through f64 collapses
+        // values near ±2^63 (operator_equals_variation_64bit)
+        (Int(x), Int(y)) => x == y,
         (Int(_) | Float(_), Int(_) | Float(_)) => to_f64(a) == to_f64(b),
         (Str(x), Str(y)) => {
             if is_numeric_str(x) && is_numeric_str(y) {
-                to_f64(a) == to_f64(b)
+                // integral strings compare exactly (f64 collapses ±2^63)
+                match (int_str(x), int_str(y)) {
+                    (Some(ix), Some(iy)) => ix == iy,
+                    _ => to_f64(a) == to_f64(b),
+                }
             } else {
                 x == y
             }
         }
-        (Int(_) | Float(_), Str(s)) | (Str(s), Int(_) | Float(_)) => {
+        (Int(i), Str(s)) | (Str(s), Int(i)) => {
+            if is_numeric_str(s) {
+                match int_str(s) {
+                    Some(is) => *i == is,
+                    None => to_f64(a) == to_f64(b),
+                }
+            } else {
+                to_bytes(a) == to_bytes(b)
+            }
+        }
+        (Float(_), Str(s)) | (Str(s), Float(_)) => {
             // PHP 8: number vs non-numeric string compares as strings
             if is_numeric_str(s) {
                 to_f64(a) == to_f64(b)
@@ -556,6 +573,16 @@ pub fn strict_eq(a: &Value, b: &Value) -> bool {
 }
 
 /// Three-way comparison (`<=>`), PHP semantics.
+/// Parse a numeric string as an exact i64 when it is integral and in range
+/// (no fraction/exponent, no overflow). None → caller falls back to f64.
+fn int_str(s: &[u8]) -> Option<i64> {
+    let t = std::str::from_utf8(s).ok()?.trim();
+    if t.is_empty() || t.contains(['.', 'e', 'E']) {
+        return None;
+    }
+    t.parse::<i64>().ok()
+}
+
 pub fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     use Value::*;
@@ -563,12 +590,23 @@ pub fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
         return compare(&a.deref(), &b.deref());
     }
     match (a, b) {
+        // exact integer ordering (f64 round trips collapse near ±2^63)
+        (Int(x), Int(y)) => x.cmp(y),
         (Str(x), Str(y)) => {
             if is_numeric_str(x) && is_numeric_str(y) {
-                to_f64(a).partial_cmp(&to_f64(b)).unwrap_or(Ordering::Equal)
+                match (int_str(x), int_str(y)) {
+                    (Some(ix), Some(iy)) => ix.cmp(&iy),
+                    _ => to_f64(a).partial_cmp(&to_f64(b)).unwrap_or(Ordering::Equal),
+                }
             } else {
                 x.cmp(y)
             }
+        }
+        (Int(i), Str(s)) if is_numeric_str(s) && int_str(s).is_some() => {
+            i.cmp(&int_str(s).unwrap())
+        }
+        (Str(s), Int(i)) if is_numeric_str(s) && int_str(s).is_some() => {
+            int_str(s).unwrap().cmp(i)
         }
         (Array(x), Array(y)) => x.len().cmp(&y.len()),
         (Bool(_), _) | (_, Bool(_)) | (Null, _) | (_, Null) => {

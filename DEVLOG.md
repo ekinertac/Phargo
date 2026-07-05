@@ -27,6 +27,24 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-08 — The reverse diff pays twice.
+
+**The 24 tests that passed only under the VM were walker bugs — in the
+SHARED value kernels.** `Int == Int` compared through f64 (collapsing
+values near ±2^63), ordering did the same, int-vs-integral-string went
+through floats, `+`/`-`/`*` wrapped on overflow instead of promoting to
+float like PHP, and `++` at the integer edge wrapped too. Fixing the
+kernels lifted BOTH engines: walker 3843 → 3866 (+23), VM 3866 → 3873.
+The engines now differ by 7 tests, all understood (evaluation-order
+corners where the VM matches PHP and the walker doesn't — points for the
+cutover column).
+
+Also from a user report: our debug_backtrace() was a stub returning [],
+which made Requests' InvalidArgument::create warn right onto rendered
+pages. It now emits real frames (file/line/function/class/type) from the
+frame stack, honoring the limit argument. Exception messages that embed
+caller context finally carry it.
+
 ## 2026-07-07 (later) — The parity hunt: 69 regressions, 12 bug classes, and an inversion.
 
 **The VM went from 44 tests BEHIND the walker to 23 tests AHEAD (3866 vs
