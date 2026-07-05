@@ -27,7 +27,32 @@ you would never think to write a test for.
 
 ---
 
-## 2026-07-09 — PHP 8's strictness, generated from PHP itself.
+## 2026-07-09 (later) — enum(Foo::Bar), and the panic that ate a scoreboard.
+
+**Walker 3894 → 3928, VM 3901 → 3922.** Three rungs in one batch, found
+by a new failure classifier (run N failing tests, tally the first
+divergent line, sort by count):
+
+- `var_dump(Suit::Hearts)` prints `enum(Suit::Hearts)`, not an object
+  dump — one special case in var_dump, a dozen-plus tests.
+- Enum declaration rules now fatal exactly like PHP (texts verified
+  against `php -n`): no properties, backed cases must / non-backed
+  cases must-not carry values, backing type is int|string only,
+  UnitEnum/BackedEnum aren't implementable, `new` on an enum throws.
+  Note for the corpus: our php-src checkout predates 8.5's
+  stack-traces-on-fatals, so `decl_fatal` deliberately emits the
+  traceless form.
+- Method-arity strictness for emulated classes (METHOD_SIGS) landed
+  after a lesson: the first attempt cost 32 date tests because the
+  PRELUDE calls its own classes with internal conventions — a
+  prelude_depth counter now scopes enforcement to user call sites.
+
+The classifier itself earned its keep before reporting anything: it
+died on `number_format(1.5, PHP_INT_MAX)` — Rust float formatting
+panics past ~65k precision, and that panic had been silently killing
+whole in-process runs. First clamp (512) broke two tests that pad
+2,700 zeros on purpose; 50k covers everything with margin. The corpus
+tests both directions of the same argument.
 
 **VM 3875 → 3894: internal-function argument strictness, driven by a
 signature table PHP wrote for us.** A `gensigs.php` script reflects
