@@ -8075,13 +8075,14 @@ impl Eval {
     /// read `static::$default_delimiter` as NULL → strlen 0 → infinite loop).
     fn static_prop_key(&mut self, cname: &str, name: &str) -> R<(String, String)> {
         let chain = self.ancestry(cname);
+        // per class, derived-first: existing storage OR own declaration wins.
+        // (Two separate passes let a parent's already-initialized storage
+        // shadow a child's OWN redeclared static — property_override tests.)
         for c in &chain {
             let key = (c.name.to_ascii_lowercase(), name.to_string());
             if self.static_props.contains_key(&key) {
                 return Ok(key);
             }
-        }
-        for c in &chain {
             if let Some(p) = c.props.iter().find(|p| p.is_static && p.name == name) {
                 let key = (c.name.to_ascii_lowercase(), name.to_string());
                 // defaults may reference `self::CONST` or use-aliased classes
