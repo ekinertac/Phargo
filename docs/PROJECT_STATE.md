@@ -226,7 +226,28 @@ now edges the VM on the page — top-level slot sync is the VM's visible
 remaining overhead. `$a[] = $a` still snapshots (pending value holds a
 handle → make_mut splits before push; no Rc cycles).
 
-**UPDATE (2026-07-05): "Hello world!" RENDERS.** Named SQL parameters now
+**UPDATE (2026-07-11, corpus climb): walker 4016 / VM 4022 (18.3% of
+gradeable); the goal line is 20% (4394).** Batches since COW, all
+committed with dual-board evidence: PHP-8 builtin argument strictness
+from a reflected signature table (gensigs.php → builtin_sigs.rs:
+ArgumentCountError/TypeError/null-deprecation; Exception-family ctor
+rows deliberately absent — the namespace fallback can land WP's
+Requests exception on prelude Exception); method arity for emulated
+classes (user call sites only, via prelude_depth); enum var_dump
+format + decl fatals + E: serialization with singleton identity + case
+props readonly + implicitly final; PHP 8.4 property hooks (synthetic
+__hook_get_/__hook_set_ methods, reentrancy guard for backing access,
+VM ThisProp gating, decl fatals AT HOIST TIME — exec-time checks
+diverge under the VM which compiles hoisted decls to no-ops);
+b"..."-prefix strings; dynamic static calls C::$m(); group use +
+use-function aliases; ReflectionClass flags via __phargo_class_flag;
+child-redeclared static props get own storage; is_countable;
+unserialize allowed_classes/__PHP_Incomplete_Class. Known-flaky:
+ext/date/bug73837 busy-loops 2 wall-clock seconds and oscillates
+around the step limit. Remaining mapped veins: lazy_objects (224),
+hooks deep semantics (~65), enum reflection (~50), date micros (~30),
+fibers (110, needs VM frames). The tail is now genuinely long — the
+classifier (examples/xxx_dtscan.rs) is the pick-the-next-rung tool.** Named SQL parameters now
 bind via rusqlite raw_bind_parameter/parameter_index (the PDO prelude's
 bindValue had cast ":param0" to int 0; execute() flattened assoc arrays).
 The front page is a full 26 KB twentytwentyfive page with the post title,
