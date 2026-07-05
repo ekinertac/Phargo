@@ -217,6 +217,15 @@ Vec::clone). Next rung: copy-on-write `Arr` (Rc<ArrData> + make_mut,
 ~110 direct `.entries` sites) — lifts BOTH engines and probably some
 OOM/step-limit corpus fails too.**
 
+**UPDATE (2026-07-08, later): COW LANDED — WP FRONT PAGE 772 ms, GOAL
+HIT.** `Arr` = `Rc<ArrData>` + `Rc::make_mut` on all mutators; clone =
+Rc bump; `entries` privatized behind entries()/entries_mut()/
+into_entries()/take_entries() (+ pos()/set_pos). Page 7.3 s → 0.77 s
+(walker) / 0.82 s (VM); micro suite 1065 → 813 ms walker-side. Walker
+now edges the VM on the page — top-level slot sync is the VM's visible
+remaining overhead. `$a[] = $a` still snapshots (pending value holds a
+handle → make_mut splits before push; no Rc cycles).
+
 **UPDATE (2026-07-05): "Hello world!" RENDERS.** Named SQL parameters now
 bind via rusqlite raw_bind_parameter/parameter_index (the PDO prelude's
 bindValue had cast ":param0" to int 0; execute() flattened assoc arrays).

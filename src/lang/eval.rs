@@ -2202,7 +2202,7 @@ impl Eval {
             }
             if let Some(Value::Array(kids)) = arr.get(&Key::Str(b"kids".to_vec())) {
                 let kids = kids.clone();
-                for (_, kid) in &kids.entries {
+                for (_, kid) in kids.entries() {
                     self.xml_sax_walk(parser, kid, fold)?;
                 }
             }
@@ -2235,7 +2235,7 @@ impl Eval {
             }
             Value::Array(a) => {
                 out.extend_from_slice(format!("a:{}:{{", a.len()).as_bytes());
-                let entries = a.entries.clone();
+                let entries = a.entries().to_vec();
                 for (k, val) in &entries {
                     self.ser_key(k, out);
                     self.ser_val(val, out, depth + 1)?;
@@ -2251,7 +2251,7 @@ impl Eval {
                         out.extend_from_slice(
                             format!("O:{}:\"{}\":{}:{{", class.len(), class, a.len()).as_bytes(),
                         );
-                        let entries = a.entries.clone();
+                        let entries = a.entries().to_vec();
                         for (k, val) in &entries {
                             self.ser_key(k, out);
                             self.ser_val(val, out, depth + 1)?;
@@ -2298,7 +2298,7 @@ impl Eval {
         }
         match v {
             Value::Array(a) => {
-                let vals: Vec<Value> = a.entries.iter().map(|(_, x)| x.clone()).collect();
+                let vals: Vec<Value> = a.entries().iter().map(|(_, x)| x.clone()).collect();
                 for x in vals {
                     self.apply_wakeup(&x, depth + 1)?;
                 }
@@ -2859,7 +2859,7 @@ impl Eval {
                 }
                 match arr {
                     Value::Array(a) => {
-                        for (k, v) in a.entries.clone() {
+                        for (k, v) in a.entries().to_vec() {
                             if let Some(f) = self.foreach_step(key, value, body, Some(akey_to_value(&k)), v)? {
                                 return Ok(f);
                             }
@@ -3310,7 +3310,7 @@ impl Eval {
         body: &[Stmt],
     ) -> R<Flow> {
         let keys: Vec<Key> = match self.with_place_mut(place, |a| {
-            a.entries.iter().map(|(k, _)| k.clone()).collect()
+            a.entries().iter().map(|(k, _)| k.clone()).collect()
         }) {
             Some(ks) => ks,
             None => return Ok(Flow::Normal),
@@ -3336,13 +3336,13 @@ impl Eval {
                         break;
                     }
                     let fresh: Vec<Key> = match self.with_place_mut(place, |a| {
-                        let start = scan_pos.min(a.entries.len());
-                        let f: Vec<Key> = a.entries[start..]
+                        let start = scan_pos.min(a.entries().len());
+                        let f: Vec<Key> = a.entries()[start..]
                             .iter()
                             .map(|(k, _)| k.clone())
                             .filter(|k| !visited.contains(k))
                             .collect();
-                        scan_pos = a.entries.len();
+                        scan_pos = a.entries().len();
                         f
                     }) {
                         Some(f) => f,
@@ -3480,7 +3480,7 @@ impl Eval {
                 for it in items {
                     if it.spread {
                         if let Value::Array(src) = self.eval(&it.value)? {
-                            for (k, v) in src.entries {
+                            for (k, v) in src.into_entries() {
                                 match k {
                                     Key::Int(_) => a.push(v),
                                     Key::Str(_) => a.insert(k, v),
@@ -3984,7 +3984,7 @@ impl Eval {
                 let src = self.eval(e)?;
                 match src {
                     Value::Array(a) => {
-                        for (k, v) in a.entries {
+                        for (k, v) in a.into_entries() {
                             self.gen_nodes =
                                 self.gen_nodes.saturating_add(value_size(&v, MAX_ARRAY_NODES));
                             if self.gen_nodes >= MAX_ARRAY_NODES {
@@ -4002,7 +4002,7 @@ impl Eval {
                         // a sub-generator/iterable — drain via iterator_to_array
                         let drained = self.builtin("iterator_to_array", vec![src, Value::Bool(false)])?;
                         if let Value::Array(a) = drained {
-                            for (_, v) in a.entries {
+                            for (_, v) in a.into_entries() {
                                 self.gen_nodes = self
                                     .gen_nodes
                                     .saturating_add(value_size(&v, MAX_ARRAY_NODES));
@@ -4160,7 +4160,7 @@ impl Eval {
             Add => {
                 if let (Value::Array(a), Value::Array(b)) = (l, r) {
                     let mut out = a.clone();
-                    for (k, v) in &b.entries {
+                    for (k, v) in b.entries() {
                         if out.get(k).is_none() {
                             out.insert(k.clone(), v.clone());
                         }
@@ -4299,7 +4299,7 @@ impl Eval {
                 Value::Object(_) | Value::Closure(_) => v,
                 Value::Array(a) => {
                     let mut o = Obj::new("stdClass");
-                    for (k, val) in a.entries {
+                    for (k, val) in a.into_entries() {
                         let name = match k {
                             Key::Int(n) => n.to_string(),
                             Key::Str(s) => String::from_utf8_lossy(&s).into_owned(),
@@ -5274,10 +5274,10 @@ impl Eval {
                         Other(String),
                     }
                     let root = match &slots[i] {
-                        Value::Array(a) => IterRoot::Arr(a.entries.clone()),
+                        Value::Array(a) => IterRoot::Arr(a.entries().to_vec()),
                         Value::Object(rc) => IterRoot::Obj(rc.clone()),
                         Value::Ref(c) => match &*c.borrow() {
-                            Value::Array(a) => IterRoot::Arr(a.entries.clone()),
+                            Value::Array(a) => IterRoot::Arr(a.entries().to_vec()),
                             Value::Object(rc) => IterRoot::Obj(rc.clone()),
                             v => IterRoot::Other(self.given_type(v)),
                         },
@@ -6695,13 +6695,13 @@ impl Eval {
 
     fn array_pointer_inplace(name: &str, arr: &mut Arr) -> Value {
         match name {
-            "reset" => arr.pos = 0,
-            "end" => arr.pos = arr.entries.len().saturating_sub(1),
-            "next" => arr.pos = arr.pos.saturating_add(1),
-            "prev" => arr.pos = if arr.pos == 0 { usize::MAX } else { arr.pos - 1 },
+            "reset" => arr.set_pos(0),
+            "end" => arr.set_pos(arr.entries().len().saturating_sub(1)),
+            "next" => arr.set_pos(arr.pos().saturating_add(1)),
+            "prev" => arr.set_pos(if arr.pos() == 0 { usize::MAX } else { arr.pos() - 1 }),
             _ => {}
         }
-        let cur = arr.entries.get(arr.pos);
+        let cur = arr.entries().get(arr.pos());
         match name {
             "key" => match cur {
                 Some((k, _)) => akey_to_value(k),
@@ -6715,7 +6715,7 @@ impl Eval {
                     r.insert(Key::Str(b"key".to_vec()), kv);
                     r.insert(Key::Int(1), v.clone());
                     r.insert(Key::Str(b"value".to_vec()), v.clone());
-                    arr.pos += 1;
+                    arr.set_pos(arr.pos() + 1);
                     Value::Array(r)
                 }
                 None => Value::Bool(false),
@@ -6738,7 +6738,7 @@ impl Eval {
         let mut i = 0;
         while i < argv.len() {
             if let Value::Array(a) = &argv[i] {
-                let vals: Vec<Value> = a.entries.iter().map(|(_, v)| v.clone()).collect();
+                let vals: Vec<Value> = a.entries().iter().map(|(_, v)| v.clone()).collect();
                 let mut desc = false;
                 // following ints are direction/flags for THIS column
                 let mut j = i + 1;
@@ -6787,15 +6787,15 @@ impl Eval {
             _ => return Ok(Value::Bool(false)),
         };
         let cb = argv.get(1).cloned().unwrap_or(Value::Null);
-        for i in 0..arr.entries.len() {
-            let (k, v) = arr.entries[i].clone();
+        for i in 0..arr.entries().len() {
+            let (k, v) = arr.entries()[i].clone();
             let cell = Rc::new(RefCell::new(v.deref()));
             let mut cargs = vec![Value::Ref(cell.clone()), akey_to_value(&k)];
             if argv.len() > 2 {
                 cargs.push(argv[2].clone());
             }
             self.call_value(cb.clone(), cargs)?;
-            arr.entries[i].1 = cell.borrow().clone();
+            arr.entries_mut()[i].1 = cell.borrow().clone();
         }
         self.assign_to(&args[0].value, Value::Array(arr))?;
         Ok(Value::Bool(true))
@@ -6827,20 +6827,20 @@ impl Eval {
                 }
                 Value::Int(arr.len() as i64)
             }
-            "array_pop" => match arr.entries.pop() {
+            "array_pop" => match arr.entries_mut().pop() {
                 Some((_, v)) => {
-                    arr = rebuilt(arr.entries);
+                    arr = rebuilt(arr.take_entries());
                     v
                 }
                 None => Value::Null,
             },
             "array_shift" => {
-                if arr.entries.is_empty() {
+                if arr.entries().is_empty() {
                     Value::Null
                 } else {
-                    let (_, v) = arr.entries.remove(0);
+                    let (_, v) = arr.entries_mut().remove(0);
                     let mut new = Arr::new();
-                    for (k, val) in std::mem::take(&mut arr.entries) {
+                    for (k, val) in arr.take_entries() {
                         match k {
                             Key::Int(_) => new.push(val),
                             Key::Str(_) => new.insert(k, val),
@@ -6855,7 +6855,7 @@ impl Eval {
                 for v in &argv[1..] {
                     new.push(v.clone());
                 }
-                for (k, val) in std::mem::take(&mut arr.entries) {
+                for (k, val) in arr.take_entries() {
                     match k {
                         Key::Int(_) => new.push(val),
                         Key::Str(_) => new.insert(k, val),
@@ -6865,7 +6865,7 @@ impl Eval {
                 Value::Int(arr.len() as i64)
             }
             "sort" | "rsort" => {
-                let mut vals: Vec<Value> = arr.entries.iter().map(|(_, v)| v.clone()).collect();
+                let mut vals: Vec<Value> = arr.entries().iter().map(|(_, v)| v.clone()).collect();
                 vals.sort_by(|a, b| compare(a, b));
                 if name == "rsort" {
                     vals.reverse();
@@ -6874,7 +6874,7 @@ impl Eval {
                 Value::Bool(true)
             }
             "asort" | "arsort" => {
-                let mut entries = std::mem::take(&mut arr.entries);
+                let mut entries = arr.take_entries();
                 entries.sort_by(|(_, a), (_, b)| compare(a, b));
                 if name == "arsort" {
                     entries.reverse();
@@ -6883,7 +6883,7 @@ impl Eval {
                 Value::Bool(true)
             }
             "ksort" | "krsort" => {
-                let mut entries = std::mem::take(&mut arr.entries);
+                let mut entries = arr.take_entries();
                 entries.sort_by(|(a, _), (b, _)| key_cmp(a, b));
                 if name == "krsort" {
                     entries.reverse();
@@ -6893,7 +6893,7 @@ impl Eval {
             }
             "usort" | "uasort" | "uksort" => {
                 let cb = argv.get(1).cloned().unwrap_or(Value::Null);
-                let mut entries = std::mem::take(&mut arr.entries);
+                let mut entries = arr.take_entries();
                 let on_keys = name == "uksort";
                 entries.sort_by(|(ka, va), (kb, vb)| {
                     let (l, r) = if on_keys {
@@ -6912,7 +6912,7 @@ impl Eval {
                 Value::Bool(true)
             }
             "array_splice" => {
-                let len = arr.entries.len() as i64;
+                let len = arr.entries().len() as i64;
                 let mut off = to_i64(argv.get(1).unwrap_or(&Value::Null));
                 if off < 0 {
                     off = (len + off).max(0);
@@ -6922,20 +6922,20 @@ impl Eval {
                     let l = to_i64(&argv[2]);
                     if l < 0 { ((len + l) as usize).saturating_sub(off) } else { l as usize }
                 } else {
-                    arr.entries.len() - off
+                    arr.entries().len() - off
                 };
-                let end = (off + rem).min(arr.entries.len());
-                let removed: Vec<Value> = arr.entries[off..end].iter().map(|(_, v)| v.clone()).collect();
+                let end = (off + rem).min(arr.entries().len());
+                let removed: Vec<Value> = arr.entries()[off..end].iter().map(|(_, v)| v.clone()).collect();
                 let repl: Vec<Value> = match argv.get(3) {
-                    Some(Value::Array(a)) => a.entries.iter().map(|(_, v)| v.clone()).collect(),
+                    Some(Value::Array(a)) => a.entries().iter().map(|(_, v)| v.clone()).collect(),
                     Some(v) => vec![v.clone()],
                     None => vec![],
                 };
-                let mut new_entries: Vec<(Key, Value)> = arr.entries[..off].to_vec();
+                let mut new_entries: Vec<(Key, Value)> = arr.entries()[..off].to_vec();
                 for v in repl {
                     new_entries.push((Key::Int(0), v)); // key reassigned by rebuilt-as-pushed
                 }
-                new_entries.extend_from_slice(&arr.entries[end..]);
+                new_entries.extend_from_slice(&arr.entries()[end..]);
                 // reindex integer keys, keep string keys
                 let mut new = Arr::new();
                 for (k, v) in new_entries {
@@ -7108,7 +7108,7 @@ impl Eval {
     /// (non-array) values only. Read-only — element mutation via a by-ref callback
     /// parameter isn't modeled here (the callable-value path is by-value).
     fn walk_recursive(&mut self, arr: &Arr, cb: &Value, has_extra: bool, extra: &Value) -> R<()> {
-        for (k, v) in &arr.entries {
+        for (k, v) in arr.entries() {
             if let Value::Array(sub) = v {
                 self.walk_recursive(sub, cb, has_extra, extra)?;
             } else {
@@ -7229,7 +7229,7 @@ impl Eval {
 
     fn make_generator(&self, buf: Arr, ret: Value) -> Value {
         let mut karr = Arr::new();
-        for (k, _) in &buf.entries {
+        for (k, _) in buf.entries() {
             karr.push(akey_to_value(k));
         }
         let o = Rc::new(RefCell::new(Obj::new("Generator")));
@@ -7504,7 +7504,7 @@ impl Eval {
             }
             if a.spread {
                 if let Value::Array(arr) = self.eval(&a.value)? {
-                    for (k, v) in arr.entries {
+                    for (k, v) in arr.into_entries() {
                         match k {
                             Key::Str(s) => named.push((String::from_utf8_lossy(&s).into_owned(), v)),
                             Key::Int(_) => pos.push(v),
@@ -7618,11 +7618,11 @@ impl Eval {
             match &g(0) {
                 Value::Array(sa) => {
                     let mut out = subject.to_vec();
-                    for (i, (_, sv)) in sa.entries.iter().enumerate() {
+                    for (i, (_, sv)) in sa.entries().iter().enumerate() {
                         let needle = to_bytes(sv);
                         let rep = match &g(1) {
                             Value::Array(ra) => ra
-                                .entries
+                                .entries()
                                 .get(i)
                                 .map(|(_, v)| to_bytes(v))
                                 .unwrap_or_default(),
@@ -7645,7 +7645,7 @@ impl Eval {
         let v = match &g(2) {
             Value::Array(subj) => {
                 let mut out = Arr::new();
-                for (k, v) in &subj.entries {
+                for (k, v) in subj.entries() {
                     out.insert(k.clone(), Value::Str(one(&to_bytes(v))));
                 }
                 Value::Array(out)
@@ -8902,6 +8902,16 @@ impl Eval {
             }
             "var_dump" => {
                 for v in &args {
+                    // PHP never prints `&` at the TOP level of var_dump($x) —
+                    // the marker is only for reference elements inside
+                    // containers. Deref a Ref argument before dumping.
+                    let dv;
+                    let v = if let Value::Ref(c) = v {
+                        dv = c.borrow().clone();
+                        &dv
+                    } else {
+                        v
+                    };
                     let mut s = String::new();
                     var_dump(self, v, 0, &mut s);
                     self.out.extend_from_slice(s.as_bytes());
@@ -9408,7 +9418,7 @@ impl Eval {
             "extract" => {
                 let mut n = 0;
                 if let Value::Array(arr) = a(0) {
-                    for (k, v) in arr.entries {
+                    for (k, v) in arr.into_entries() {
                         if let Key::Str(s) = k {
                             if let Ok(name) = std::str::from_utf8(&s) {
                                 if !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) {
@@ -9944,7 +9954,7 @@ impl Eval {
             "http_build_query" => {
                 let mut parts: Vec<u8> = Vec::new();
                 if let Value::Array(arr) = a(0) {
-                    for (k, v) in &arr.entries {
+                    for (k, v) in arr.entries() {
                         if !parts.is_empty() { parts.push(b'&'); }
                         let key = match k { Key::Int(n) => n.to_string().into_bytes(), Key::Str(s) => s.clone() };
                         parts.extend_from_slice(&urlencode_form(&key));
@@ -10022,7 +10032,7 @@ impl Eval {
                         }
                         v
                     }
-                    Value::Array(arr) => arr.entries.iter().map(|(_, v)| to_bytes(v).to_ascii_lowercase()).collect(),
+                    Value::Array(arr) => arr.entries().iter().map(|(_, v)| to_bytes(v).to_ascii_lowercase()).collect(),
                     _ => Vec::new(),
                 };
                 Value::Str(strip_tags(&s, &allowed))
@@ -10056,7 +10066,7 @@ impl Eval {
             "array_replace" | "array_replace_recursive" => {
                 let recursive = name == "array_replace_recursive";
                 fn rep(base: &mut Arr, over: &Arr, recursive: bool) {
-                    for (k, v) in &over.entries {
+                    for (k, v) in over.entries() {
                         if recursive {
                             if let (Some(Value::Array(b)), Value::Array(o)) =
                                 (base.get_mut(k), v)
@@ -10090,7 +10100,7 @@ impl Eval {
                             _ => None,
                         })
                         .collect();
-                    for (k, v) in &arr.entries {
+                    for (k, v) in arr.entries() {
                         let in_all = others.iter().all(|o| o.get(k).is_some());
                         let in_any = others.iter().any(|o| o.get(k).is_some());
                         if (keep_present && in_all) || (!keep_present && !in_any) {
@@ -10107,12 +10117,12 @@ impl Eval {
                     let mut others: HashSet<Vec<u8>> = HashSet::new();
                     for v in &args[1..] {
                         if let Value::Array(o) = v {
-                            for (_, x) in &o.entries {
+                            for (_, x) in o.entries() {
                                 others.insert(to_bytes(x));
                             }
                         }
                     }
-                    for (k, v) in arr.entries {
+                    for (k, v) in arr.into_entries() {
                         if !others.contains(&to_bytes(&v)) {
                             out.insert(k, v);
                         }
@@ -10127,13 +10137,13 @@ impl Eval {
                         .iter()
                         .map(|v| {
                             if let Value::Array(o) = v {
-                                o.entries.iter().map(|(_, x)| to_bytes(x)).collect()
+                                o.entries().iter().map(|(_, x)| to_bytes(x)).collect()
                             } else {
                                 HashSet::new()
                             }
                         })
                         .collect();
-                    for (k, v) in arr.entries {
+                    for (k, v) in arr.into_entries() {
                         let vb = to_bytes(&v);
                         if sets.iter().all(|s| s.contains(&vb)) {
                             out.insert(k, v);
@@ -10146,7 +10156,7 @@ impl Eval {
                 let mut out = Arr::new();
                 let val = a(1);
                 if let Value::Array(keys) = a(0) {
-                    for (_, k) in keys.entries {
+                    for (_, k) in keys.into_entries() {
                         out.insert(Arr::norm_key(&k), val.clone());
                     }
                 }
@@ -10156,7 +10166,7 @@ impl Eval {
                 let cb = a(1);
                 let extra = a(2);
                 if let Value::Array(arr) = a(0) {
-                    for (k, v) in arr.entries {
+                    for (k, v) in arr.into_entries() {
                         let kv = match k {
                             Key::Int(n) => Value::Int(n),
                             Key::Str(s) => Value::Str(s),
@@ -10184,7 +10194,7 @@ impl Eval {
                 let mut ff = 1f64;
                 let mut isf = false;
                 if let Value::Array(arr) = a(0) {
-                    for (_, v) in &arr.entries {
+                    for (_, v) in arr.entries() {
                         match to_num(v) {
                             Num::Int(n) if !isf => fi = fi.wrapping_mul(n),
                             n => {
@@ -10202,7 +10212,7 @@ impl Eval {
             "array_count_values" => {
                 let mut out = Arr::new();
                 if let Value::Array(arr) = a(0) {
-                    for (_, v) in arr.entries {
+                    for (_, v) in arr.into_entries() {
                         let k = Arr::norm_key(&v);
                         let cur = out.get(&k).map(to_i64).unwrap_or(0);
                         out.insert(k, Value::Int(cur + 1));
@@ -10218,7 +10228,7 @@ impl Eval {
                     _ => (Vec::new(), Arr::new()),
                 };
                 let mut out = Vec::new();
-                for (i, (_, v)) in arr.entries.iter().enumerate() {
+                for (i, (_, v)) in arr.entries().iter().enumerate() {
                     if i > 0 {
                         out.extend_from_slice(&sep);
                     }
@@ -10350,7 +10360,7 @@ impl Eval {
                     // pair form: longest match first at each position, no
                     // rescanning of replaced text
                     let mut map: Vec<(Vec<u8>, Vec<u8>)> = pairs
-                        .entries
+                        .entries()
                         .iter()
                         .map(|(k, v)| (to_bytes(&akey_to_value(k)), to_bytes(v)))
                         .filter(|(k, _)| !k.is_empty())
@@ -10690,7 +10700,7 @@ impl Eval {
             "array_keys" => {
                 let mut out = Arr::new();
                 if let Value::Array(arr) = a(0) {
-                    for (k, _) in arr.entries {
+                    for (k, _) in arr.into_entries() {
                         out.push(match k {
                             Key::Int(n) => Value::Int(n),
                             Key::Str(s) => Value::Str(s),
@@ -10702,7 +10712,7 @@ impl Eval {
             "array_values" => {
                 let mut out = Arr::new();
                 if let Value::Array(arr) = a(0) {
-                    for (_, v) in arr.entries {
+                    for (_, v) in arr.into_entries() {
                         out.push(v);
                     }
                 }
@@ -10712,7 +10722,7 @@ impl Eval {
                 let mut out = Arr::new();
                 for v in &args {
                     if let Value::Array(arr) = v {
-                        for (k, val) in &arr.entries {
+                        for (k, val) in arr.entries() {
                             match k {
                                 Key::Int(_) => out.push(val.clone()),
                                 Key::Str(_) => out.insert(k.clone(), val.clone()),
@@ -10737,7 +10747,7 @@ impl Eval {
                 let mut out = Arr::new();
                 if let Value::Array(arr) = a(0) {
                     let mut chunk = Arr::new();
-                    for (k, v) in arr.entries {
+                    for (k, v) in arr.into_entries() {
                         if preserve {
                             chunk.insert(k, v);
                         } else {
@@ -10757,7 +10767,7 @@ impl Eval {
                 let preserve = to_bool(&a(1));
                 let mut out = Arr::new();
                 if let Value::Array(arr) = a(0) {
-                    for (k, v) in arr.entries.into_iter().rev() {
+                    for (k, v) in arr.into_entries().into_iter().rev() {
                         match k {
                             Key::Int(_) if !preserve => out.push(v),
                             _ => out.insert(k, v),
@@ -10770,8 +10780,8 @@ impl Eval {
                 let preserve = to_bool(&a(3));
                 let (entries, len) = match a(0) {
                     Value::Array(arr) => {
-                        let l = arr.entries.len();
-                        (arr.entries, l)
+                        let l = arr.entries().len();
+                        (arr.into_entries(), l)
                     }
                     _ => (Vec::new(), 0),
                 };
@@ -10798,7 +10808,7 @@ impl Eval {
             "array_flip" => {
                 let mut out = Arr::new();
                 if let Value::Array(arr) = a(0) {
-                    for (k, v) in arr.entries {
+                    for (k, v) in arr.into_entries() {
                         out.insert(Arr::norm_key(&v), akey_to_value(&k));
                     }
                 }
@@ -10808,7 +10818,7 @@ impl Eval {
                 let mut out = Arr::new();
                 let mut seen: HashSet<Vec<u8>> = HashSet::new();
                 if let Value::Array(arr) = a(0) {
-                    for (k, v) in arr.entries {
+                    for (k, v) in arr.into_entries() {
                         if seen.insert(to_bytes(&v)) {
                             out.insert(k, v);
                         }
@@ -10821,7 +10831,7 @@ impl Eval {
                 let strict = to_bool(&a(2));
                 let mut found = Value::Bool(false);
                 if let Value::Array(arr) = a(1) {
-                    for (k, v) in &arr.entries {
+                    for (k, v) in arr.entries() {
                         if (strict && strict_eq(&needle, v)) || (!strict && loose_eq(&needle, v)) {
                             found = akey_to_value(k);
                             break;
@@ -10835,17 +10845,17 @@ impl Eval {
                 Value::Bool(matches!(a(1), Value::Array(arr) if arr.get(&key).is_some()))
             }
             "array_key_first" => match a(0) {
-                Value::Array(arr) => arr.entries.first().map(|(k, _)| akey_to_value(k)).unwrap_or(Value::Null),
+                Value::Array(arr) => arr.entries().first().map(|(k, _)| akey_to_value(k)).unwrap_or(Value::Null),
                 _ => Value::Null,
             },
             "array_key_last" => match a(0) {
-                Value::Array(arr) => arr.entries.last().map(|(k, _)| akey_to_value(k)).unwrap_or(Value::Null),
+                Value::Array(arr) => arr.entries().last().map(|(k, _)| akey_to_value(k)).unwrap_or(Value::Null),
                 _ => Value::Null,
             },
             "array_combine" => {
                 let mut out = Arr::new();
                 if let (Value::Array(ks), Value::Array(vs)) = (a(0), a(1)) {
-                    for ((_, k), (_, v)) in ks.entries.into_iter().zip(vs.entries) {
+                    for ((_, k), (_, v)) in ks.into_entries().into_iter().zip(vs.into_entries()) {
                         out.insert(Arr::norm_key(&k), v);
                     }
                 }
@@ -10871,7 +10881,7 @@ impl Eval {
                 let idx = a(2);
                 let mut out = Arr::new();
                 if let Value::Array(arr) = a(0) {
-                    for (_, row) in arr.entries {
+                    for (_, row) in arr.into_entries() {
                         if let Value::Array(r) = &row {
                             let cell = if matches!(col, Value::Null) {
                                 row.clone()
@@ -10891,14 +10901,14 @@ impl Eval {
                 Value::Array(out)
             }
             "array_is_list" => Value::Bool(match a(0) {
-                Value::Array(arr) => arr.entries.iter().enumerate().all(|(i, (k, _))| matches!(k, Key::Int(n) if *n == i as i64)),
+                Value::Array(arr) => arr.entries().iter().enumerate().all(|(i, (k, _))| matches!(k, Key::Int(n) if *n == i as i64)),
                 _ => false,
             }),
             "array_pad" => {
                 let size = to_i64(&a(1));
                 let val = a(2);
                 let mut items: Vec<Value> = match a(0) {
-                    Value::Array(arr) => arr.entries.into_iter().map(|(_, v)| v).collect(),
+                    Value::Array(arr) => arr.into_entries().into_iter().map(|(_, v)| v).collect(),
                     _ => Vec::new(),
                 };
                 let n = (size.unsigned_abs() as usize).min(MAX_ARRAY_NODES);
@@ -10923,7 +10933,7 @@ impl Eval {
                 let mut ff = 0f64;
                 let mut isf = false;
                 if let Value::Array(arr) = a(0) {
-                    for (_, v) in &arr.entries {
+                    for (_, v) in arr.entries() {
                         match to_num(v) {
                             Num::Int(n) if !isf => fi += n,
                             n => {
@@ -10947,7 +10957,7 @@ impl Eval {
                 let strict = to_bool(&a(2));
                 let mut found = false;
                 if let Value::Array(arr) = a(1) {
-                    for (_, v) in &arr.entries {
+                    for (_, v) in arr.entries() {
                         if (strict && strict_eq(&needle, v)) || (!strict && loose_eq(&needle, v)) {
                             found = true;
                             break;
@@ -10965,7 +10975,7 @@ impl Eval {
                 let f = a(0);
                 let mut argv = Vec::new();
                 if let Value::Array(arr) = a(1) {
-                    for (_, v) in arr.entries {
+                    for (_, v) in arr.into_entries() {
                         argv.push(v);
                     }
                 }
@@ -10975,7 +10985,7 @@ impl Eval {
                 let cb = a(0);
                 let mut out = Arr::new();
                 if let Value::Array(arr) = a(1) {
-                    for (k, v) in arr.entries {
+                    for (k, v) in arr.into_entries() {
                         let r = if matches!(cb, Value::Null) {
                             v
                         } else {
@@ -10992,7 +11002,7 @@ impl Eval {
                 let mode = to_i64(&a(2));
                 let mut out = Arr::new();
                 if let Value::Array(arr) = a(0) {
-                    for (k, v) in arr.entries {
+                    for (k, v) in arr.into_entries() {
                         let keep = if matches!(cb, Value::Null) {
                             to_bool(&v)
                         } else {
@@ -11014,7 +11024,7 @@ impl Eval {
                 let cb = a(1);
                 let mut acc = a(2);
                 if let Value::Array(arr) = a(0) {
-                    for (_, v) in arr.entries {
+                    for (_, v) in arr.into_entries() {
                         acc = self.call_value(cb.clone(), vec![acc, v])?;
                     }
                 }
@@ -11045,7 +11055,7 @@ impl Eval {
                 // format + an array of args → flatten to a sprintf arg list
                 let mut sa = vec![a(0)];
                 if let Value::Array(arr) = a(1) {
-                    for (_, v) in arr.entries {
+                    for (_, v) in arr.into_entries() {
                         sa.push(v);
                     }
                 }
@@ -11575,7 +11585,7 @@ impl Eval {
                 let sql = String::from_utf8_lossy(&to_bytes(&a(1))).into_owned();
                 let mut params: Vec<(Option<String>, crate::pdo::SqlVal)> = Vec::new();
                 if let Value::Array(pa) = &a(2) {
-                    for (k, v) in &pa.entries {
+                    for (k, v) in pa.entries() {
                         // string keys are NAMED parameters (":param0")
                         let name = match k {
                             Key::Str(s) => Some(String::from_utf8_lossy(s).into_owned()),
@@ -11821,7 +11831,7 @@ impl Eval {
                 fn collect(ev: &mut Eval, v: &Value, out: &mut Arr) {
                     match v {
                         Value::Array(a) => {
-                            let entries = a.entries.clone();
+                            let entries = a.entries().to_vec();
                             for (_, item) in &entries {
                                 collect(ev, item, out);
                             }
@@ -12004,7 +12014,7 @@ impl Eval {
                 let pattern = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 let mut out = Arr::new();
                 if let (Some(rx), Value::Array(arr)) = (crate::rx_compile(&pattern), a(1)) {
-                    for (k, v) in arr.entries {
+                    for (k, v) in arr.into_entries() {
                         let text: Vec<char> = String::from_utf8_lossy(&to_bytes(&v)).chars().collect();
                         let mut steps = 0usize;
                         if rx.exec(&text, 0, &mut steps).is_some() {
@@ -12224,7 +12234,7 @@ impl Eval {
                 let bytes = match &a(1) {
                     Value::Array(arr) => {
                         let mut v = Vec::new();
-                        for (_, e) in &arr.entries {
+                        for (_, e) in arr.entries() {
                             v.extend_from_slice(&to_bytes(e));
                         }
                         v
@@ -12332,7 +12342,7 @@ impl Eval {
                 let quote = if args.len() > 3 { first_byte_or(&to_bytes(&a(3)), b'"') } else { b'"' };
                 let mut line: Vec<u8> = Vec::new();
                 if let Value::Array(arr) = a(1) {
-                    for (i, (_, v)) in arr.entries.iter().enumerate() {
+                    for (i, (_, v)) in arr.entries().iter().enumerate() {
                         if i > 0 {
                             line.push(delim);
                         }
@@ -12531,7 +12541,7 @@ impl Eval {
                     let mut b = o.borrow_mut();
                     let pos = b.get("__pos").map(to_i64).unwrap_or(0).max(0) as usize;
                     let next = match b.get("__entries") {
-                        Some(Value::Array(e)) => e.entries.get(pos).map(|(_, v)| v.clone()),
+                        Some(Value::Array(e)) => e.entries().get(pos).map(|(_, v)| v.clone()),
                         _ => None,
                     };
                     match next {
@@ -12863,7 +12873,7 @@ impl Eval {
     fn extreme(&self, args: &[Value], want_max: bool) -> Value {
         let items: Vec<Value> = if args.len() == 1 {
             if let Value::Array(a) = &args[0] {
-                a.entries.iter().map(|(_, v)| v.clone()).collect()
+                a.entries().iter().map(|(_, v)| v.clone()).collect()
             } else {
                 vec![args[0].clone()]
             }
@@ -13261,7 +13271,7 @@ fn str_bitwise(l: &Value, r: &Value, op: fn(u8, u8) -> u8, longer: bool) -> Valu
 /// array_merge_recursive: integer keys append; string keys merge, and when both
 /// sides hold a value under the same string key, they combine into an array.
 fn merge_recursive(out: &mut Arr, src: &Arr) {
-    for (k, v) in &src.entries {
+    for (k, v) in src.entries() {
         match k {
             Key::Int(_) => out.push(v.clone()),
             Key::Str(_) => {
@@ -13718,12 +13728,12 @@ fn preg_replace_full(argv: &[Value]) -> (Value, i64) {
     let subject = String::from_utf8_lossy(&to_bytes(&g(2))).into_owned();
     let limit = if argv.len() > 3 { to_i64(&g(3)) } else { -1 };
     let pats: Vec<Vec<u8>> = match g(0) {
-        Value::Array(arr) => arr.entries.into_iter().map(|(_, v)| to_bytes(&v)).collect(),
+        Value::Array(arr) => arr.into_entries().into_iter().map(|(_, v)| to_bytes(&v)).collect(),
         v => vec![to_bytes(&v)],
     };
     let rep_is_arr = matches!(g(1), Value::Array(_));
     let reps: Vec<Vec<u8>> = match g(1) {
-        Value::Array(arr) => arr.entries.into_iter().map(|(_, v)| to_bytes(&v)).collect(),
+        Value::Array(arr) => arr.into_entries().into_iter().map(|(_, v)| to_bytes(&v)).collect(),
         v => vec![to_bytes(&v)],
     };
     let mut result = subject;
@@ -14168,7 +14178,7 @@ fn var_dump_seen(ev: &Eval, v: &Value, indent: usize, out: &mut String, seen: &m
         )),
         Value::Array(a) => {
             out.push_str(&format!("{pad}array({}) {{\n", a.len()));
-            for (k, val) in &a.entries {
+            for (k, val) in a.entries() {
                 match k {
                     Key::Int(n) => out.push_str(&format!("{pad}  [{n}]=>\n")),
                     Key::Str(s) => {
@@ -14231,9 +14241,11 @@ fn var_dump_seen(ev: &Eval, v: &Value, indent: usize, out: &mut String, seen: &m
         Value::Closure(_) => out.push_str(&format!("{pad}object(Closure)#1 (0) {{\n{pad}}}\n")),
         Value::Ref(c) => {
             // PHP marks a reference element with `&` only while it has another
-            // durable alias (refcount > 1). Our Rc count includes one temp clone
-            // made evaluating the var_dump argument, hence the threshold of 3.
-            if Rc::strong_count(c) >= 3 {
+            // durable alias (refcount > 1). Under COW arrays the var_dump
+            // argument copy shares the payload — it adds NO cell handle — so
+            // the holders here are exactly the durable ones: the array entry
+            // plus any live alias. Threshold 2 = entry + one alias.
+            if Rc::strong_count(c) >= 2 {
                 let mut inner = String::new();
                 var_dump_seen(ev, &c.borrow(), indent, &mut inner, seen);
                 // each dump line starts with the indent pad; the `&` sits between
@@ -14287,7 +14299,7 @@ fn var_export_seen(v: &Value, indent: usize, out: &mut String, seen: &mut Vec<us
         Value::Array(a) => {
             let pad = "  ".repeat(indent);
             out.push_str("array (\n");
-            for (k, val) in &a.entries {
+            for (k, val) in a.entries() {
                 out.push_str(&pad);
                 out.push_str("  ");
                 match k {
@@ -14338,7 +14350,7 @@ fn print_r(v: &Value, indent: usize, out: &mut String) {
             let pad = "    ".repeat(indent);
             out.push_str("Array\n");
             out.push_str(&format!("{pad}(\n"));
-            for (k, val) in &a.entries {
+            for (k, val) in a.entries() {
                 let ks = match k {
                     Key::Int(n) => n.to_string(),
                     Key::Str(s) => String::from_utf8_lossy(s).into_owned(),
@@ -14370,7 +14382,7 @@ fn value_size(v: &Value, limit: usize) -> usize {
             return count;
         }
         if let Value::Array(a) = cur {
-            for (_, e) in &a.entries {
+            for (_, e) in a.entries() {
                 stack.push(e);
             }
         }
@@ -14844,7 +14856,7 @@ fn key_cmp(a: &Key, b: &Key) -> std::cmp::Ordering {
 
 // ---- JSON (byte-based, for the v2 Value) -------------------------------
 fn json_is_list(a: &Arr) -> bool {
-    a.entries.iter().enumerate().all(|(i, (k, _))| matches!(k, Key::Int(n) if *n == i as i64))
+    a.entries().iter().enumerate().all(|(i, (k, _))| matches!(k, Key::Int(n) if *n == i as i64))
 }
 
 fn json_encode(v: &Value, out: &mut Vec<u8>, depth: usize) {
@@ -14867,7 +14879,7 @@ fn json_encode(v: &Value, out: &mut Vec<u8>, depth: usize) {
         Value::Array(a) => {
             if json_is_list(a) {
                 out.push(b'[');
-                for (i, (_, val)) in a.entries.iter().enumerate() {
+                for (i, (_, val)) in a.entries().iter().enumerate() {
                     if i > 0 {
                         out.push(b',');
                     }
@@ -14876,7 +14888,7 @@ fn json_encode(v: &Value, out: &mut Vec<u8>, depth: usize) {
                 out.push(b']');
             } else {
                 out.push(b'{');
-                for (i, (k, val)) in a.entries.iter().enumerate() {
+                for (i, (k, val)) in a.entries().iter().enumerate() {
                     if i > 0 {
                         out.push(b',');
                     }
@@ -15076,7 +15088,7 @@ fn finish_obj(arr: Arr, assoc: bool) -> Option<Value> {
         Some(Value::Array(arr))
     } else {
         let o = Rc::new(RefCell::new(Obj::new("stdClass")));
-        for (k, v) in arr.entries {
+        for (k, v) in arr.into_entries() {
             let name = match k {
                 Key::Int(n) => n.to_string(),
                 Key::Str(s) => String::from_utf8_lossy(&s).into_owned(),

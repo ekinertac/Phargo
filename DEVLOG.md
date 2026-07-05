@@ -27,6 +27,55 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-08 (later still) — Copy-on-write arrays: 7.3 seconds → 0.77. GOAL HIT.
+
+**The WordPress front page renders in 772 ms.** The "under 1 second"
+milestone fell to a single change: `Arr` became `Rc<ArrData>` with
+`Rc::make_mut` on every mutation path. Cloning an array is now a
+refcount bump; the first mutation through a shared handle copies the
+payload once. Same value semantics, ~9× on the page.
+
+The profiler called this shot precisely. After the static-var batch
+tripled VM compile coverage and the page barely moved (7.6s → 7.3s),
+the sample profile showed 3.9k of 5k samples inside `Vec::clone` under
+`Value::deref` — every read of an array element deep-copied it, every
+argument pass deep-copied again. WordPress passes `$wp_query`-sized
+structures around constantly. Dispatch was never the wall; copying was.
+
+The conversion itself was almost anticlimactic: the payload moves behind
+an Rc, `entries` stops being a public field (accessors: `entries()`,
+`entries_mut()`, `into_entries()` — a move when unshared, ONE clone when
+shared, i.e. what eager cloning paid on every read), and ~115 call sites
+sweep mechanically. The interesting property is what DIDN'T change:
+`$a[] = $a` still snapshots (the pending value holds a handle, so
+`make_mut` splits before the push — no cycles possible), and in-place
+nested writes split each level lazily, so deep structures share
+everything untouched.
+
+One semantic casualty, and it was the predictable one: every
+`Rc::strong_count` heuristic that counted array clones. `var_dump`
+marks a reference element with `&` when it has a durable alias, and the
+old threshold was **3** — because evaluating the var_dump *argument*
+eagerly cloned the array, cloning each `Value::Ref` element, adding one
+handle. Under COW that argument copy shares the payload and adds NO
+cell handle, so the genuinely-aliased last element of a foreach-by-ref
+(`array entry + $v` = 2) fell below the mark: eight tests lost, all
+foreach/reference-flavored, both engines identically. Threshold 2 got
+all eight back — and immediately overshot the other way: `var_dump` of
+`$obj->p` where p had once been referenced printed a spurious `&`,
+because the eval of a direct Ref argument adds the one temp handle the
+old threshold had priced in. The real rule, it turns out, is PHP's own:
+**var_dump never prints `&` at the top level of an argument** — the
+marker exists only for reference elements *inside* containers. Deref
+the argument up front, keep threshold 2 for elements, and both worlds
+agree. The is_ref-by-refcount approximation was always listed in
+DEVIATIONS as a seam; COW just moved which count it sees.
+
+Both engines got faster — walker micro suite 1065 → 813 ms, and the
+walker actually edges the VM on the page now (772 vs 817 ms): with clone
+pressure gone, the VM's top-level slot sync shows. A cutover argument
+for another day; today the number that matters is the one in the goal.
+
 ## 2026-07-08 (later) — Statics by reference, and the day the slot learned to alias.
 
 **Six new feature families compile now — `global`, static properties,

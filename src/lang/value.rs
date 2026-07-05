@@ -125,13 +125,34 @@ pub enum Key {
 }
 
 /// An insertion-ordered map (PHP arrays), with a hash index for O(1) lookup.
+///
+/// COPY-ON-WRITE: cloning an `Arr` bumps an Rc; the first mutation through a
+/// shared handle clones the payload once (`Rc::make_mut`). Visible semantics
+/// stay PHP's value semantics — only the *cost* moves from every read
+/// (`Value::deref` of an array element used to deep-copy it) to the rare
+/// shared-then-mutated case. Clone pressure was the WordPress page's
+/// profiled wall (3.9k/5k samples under Vec::clone via deref).
 #[derive(Debug, Clone, Default)]
 pub struct Arr {
-    pub entries: Vec<(Key, Value)>,
+    data: std::rc::Rc<ArrData>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ArrData {
+    entries: Vec<(Key, Value)>,
     index: HashMap<Key, usize>,
     next_int: i64,
     /// Internal pointer for reset()/next()/current()/key()/end()/prev().
-    pub pos: usize,
+    pos: usize,
+}
+
+impl ArrData {
+    fn reindex(&mut self) {
+        self.index.clear();
+        for (i, (k, _)) in self.entries.iter().enumerate() {
+            self.index.insert(k.clone(), i);
+        }
+    }
 }
 
 impl Arr {
@@ -139,10 +160,42 @@ impl Arr {
         Arr::default()
     }
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.data.entries.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.data.entries.is_empty()
+    }
+    pub fn entries(&self) -> &[(Key, Value)] {
+        &self.data.entries
+    }
+    /// Raw mutable access — the old `pub entries` contract: callers that
+    /// reorder or remove entries must fix the index themselves (the sort /
+    /// splice builtins rebuild the array wholesale afterwards).
+    pub fn entries_mut(&mut self) -> &mut Vec<(Key, Value)> {
+        &mut std::rc::Rc::make_mut(&mut self.data).entries
+    }
+    /// Consume into the entry list — a move when unshared, one clone when
+    /// shared (exactly what eager cloning paid on EVERY read before COW).
+    pub fn into_entries(self) -> Vec<(Key, Value)> {
+        match std::rc::Rc::try_unwrap(self.data) {
+            Ok(d) => d.entries,
+            Err(rc) => rc.entries.clone(),
+        }
+    }
+    /// `mem::take(&mut a.entries)` equivalent (index left stale, like the
+    /// old field takes — callers rebuild or drop the Arr).
+    pub fn take_entries(&mut self) -> Vec<(Key, Value)> {
+        std::mem::take(&mut std::rc::Rc::make_mut(&mut self.data).entries)
+    }
+    /// Rebuild the key index after direct entries_mut() surgery.
+    pub fn reindex(&mut self) {
+        std::rc::Rc::make_mut(&mut self.data).reindex();
+    }
+    pub fn pos(&self) -> usize {
+        self.data.pos
+    }
+    pub fn set_pos(&mut self, p: usize) {
+        std::rc::Rc::make_mut(&mut self.data).pos = p;
     }
 
     /// Normalize a value used as a key (int-like strings → ints; bools/floats → ints; null → "").
@@ -167,56 +220,52 @@ impl Arr {
     }
 
     pub fn get(&self, k: &Key) -> Option<&Value> {
-        self.index.get(k).map(|&i| &self.entries[i].1)
+        self.data.index.get(k).map(|&i| &self.data.entries[i].1)
     }
     pub fn get_mut(&mut self, k: &Key) -> Option<&mut Value> {
-        if let Some(&i) = self.index.get(k) {
-            Some(&mut self.entries[i].1)
+        let d = std::rc::Rc::make_mut(&mut self.data);
+        if let Some(&i) = d.index.get(k) {
+            Some(&mut d.entries[i].1)
         } else {
             None
         }
     }
 
     pub fn insert(&mut self, k: Key, v: Value) {
+        let d = std::rc::Rc::make_mut(&mut self.data);
         if let Key::Int(n) = &k {
-            if *n >= self.next_int {
-                self.next_int = n + 1;
+            if *n >= d.next_int {
+                d.next_int = n + 1;
             }
         }
-        if let Some(&i) = self.index.get(&k) {
+        if let Some(&i) = d.index.get(&k) {
             // Write through a reference element (created by `foreach (… as &$v)`)
             // so aliases of the cell observe the assignment, PHP-style.
-            if let (Value::Ref(cell), false) = (&self.entries[i].1, matches!(v, Value::Ref(_))) {
+            if let (Value::Ref(cell), false) = (&d.entries[i].1, matches!(v, Value::Ref(_))) {
                 *cell.borrow_mut() = v;
                 return;
             }
-            self.entries[i].1 = v;
+            d.entries[i].1 = v;
         } else {
-            self.index.insert(k.clone(), self.entries.len());
-            self.entries.push((k, v));
+            d.index.insert(k.clone(), d.entries.len());
+            d.entries.push((k, v));
         }
     }
 
     /// `$a[] = v` — append with the next integer key.
     pub fn push(&mut self, v: Value) {
-        let k = Key::Int(self.next_int);
+        let k = Key::Int(self.data.next_int);
         self.insert(k, v);
     }
 
     pub fn remove(&mut self, k: &Key) -> Option<Value> {
-        if let Some(i) = self.index.get(k).copied() {
-            let (_, v) = self.entries.remove(i);
-            self.reindex();
+        let d = std::rc::Rc::make_mut(&mut self.data);
+        if let Some(i) = d.index.get(k).copied() {
+            let (_, v) = d.entries.remove(i);
+            d.reindex();
             Some(v)
         } else {
             None
-        }
-    }
-
-    fn reindex(&mut self) {
-        self.index.clear();
-        for (i, (k, _)) in self.entries.iter().enumerate() {
-            self.index.insert(k.clone(), i);
         }
     }
 }
@@ -541,7 +590,7 @@ fn array_loose_eq(x: &Arr, y: &Arr, depth: usize) -> bool {
     if depth > 256 || x.len() != y.len() {
         return depth <= 256 && x.len() == y.len();
     }
-    for (k, v) in &x.entries {
+    for (k, v) in x.entries() {
         match y.get(k) {
             Some(w) if loose_eq_d(v, w, depth + 1) => {}
             _ => return false,
@@ -563,7 +612,7 @@ pub fn strict_eq(a: &Value, b: &Value) -> bool {
         (Str(x), Str(y)) => x == y,
         (Array(x), Array(y)) => {
             x.len() == y.len()
-                && x.entries.iter().zip(&y.entries).all(|((ka, va), (kb, vb))| {
+                && x.entries().iter().zip(y.entries()).all(|((ka, va), (kb, vb))| {
                     ka == kb && strict_eq(va, vb)
                 })
         }

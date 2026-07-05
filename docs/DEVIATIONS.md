@@ -43,10 +43,13 @@ micro TOTAL 1092 ms; wp-front-page 7526 ms (goal < 1000 ms).
   - re-bound by-ref parameters are tracked via a NUL-prefixed scope marker
     (`\0rebound\0name`) — functional, but a marker, not a model.
   The VM's zval-like Value with an explicit is_ref bit replaces all four.
-- **Copy-on-write arrays.** Arrays clone eagerly; the perf wall is mostly
-  clone pressure (bug40261 and the 48× WP fix were both "stop cloning
-  containers in hot paths" — the class of bug exists because the model
-  invites it). VM Value needs refcounted COW payloads.
+- ~~**Copy-on-write arrays.**~~ **RESOLVED 2026-07-08:** `Arr` is now
+  `Rc<ArrData>` with `Rc::make_mut` on every mutation path — cloning is an
+  Rc bump, the first mutation through a shared handle copies the payload
+  once. Visible semantics unchanged (still value semantics); the WP front
+  page went 7.3 s → 0.77 s. The historical note stands: bug40261 and the
+  48× WP fix were both "stop cloning containers in hot paths" — the eager
+  model invited that bug class, COW retires it.
 - **`readonly` init-once.** Writes are checked by visibility context, not by
   "exactly one initialization"; one corpus test knowingly lost.
 - **Scope maps.** Locals live in `HashMap<String, Value>`; `compact()`,
