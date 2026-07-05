@@ -25,6 +25,65 @@
 use super::ast::*;
 use std::collections::HashMap;
 
+thread_local! {
+    /// Why the most recent compilation bailed (diagnostics only; read by
+    /// the evaluator's PHARGO_VM_DEBUG census).
+    pub static LAST_BAIL: std::cell::RefCell<&'static str> = const { std::cell::RefCell::new("") };
+}
+
+fn bail<T>(reason: &'static str) -> Option<T> {
+    LAST_BAIL.with(|b| *b.borrow_mut() = reason);
+    None
+}
+
+fn stmt_name(s: &Stmt) -> &'static str {
+    match s {
+        Stmt::Global(_) => "stmt:global",
+        Stmt::StaticVar(_) => "stmt:static-var",
+        Stmt::Try { .. } => "stmt:try",
+        Stmt::Throw(_) => "stmt:throw",
+        Stmt::Unset(_) => "stmt:unset",
+        Stmt::Func(_) => "stmt:nested-func",
+        Stmt::Class(_) => "stmt:nested-class",
+        Stmt::Namespace { .. } => "stmt:namespace",
+        Stmt::Use(_) => "stmt:use",
+        Stmt::ConstDecl(_) => "stmt:const",
+        _ => "stmt:other",
+    }
+}
+
+fn expr_name(e: &Expr) -> &'static str {
+    match e {
+        Expr::Closure(_) => "expr:closure",
+        Expr::ArrowFn(_) => "expr:arrow-fn",
+        Expr::Prop(..) => "expr:prop-non-this",
+        Expr::MethodCall(..) => "expr:method-call",
+        Expr::StaticCall(..) => "expr:static-call",
+        Expr::StaticProp(..) => "expr:static-prop",
+        Expr::New(..) => "expr:new",
+        Expr::NewAnon(..) => "expr:new-anon",
+        Expr::Cast(..) => "expr:cast",
+        Expr::InstanceOf(..) => "expr:instanceof",
+        Expr::Match(..) => "expr:match",
+        Expr::VarVar(_) => "expr:varvar",
+        Expr::AssignRef(..) => "expr:assign-ref",
+        Expr::Assign(..) => "expr:assign-shape",
+        Expr::AssignOp(..) => "expr:assign-op-shape",
+        Expr::Index(..) => "expr:index-shape",
+        Expr::Isset(_) => "expr:isset-shape",
+        Expr::Empty(_) => "expr:empty-shape",
+        Expr::Call(..) => "expr:call-shape",
+        Expr::ConstFetch(_) => "expr:const-fetch",
+        Expr::MagicConst(_) => "expr:magic-const",
+        Expr::Ternary(..) => "expr:ternary",
+        Expr::List(_) => "expr:list",
+        Expr::Array(_) => "expr:array-shape",
+        Expr::ClassConst(..) => "expr:class-const-shape",
+        Expr::Unary(..) => "expr:unary-shape",
+        _ => "expr:other",
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Op {
     /// Push consts[i].
@@ -133,6 +192,28 @@ pub enum Op {
     /// Class constant CLS::NAME (self/parent/static keywords resolve like
     /// the walker's resolve_class_name).
     ClassConstOp { class: u16, name: u16 },
+    /// `global $x`: bind slot to the global variable (registered in the
+    /// run's bound list; bound slots sync around out-of-VM calls and exit).
+    BindGlobal { slot: u16, name: u16 },
+    /// `static $x = init;` — two ops so the initializer runs ONCE (PHP 8.3
+    /// allows side-effecting initializers): StaticCheck binds the existing
+    /// cell and jumps past the init ops; StaticInit pops the init value,
+    /// creates the cell, and binds it. The slot holds the walker's own
+    /// per-function Ref cell (Eval::static_vars); slot ops write THROUGH a
+    /// Ref-holding slot, so aliasing stays exact (recursion, in-place array
+    /// mutation) with no sync choreography. names[key] is
+    /// "Class::fn\0varname" (the walker's own static_vars key).
+    StaticCheck { slot: u16, key: u16, done: u32 },
+    StaticInit { slot: u16, key: u16 },
+    /// CLS::$prop read/write through the walker's static_prop_key.
+    LoadStaticProp { class: u16, name: u16 },
+    StoreStaticProp { class: u16, name: u16 },
+    /// `$v instanceof ClassName` (static right-hand name).
+    InstanceOfOp { class: u16 },
+    /// unset($slot[key]) — pop key; ArrayAccess objects get offsetUnset.
+    UnsetIndex(u16),
+    UnsetThisPropIndex(u16),
+    UnsetThisProp(u16),
     /// Method call: stack holds receiver then argc args. Dispatches through
     /// Eval::call_method (same resolution/visibility path as the walker).
     /// Compile-time restriction keeps by-ref parameter semantics safe: no
@@ -162,6 +243,8 @@ pub struct Chunk {
     /// Any op resolves names through the namespace/use context (const
     /// lookups, new, static calls) — fast calls must swap def-ctx.
     pub needs_ctx: bool,
+    /// Contains BindGlobal ops (bound slots need call/exit synchronization).
+    pub has_globals: bool,
     /// Per-call-site memo (validated against Eval::funcs_generation).
     pub sites: std::cell::RefCell<Vec<SiteMemo>>,
     /// Owning function name, for diagnostics.
@@ -208,6 +291,16 @@ pub enum CalleeKind {
     Unsafe,
 }
 
+/// Definition-site values for compile-time magic constants.
+#[derive(Default)]
+pub struct MagicCtx {
+    pub file: String,
+    pub dir: String,
+    pub function: String,
+    pub class: String,
+    pub namespace: String,
+}
+
 pub struct Compiler<'a> {
     ops: Vec<Op>,
     consts: Vec<super::value::Value>,
@@ -215,12 +308,14 @@ pub struct Compiler<'a> {
     slots: HashMap<String, u16>,
     slot_names: Vec<String>,
     resolver: &'a dyn Fn(&str) -> CalleeKind,
+    magic: &'a MagicCtx,
     /// (continue_target, break_patches, iter_depth_at_entry) per open loop.
     loops: Vec<LoopCtx>,
     iter_depth: usize,
     top_level: bool,
     uses_this: bool,
     needs_ctx: bool,
+    has_globals: bool,
     n_sites: u16,
 }
 
@@ -259,6 +354,7 @@ impl<'a> Compiler<'a> {
         body: &[Stmt],
         top_level: bool,
         params: Option<&[Param]>,
+        magic: &MagicCtx,
         resolver: &'a dyn Fn(&str) -> CalleeKind,
     ) -> Option<Chunk> {
         let mut c = Compiler {
@@ -268,11 +364,13 @@ impl<'a> Compiler<'a> {
             slots: HashMap::new(),
             slot_names: Vec::new(),
             resolver,
+            magic,
             loops: Vec::new(),
             iter_depth: 0,
             top_level,
             uses_this: false,
             needs_ctx: false,
+            has_globals: false,
             n_sites: 0,
         };
         // parameters claim slots 0..n in declaration order
@@ -346,6 +444,7 @@ impl<'a> Compiler<'a> {
             param_defaults,
             fast_callable,
             needs_ctx: c.needs_ctx,
+            has_globals: c.has_globals,
             sites: std::cell::RefCell::new(vec![
                 SiteMemo { generation: 0, target: Callee::Unresolved };
                 n_sites
@@ -635,6 +734,76 @@ impl<'a> Compiler<'a> {
                 self.finish_loop(end, start);
                 Some(())
             }
+            Stmt::Global(names) => {
+                // at top level `global` is a no-op (already global scope);
+                // slots there alias globals via the boundary syncs anyway
+                if !self.top_level {
+                    for n in names {
+                        let s = self.slot(n)?;
+                        let ni = self.name(n)?;
+                        self.has_globals = true;
+                        self.ops.push(Op::BindGlobal { slot: s, name: ni });
+                    }
+                }
+                Some(())
+            }
+            // `static $x = init` — only inside function bodies (a top-level
+            // static is a plain var to the walker; keep those on the walker).
+            Stmt::StaticVar(vars) => {
+                if self.top_level {
+                    return bail("stmt:static-var-top");
+                }
+                let fnkey = format!("{}::{}", self.magic.class, self.magic.function);
+                for (name, init) in vars {
+                    let s = self.slot(name)?;
+                    let ki = self.name(&format!("{fnkey}\u{0}{name}"))?;
+                    let check = self.ops.len();
+                    self.ops.push(Op::StaticCheck { slot: s, key: ki, done: 0 });
+                    match init {
+                        Some(e) => self.expr(e)?,
+                        None => {
+                            let k = self.konst(super::value::Value::Null)?;
+                            self.ops.push(Op::Const(k));
+                        }
+                    }
+                    self.ops.push(Op::StaticInit { slot: s, key: ki });
+                    let done = self.here();
+                    match &mut self.ops[check] {
+                        Op::StaticCheck { done: d, .. } => *d = done,
+                        _ => unreachable!(),
+                    }
+                }
+                Some(())
+            }
+            Stmt::Unset(items) => {
+                for it in items {
+                    match it {
+                        Expr::Var(n) => {
+                            let s = self.slot(n)?;
+                            self.ops.push(Op::UnsetSlot(s));
+                        }
+                        Expr::Index(base, Some(k)) => {
+                            if let Some(p) = self.this_prop(base) {
+                                self.expr(k)?;
+                                self.ops.push(Op::UnsetThisPropIndex(p));
+                            } else {
+                                let s = match &**base {
+                                    Expr::Var(n) => self.slot(n)?,
+                                    _ => return bail("stmt:unset-shape"),
+                                };
+                                self.expr(k)?;
+                                self.ops.push(Op::UnsetIndex(s));
+                            }
+                        }
+                        Expr::Prop(..) => {
+                            let p = self.this_prop(it)?;
+                            self.ops.push(Op::UnsetThisProp(p));
+                        }
+                        _ => return bail("stmt:unset-shape"),
+                    }
+                }
+                Some(())
+            }
             Stmt::Switch { subject, cases } => {
                 // subject into an anonymous temp slot, dispatch via loose Eq,
                 // bodies in order with PHP fall-through; break jumps to end
@@ -723,7 +892,7 @@ impl<'a> Compiler<'a> {
                 }
                 Some(())
             }
-            _ => None,
+            other => bail(stmt_name(other)),
         }
     }
 
@@ -801,7 +970,21 @@ impl<'a> Compiler<'a> {
                     self.ops.push(Op::StoreThisProp(p));
                     Some(())
                 }
-                _ => None,
+                Expr::StaticProp(class, pname) => {
+                    let raw = match &**class {
+                        Expr::ConstFetch(n) if !n.fully_qualified && n.parts.len() == 1 => {
+                            n.last().to_string()
+                        }
+                        _ => return bail("expr:static-prop-shape"),
+                    };
+                    let ci = self.name(&raw)?;
+                    let ni = self.name(pname)?;
+                    self.needs_ctx = true;
+                    self.expr(rhs)?;
+                    self.ops.push(Op::StoreStaticProp { class: ci, name: ni });
+                    Some(())
+                }
+                other => bail(expr_name(other)),
             },
             Expr::AssignOp(op, lhs, rhs) if self.this_prop(lhs).is_some() => {
                 let p = self.this_prop(lhs)?;
@@ -1267,6 +1450,52 @@ impl<'a> Compiler<'a> {
                 self.needs_ctx = true;
                 self.ops.push(Op::ClassConstOp { class: ci, name: ni });
             }
+            Expr::StaticProp(class, pname) => {
+                let raw = match &**class {
+                    Expr::ConstFetch(n) if !n.fully_qualified && n.parts.len() == 1 => {
+                        n.last().to_string()
+                    }
+                    _ => return bail("expr:static-prop-shape"),
+                };
+                let ci = self.name(&raw)?;
+                let ni = self.name(pname)?;
+                self.needs_ctx = true;
+                self.ops.push(Op::LoadStaticProp { class: ci, name: ni });
+            }
+            Expr::InstanceOf(v, class) => {
+                let raw = match &**class {
+                    Expr::ConstFetch(n) if !n.fully_qualified && n.parts.len() == 1 => {
+                        n.last().to_string()
+                    }
+                    _ => return bail("expr:instanceof-shape"),
+                };
+                self.expr(v)?;
+                let ci = self.name(&raw)?;
+                self.needs_ctx = true;
+                self.ops.push(Op::InstanceOfOp { class: ci });
+            }
+            Expr::MagicConst(m) => {
+                use super::value::Value;
+                let v = match m.to_ascii_uppercase().as_str() {
+                    "__FILE__" => Value::Str(self.magic.file.clone().into_bytes()),
+                    "__DIR__" => Value::Str(self.magic.dir.clone().into_bytes()),
+                    "__FUNCTION__" => Value::Str(self.magic.function.clone().into_bytes()),
+                    "__CLASS__" => Value::Str(self.magic.class.clone().into_bytes()),
+                    "__METHOD__" => {
+                        let m = if self.magic.class.is_empty() {
+                            self.magic.function.clone()
+                        } else {
+                            format!("{}::{}", self.magic.class, self.magic.function)
+                        };
+                        Value::Str(m.into_bytes())
+                    }
+                    "__NAMESPACE__" => Value::Str(self.magic.namespace.clone().into_bytes()),
+                    // __LINE__ varies per use site; keep it on the walker
+                    _ => return bail("expr:magic-line"),
+                };
+                let k = self.konst(v)?;
+                self.ops.push(Op::Const(k));
+            }
             Expr::ConstFetch(n) => {
                 if n.parts.len() != 1 {
                     return None;
@@ -1319,7 +1548,7 @@ impl<'a> Compiler<'a> {
                 self.n_sites = self.n_sites.checked_add(1)?;
                 self.ops.push(Op::CallFn { name: ni, argc: args.len() as u8, site });
             }
-            _ => return None,
+            other => return bail(expr_name(other)),
         }
         Some(())
     }

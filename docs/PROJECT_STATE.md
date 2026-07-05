@@ -198,6 +198,25 @@ calls binding args directly into callee slots, skipping the scope
 HashMap/def-ctx/frame machinery for compiled callees. Also: compile rate
 614/2030 WP bodies; next bail causes worth a census after calls land.**
 
+**UPDATE (2026-07-08, Phase 2 continues):** fast calls + call-site memos
+landed; then six feature families: `global`, static props, `instanceof`,
+magic constants (definition-site, derived from the chunk's owner +
+def-ctx map — NOT evaluator state at compile time), `unset`, and
+`static` vars. Statics introduced the aliasing model: slots can hold the
+walker's `Value::Ref` cells and every slot op writes THROUGH them —
+`global` then became true Ref binding (copy-sync machinery deleted).
+Static initializers run ONCE (StaticCheck/StaticInit op pair — PHP 8.3
+allows side effects there). Collateral walker bugs found by
+engine-racing: `.=` fast path severed Ref cells; VM fast paths skipped
+return-type coercion; IssetIndex missed offsetExists. Walker 3867 / VM
+3873 (17.6%), WP byte-identical, A/B 16/16. WP bail census 4019 → ~1200
+events (top rest: closures 469, try 322, assign-ref 76). Page only
+7.6s → 7.3s — **profiler says the wall is clone pressure now:
+`Value::deref` deep-clones array elements per read (3.9k/5k samples in
+Vec::clone). Next rung: copy-on-write `Arr` (Rc<ArrData> + make_mut,
+~110 direct `.entries` sites) — lifts BOTH engines and probably some
+OOM/step-limit corpus fails too.**
+
 **UPDATE (2026-07-05): "Hello world!" RENDERS.** Named SQL parameters now
 bind via rusqlite raw_bind_parameter/parameter_index (the PDO prelude's
 bindValue had cast ":param0" to int 0; execute() flattened assoc arrays).

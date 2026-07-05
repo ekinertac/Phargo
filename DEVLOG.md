@@ -27,6 +27,64 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-08 (later) — Statics by reference, and the day the slot learned to alias.
+
+**Six new feature families compile now — `global`, static properties,
+`instanceof`, magic constants, `unset`, and `static` variables — and the
+WordPress bail census collapsed from 4019 events to ~1200.** The first five
+were straightforward ops. The sixth forced the VM to grow a real aliasing
+model, and that model then paid for itself three times over.
+
+The design question for `static $x`: sync copies around every call (the
+old `global` approximation), or teach slots to hold the walker's own
+`Value::Ref` cells and write THROUGH them? Copy-sync loses recursion
+(`static $n = 0; $n++; if ($n < 3) f();` — inner increments overwritten at
+outer exit) and clones a possibly-huge memo array around every out-of-VM
+call — the 48× lesson wearing a new hat. So: write-through. `BindStatic`
+puts the cell itself in the slot; every slot accessor (load, store,
+indexed read/write, append, foreach, isset, `.=`, nested paths) learned
+one branch: if the slot holds a Ref, operate inside the cell.
+
+Once slots could alias, `global` stopped being an approximation too — it
+now binds the global's Ref cell exactly like the walker's `Stmt::Global`,
+and the whole copy-in/copy-out sync machinery got DELETED. The corpus
+immediately validated the model: `this_assignment.phpt` (write to `$b`
+mid-function visible through alias `$a` — impossible under copy-sync)
+went green.
+
+Then the oracle collected its usual tax, one lesson per test:
+
+- **The walker's `.=` fast path was severing static cells.** The VM's
+  static test produced "aababc"; the walker said "abc". Real PHP says the
+  VM was right — `*slot = Value::Str(...)` on a Ref-holding scope entry
+  replaces the cell instead of writing into it. A walker bug found by
+  racing the walker against its own replacement.
+- **`static $bar = bar();` runs its initializer ONCE** (side-effecting
+  initializers are legal since 8.3). One `BindStatic` op re-evaluated it
+  per call; it's now a `StaticCheck`/`StaticInit` pair where the check
+  jumps over the init ops when the cell already exists.
+- **Declared return types coerce.** `function test(): string` turning
+  array-key `int(10)` back into `"10"` happens in the walker's call exit;
+  the VM fast paths skipped it (bug63217).
+- **`isset($obj[k])` calls `offsetExists`** — with the RAW key, not the
+  normalized one. The VM's IssetIndex fell through to "not an array →
+  false".
+- **Magic constants are definition-site facts.** `__FUNCTION__` compiled
+  from `cur_fn` embedded the CALLER's name when compilation was triggered
+  lazily from a call site. Now derived from the chunk's owner + the
+  def-ctx map.
+
+Numbers: walker 3866 → 3867, VM 3873 (holds the lead; the two batch
+losses were both recovered by the fixes above). WP front page byte-
+identical on both engines; A/B harness 16/16 including recursion,
+memoization, cross-instance method statics, and mid-chunk alias cases.
+
+Perf reality check: page render 7.6s → 7.3s despite tripling compile
+coverage. A sample profile says why — the wall isn't dispatch anymore,
+it's CLONE PRESSURE: `Value::deref` deep-copies array elements on every
+read (3.9k of 5k samples land in `Vec::clone` under it). The next rung
+was named by the profiler, not the census: copy-on-write arrays.
+
 ## 2026-07-08 — The reverse diff pays twice.
 
 **The 24 tests that passed only under the VM were walker bugs — in the

@@ -21,7 +21,7 @@ pub struct RunError(pub String);
 #[derive(Clone)]
 enum VmOwner {
     Fn(Rc<FuncDecl>),
-    Method(Rc<MethodDecl>),
+    Method(Rc<MethodDecl>, String), // + declaring class
     Top,
 }
 
@@ -2716,14 +2716,25 @@ impl Eval {
                             .vars()
                             .entry(name.clone())
                             .or_insert(Value::Str(Vec::new()));
-                        if let Value::Str(s) = slot {
+                        // static/global-bound vars hold a Ref cell: append
+                        // INSIDE it — replacing the slot would sever the cell
+                        let cell = if let Value::Ref(c) = slot { Some(c.clone()) } else { None };
+                        let mut guard;
+                        let target: &mut Value = match &cell {
+                            Some(c) => {
+                                guard = c.borrow_mut();
+                                &mut *guard
+                            }
+                            None => slot,
+                        };
+                        if let Value::Str(s) = target {
                             if s.len() + rb.len() <= MAX_STR {
                                 s.extend_from_slice(&rb);
                             }
                         } else {
-                            let mut s = to_bytes(slot);
+                            let mut s = to_bytes(target);
                             s.extend_from_slice(&rb);
-                            *slot = Value::Str(s);
+                            *target = Value::Str(s);
                         }
                         return Ok(Flow::Normal);
                     }
@@ -4539,7 +4550,7 @@ impl Eval {
         };
         let params: Option<&[Param]> = match &owner {
             VmOwner::Fn(f) => Some(&f.params),
-            VmOwner::Method(m) => Some(&m.params),
+            VmOwner::Method(m, _) => Some(&m.params),
             VmOwner::Top => None,
         };
         // by-ref parameters live in the scope map (the walker's capture/
@@ -4548,19 +4559,57 @@ impl Eval {
         // RETURNS need write-context lvalue fetches the VM doesn't model.
         let by_ref_return = match &owner {
             VmOwner::Fn(f) => f.by_ref_return,
-            VmOwner::Method(m) => m.by_ref_return,
+            VmOwner::Method(m, _) => m.by_ref_return,
             VmOwner::Top => false,
         };
         if by_ref_return || params.map(|ps| ps.iter().any(|p| p.by_ref)).unwrap_or(false) {
             self.vm_cache.insert(key, (None, owner));
             return None;
         }
-        let chunk = crate::lang::vm::Compiler::compile(body, top_level, params, &resolver).map(|mut c| {
+        // magic constants are definition-site facts: derive them from the
+        // OWNER's recorded def-ctx, never from the (possibly caller) current
+        // state — call-site-triggered compiles otherwise embed caller context
+        let (fname, cls, ctx_key) = match &owner {
+            VmOwner::Fn(f) => (f.name.clone(), String::new(), format!("fn:{}", f.name.to_ascii_lowercase())),
+            VmOwner::Method(m, decl) => (
+                m.name.clone(),
+                decl.clone(),
+                format!("class:{}", decl.to_ascii_lowercase()),
+            ),
+            VmOwner::Top => (String::new(), String::new(), String::new()),
+        };
+        let (file, ns) = match self.def_ctx.get(&ctx_key) {
+            Some(ctx) => (
+                ctx.file
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                ctx.ns.clone(),
+            ),
+            None => (self.cur_file_str(), self.cur_ns.clone()),
+        };
+        let dir = std::path::Path::new(&file)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let magic = crate::lang::vm::MagicCtx {
+            file,
+            dir,
+            function: fname,
+            class: cls,
+            namespace: ns,
+        };
+        let chunk = crate::lang::vm::Compiler::compile(body, top_level, params, &magic, &resolver).map(|mut c| {
             c.debug_name = self.cur_fn.last().cloned().unwrap_or_else(|| "{top}".into());
             Rc::new(c)
         });
         if std::env::var("PHARGO_VM_DEBUG").is_ok() && chunk.is_none() {
-            eprintln!("[vm bail] {}", self.cur_fn.last().cloned().unwrap_or_else(|| "{top}".into()));
+            let reason = crate::lang::vm::LAST_BAIL.with(|b| *b.borrow());
+            eprintln!(
+                "[vm bail] {} :: {}",
+                self.cur_fn.last().cloned().unwrap_or_else(|| "{top}".into()),
+                reason
+            );
         }
         self.vm_cache.insert(key, (chunk.clone(), owner));
         chunk
@@ -4669,7 +4718,15 @@ impl Eval {
         self.cur_fn.pop();
         self.frames.pop();
         self.call_depth -= 1;
-        r
+        // declared return types coerce, exactly like call_user's exit path
+        match &f.ret_type {
+            Some(_) => {
+                let rt = f.ret_type.clone();
+                let fname = f.name.clone();
+                r.and_then(|v| self.check_return(v, &rt, &fname))
+            }
+            None => r,
+        }
     }
 
     /// Fast method dispatch (see vm_fast_call): public untyped instance
@@ -4735,7 +4792,14 @@ impl Eval {
         self.cur_fn.pop();
         self.frames.pop();
         self.call_depth -= 1;
-        r
+        match &m.ret_type {
+            Some(_) => {
+                let rt = m.ret_type.clone();
+                let fname = m.name.clone();
+                r.and_then(|v| self.check_return(v, &rt, &fname))
+            }
+            None => r,
+        }
     }
 
     /// Top-level chunk slot<->scope synchronization around out-of-VM calls
@@ -4778,6 +4842,10 @@ impl Eval {
                 None => {}
             }
         }
+    }
+
+    fn vars_global(&mut self) -> &mut HashMap<String, Value> {
+        &mut self.scopes[0]
     }
 
     fn run_chunk_inner(
@@ -4829,12 +4897,25 @@ impl Eval {
                         }
                         self.warn(&format!("Undefined variable ${}", chunk.slot_names[i]))?;
                     }
-                    stack.push(slots[i].clone());
+                    stack.push(match &slots[i] {
+                        Value::Ref(c) => c.borrow().clone(),
+                        v => v.clone(),
+                    });
                 }
-                Op::LoadQuiet(i) => stack.push(slots[*i as usize].clone()),
+                Op::LoadQuiet(i) => stack.push(match &slots[*i as usize] {
+                    Value::Ref(c) => c.borrow().clone(),
+                    v => v.clone(),
+                }),
                 Op::Store(i) => {
                     let i = *i as usize;
-                    slots[i] = pop!();
+                    let v = pop!();
+                    // statics: the slot holds the persistent Ref cell — write
+                    // into it, never replace it
+                    if let Value::Ref(c) = &slots[i] {
+                        *c.borrow_mut() = v;
+                    } else {
+                        slots[i] = v;
+                    }
                     assigned[i] = true;
                 }
                 Op::Dup => {
@@ -4907,7 +4988,11 @@ impl Eval {
                 }
                 Op::IssetSlot(i) => {
                     let i = *i as usize;
-                    stack.push(Value::Bool(assigned[i] && !matches!(slots[i], Value::Null)));
+                    let live = match &slots[i] {
+                        Value::Ref(c) => !matches!(&*c.borrow(), Value::Null),
+                        v => !matches!(v, Value::Null),
+                    };
+                    stack.push(Value::Bool(assigned[i] && live));
                 }
                 Op::UnsetSlot(i) => {
                     let i = *i as usize;
@@ -5001,7 +5086,15 @@ impl Eval {
                     let checked = matches!(op, Op::LoadIndex(_));
                     let kv = pop!();
                     let i = *i as usize;
-                    if let Value::Object(rc) = &slots[i] {
+                    let obj_rc = match &slots[i] {
+                        Value::Object(rc) => Some(rc.clone()),
+                        Value::Ref(c) => match &*c.borrow() {
+                            Value::Object(rc) => Some(rc.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(rc) = obj_rc {
                         let class = rc.borrow().class.clone();
                         if self.find_method(&class, "offsetget").is_some() {
                             let obj = Value::Object(rc.clone());
@@ -5017,7 +5110,15 @@ impl Eval {
                         }
                     }
                     let k = Arr::norm_key(&kv);
-                    let got = match &slots[i] {
+                    let borrow;
+                    let root: &Value = match &slots[i] {
+                        Value::Ref(c) => {
+                            borrow = c.borrow();
+                            &*borrow
+                        }
+                        v => v,
+                    };
+                    let got = match root {
                         Value::Array(a) => a.get(&k).map(|v| v.deref()),
                         Value::Str(s) => {
                             // string offset read
@@ -5034,7 +5135,7 @@ impl Eval {
                     match got {
                         Some(v) => stack.push(v),
                         None => {
-                            if checked && matches!(slots[i], Value::Array(_)) {
+                            if checked && matches!(root, Value::Array(_)) {
                                 let msg = match &k {
                                     Key::Int(n) => format!("Undefined array key {n}"),
                                     Key::Str(s) => format!(
@@ -5053,7 +5154,15 @@ impl Eval {
                     let kv = pop!();
                     let i = *i as usize;
                     // ArrayAccess object in the slot: offsetSet, like assign_index
-                    if let Value::Object(rc) = &slots[i] {
+                    let obj_rc = match &slots[i] {
+                        Value::Object(rc) => Some(rc.clone()),
+                        Value::Ref(c) => match &*c.borrow() {
+                            Value::Object(rc) => Some(rc.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(rc) = obj_rc {
                         let class = rc.borrow().class.clone();
                         if self.find_method(&class, "offsetset").is_some() {
                             let obj = Value::Object(rc.clone());
@@ -5068,11 +5177,21 @@ impl Eval {
                         }
                     }
                     let k = Arr::norm_key(&kv);
-                    if !matches!(slots[i], Value::Array(_)) {
-                        slots[i] = Value::Array(Arr::new());
+                    // statics: mutate inside the Ref cell, in place
+                    let cell = if let Value::Ref(c) = &slots[i] { Some(c.clone()) } else { None };
+                    let mut guard;
+                    let target: &mut Value = match &cell {
+                        Some(c) => {
+                            guard = c.borrow_mut();
+                            &mut *guard
+                        }
+                        None => &mut slots[i],
+                    };
+                    if !matches!(*target, Value::Array(_)) {
+                        *target = Value::Array(Arr::new());
                     }
                     assigned[i] = true;
-                    if let Value::Array(a) = &mut slots[i] {
+                    if let Value::Array(a) = target {
                         a.insert(k, v);
                         if a.len() > MAX_ARRAY_NODES {
                             return Err(self.throw_error("Error", "Allocated array exceeds memory limit"));
@@ -5082,7 +5201,15 @@ impl Eval {
                 Op::Append(i) => {
                     let v = pop!();
                     let i = *i as usize;
-                    if let Value::Object(rc) = &slots[i] {
+                    let obj_rc = match &slots[i] {
+                        Value::Object(rc) => Some(rc.clone()),
+                        Value::Ref(c) => match &*c.borrow() {
+                            Value::Object(rc) => Some(rc.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(rc) = obj_rc {
                         let class = rc.borrow().class.clone();
                         if self.find_method(&class, "offsetset").is_some() {
                             let obj = Value::Object(rc.clone());
@@ -5096,11 +5223,20 @@ impl Eval {
                             continue;
                         }
                     }
-                    if !matches!(slots[i], Value::Array(_)) {
-                        slots[i] = Value::Array(Arr::new());
+                    let cell = if let Value::Ref(c) = &slots[i] { Some(c.clone()) } else { None };
+                    let mut guard;
+                    let target: &mut Value = match &cell {
+                        Some(c) => {
+                            guard = c.borrow_mut();
+                            &mut *guard
+                        }
+                        None => &mut slots[i],
+                    };
+                    if !matches!(*target, Value::Array(_)) {
+                        *target = Value::Array(Arr::new());
                     }
                     assigned[i] = true;
-                    if let Value::Array(a) = &mut slots[i] {
+                    if let Value::Array(a) = target {
                         a.push(v);
                         if a.len() > MAX_ARRAY_NODES {
                             return Err(self.throw_error("Error", "Allocated array exceeds memory limit"));
@@ -5129,16 +5265,33 @@ impl Eval {
                     if !assigned[i] {
                         self.warn(&format!("Undefined variable ${}", chunk.slot_names[i]))?;
                     }
-                    match &slots[i] {
-                        Value::Array(a) => {
-                            iters.push(VmIter::Snapshot(a.entries.clone(), 0));
+                    // statics: dispatch on the value inside the Ref cell.
+                    // Arrays snapshot their entries anyway; objects are
+                    // Rc-shared, so an owned view costs nothing extra.
+                    enum IterRoot {
+                        Arr(Vec<(Key, Value)>),
+                        Obj(Rc<RefCell<Obj>>),
+                        Other(String),
+                    }
+                    let root = match &slots[i] {
+                        Value::Array(a) => IterRoot::Arr(a.entries.clone()),
+                        Value::Object(rc) => IterRoot::Obj(rc.clone()),
+                        Value::Ref(c) => match &*c.borrow() {
+                            Value::Array(a) => IterRoot::Arr(a.entries.clone()),
+                            Value::Object(rc) => IterRoot::Obj(rc.clone()),
+                            v => IterRoot::Other(self.given_type(v)),
+                        },
+                        v => IterRoot::Other(self.given_type(v)),
+                    };
+                    match root {
+                        IterRoot::Arr(entries) => {
+                            iters.push(VmIter::Snapshot(entries, 0));
                         }
-                        Value::Object(rc) => {
+                        IterRoot::Obj(rc) => {
                             // mirror the walker: IteratorAggregate -> real
                             // iterator; Iterator protocol driven per round;
                             // plain object -> property snapshot. Protocol
                             // methods are user code: sync top-level slots.
-                            let rc = rc.clone();
                             if chunk.top_level {
                                 self.vm_sync_out(chunk, slots, assigned);
                             }
@@ -5178,8 +5331,7 @@ impl Eval {
                                 iters.push(VmIter::Snapshot(props, 0));
                             }
                         }
-                        other => {
-                            let t = self.given_type(other);
+                        IterRoot::Other(t) => {
                             self.warn(&format!(
                                 "foreach() argument must be of type array|object, {t} given"
                             ))?;
@@ -5233,11 +5385,20 @@ impl Eval {
                     match round {
                         Round::Bind(v, k) => {
                             let vi = *val_slot as usize;
-                            slots[vi] = v;
+                            if let Value::Ref(c) = &slots[vi] {
+                                *c.borrow_mut() = v;
+                            } else {
+                                slots[vi] = v;
+                            }
                             assigned[vi] = true;
                             if *key_slot != u16::MAX {
                                 let ki = *key_slot as usize;
-                                slots[ki] = k.unwrap_or(Value::Null);
+                                let kv = k.unwrap_or(Value::Null);
+                                if let Value::Ref(c) = &slots[ki] {
+                                    *c.borrow_mut() = kv;
+                                } else {
+                                    slots[ki] = kv;
+                                }
                                 assigned[ki] = true;
                             }
                         }
@@ -5257,14 +5418,23 @@ impl Eval {
                     let rhs = pop!();
                     let b = self.stringify(&rhs)?;
                     let i = *i as usize;
-                    if let Value::Str(s) = &mut slots[i] {
+                    let cell = if let Value::Ref(c) = &slots[i] { Some(c.clone()) } else { None };
+                    let mut guard;
+                    let target: &mut Value = match &cell {
+                        Some(c) => {
+                            guard = c.borrow_mut();
+                            &mut *guard
+                        }
+                        None => &mut slots[i],
+                    };
+                    if let Value::Str(s) = target {
                         if s.len() + b.len() <= MAX_STR {
                             s.extend_from_slice(&b);
                         }
                     } else {
-                        let mut s = to_bytes(&slots[i]);
+                        let mut s = to_bytes(target);
                         s.extend_from_slice(&b);
-                        slots[i] = Value::Str(s);
+                        *target = Value::Str(s);
                     }
                     assigned[i] = true;
                 }
@@ -5286,7 +5456,15 @@ impl Eval {
                             })
                             .unwrap_or(Value::Null)
                     } else {
-                        read_index_value(&slots[*slot as usize], prefix)
+                        let borrow;
+                        let root: &Value = match &slots[*slot as usize] {
+                            Value::Ref(c) => {
+                                borrow = c.borrow();
+                                &*borrow
+                            }
+                            v => v,
+                        };
+                        read_index_value(root, prefix)
                     };
                     let k = &last[0];
                     let v = match &container {
@@ -5339,16 +5517,146 @@ impl Eval {
                         }
                     } else {
                         let i = *slot as usize;
-                        if !matches!(slots[i], Value::Array(_)) {
-                            slots[i] = Value::Array(Arr::new());
+                        let cell = if let Value::Ref(c) = &slots[i] { Some(c.clone()) } else { None };
+                        let mut guard;
+                        let target: &mut Value = match &cell {
+                            Some(c) => {
+                                guard = c.borrow_mut();
+                                &mut *guard
+                            }
+                            None => &mut slots[i],
+                        };
+                        if !matches!(*target, Value::Array(_)) {
+                            *target = Value::Array(Arr::new());
                         }
                         assigned[i] = true;
-                        if let Value::Array(a) = &mut slots[i] {
+                        if let Value::Array(a) = target {
                             write_index_path(a, &keys, v, append);
                             if a.len() > MAX_ARRAY_NODES {
                                 return Err(self.throw_error("Error", "Allocated array exceeds memory limit"));
                             }
                         }
+                    }
+                }
+                Op::BindGlobal { slot, name } => {
+                    let i = *slot as usize;
+                    let gname = chunk.names[*name as usize].clone();
+                    // bind by REFERENCE, exactly like the walker's
+                    // Stmt::Global: promote the global entry to a shared Ref
+                    // cell and put the cell in the slot — write-through slot
+                    // ops keep aliasing live across out-of-VM calls
+                    let cur = self.vars_global().get(&gname).cloned();
+                    let cell = match cur {
+                        Some(Value::Ref(c)) => c,
+                        other => {
+                            let c = Rc::new(RefCell::new(other.unwrap_or(Value::Null)));
+                            self.vars_global().insert(gname, Value::Ref(c.clone()));
+                            c
+                        }
+                    };
+                    slots[i] = Value::Ref(cell);
+                    assigned[i] = true;
+                }
+                Op::StaticCheck { slot, key, done } => {
+                    let ks = &chunk.names[*key as usize];
+                    // names[key] is "Class::fn\0varname" — the walker's own
+                    // static_vars key, so walker and VM share the same cells
+                    let sep = ks.find('\0').unwrap_or(0);
+                    let mk = (ks[..sep].to_string(), ks[sep + 1..].to_string());
+                    if let Some(Value::Ref(c)) = self.static_vars.get(&mk) {
+                        let i = *slot as usize;
+                        slots[i] = Value::Ref(c.clone());
+                        assigned[i] = true;
+                        pc = *done as usize;
+                    }
+                }
+                Op::StaticInit { slot, key } => {
+                    let init = pop!();
+                    let i = *slot as usize;
+                    let ks = &chunk.names[*key as usize];
+                    let sep = ks.find('\0').unwrap_or(0);
+                    let mk = (ks[..sep].to_string(), ks[sep + 1..].to_string());
+                    let c = Rc::new(RefCell::new(init));
+                    self.static_vars.insert(mk, Value::Ref(c.clone()));
+                    slots[i] = Value::Ref(c);
+                    assigned[i] = true;
+                }
+                Op::LoadStaticProp { class, name } => {
+                    let raw = chunk.names[*class as usize].clone();
+                    let cname = self.vm_resolve_class(&raw);
+                    let pname = chunk.names[*name as usize].clone();
+                    let key = self.static_prop_key(&cname, &pname)?;
+                    let v = self.static_props.get(&key).cloned().unwrap_or(Value::Null);
+                    stack.push(if let Value::Ref(c) = &v { c.borrow().clone() } else { v });
+                }
+                Op::StoreStaticProp { class, name } => {
+                    let val = pop!();
+                    let raw = chunk.names[*class as usize].clone();
+                    let cname = self.vm_resolve_class(&raw);
+                    let pname = chunk.names[*name as usize].clone();
+                    let key = self.static_prop_key(&cname, &pname)?;
+                    self.static_props.insert(key, val);
+                }
+                Op::InstanceOfOp { class } => {
+                    let v = pop!();
+                    let raw = chunk.names[*class as usize].clone();
+                    let target = self.vm_resolve_class(&raw);
+                    stack.push(Value::Bool(match &v {
+                        Value::Object(rc) => {
+                            let c = rc.borrow().class.clone();
+                            self.is_subclass(&c, &target)
+                        }
+                        _ => false,
+                    }));
+                }
+                Op::UnsetIndex(i) => {
+                    let kv = pop!();
+                    let i = *i as usize;
+                    let obj_rc = match &slots[i] {
+                        Value::Object(rc) => Some(rc.clone()),
+                        Value::Ref(c) => match &*c.borrow() {
+                            Value::Object(rc) => Some(rc.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(rc) = obj_rc {
+                        let class = rc.borrow().class.clone();
+                        if self.find_method(&class, "offsetunset").is_some() {
+                            let obj = Value::Object(rc.clone());
+                            self.call_method(obj, "offsetUnset", vec![kv])?;
+                            continue;
+                        }
+                    }
+                    let k = Arr::norm_key(&kv);
+                    let cell = if let Value::Ref(c) = &slots[i] { Some(c.clone()) } else { None };
+                    let mut guard;
+                    let target: &mut Value = match &cell {
+                        Some(c) => {
+                            guard = c.borrow_mut();
+                            &mut *guard
+                        }
+                        None => &mut slots[i],
+                    };
+                    if let Value::Array(a) = target {
+                        a.remove(&k);
+                    }
+                }
+                Op::UnsetThisPropIndex(i) => {
+                    let kv = pop!();
+                    let k = Arr::norm_key(&kv);
+                    if let Some(rc) = this_rc {
+                        let name = &chunk.names[*i as usize];
+                        let mut b = rc.borrow_mut();
+                        if let Some(Value::Array(a)) = b.get_mut(name) {
+                            a.remove(&k);
+                        }
+                    }
+                }
+                Op::UnsetThisProp(i) => {
+                    if let Some(rc) = this_rc {
+                        let name = &chunk.names[*i as usize];
+                        rc.borrow_mut().props.retain(|(k, _)| k != name);
                     }
                 }
                 Op::ClassConstOp { class, name } => {
@@ -5378,9 +5686,42 @@ impl Eval {
                 }
                 Op::IssetIndex(i) => {
                     let kv = pop!();
-                    let k = Arr::norm_key(&kv);
                     let i = *i as usize;
-                    let b = match &slots[i] {
+                    // ArrayAccess: PHP calls offsetExists (raw key, not
+                    // normalized), like the walker's isset_one
+                    let obj_rc = match &slots[i] {
+                        Value::Object(rc) => Some(rc.clone()),
+                        Value::Ref(c) => match &*c.borrow() {
+                            Value::Object(rc) => Some(rc.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(rc) = obj_rc {
+                        let class = rc.borrow().class.clone();
+                        if self.find_method(&class, "offsetexists").is_some() {
+                            let obj = Value::Object(rc.clone());
+                            if chunk.top_level {
+                                self.vm_sync_out(chunk, slots, assigned);
+                            }
+                            let v = self.call_method(obj, "offsetExists", vec![kv])?;
+                            if chunk.top_level {
+                                self.vm_sync_in(chunk, slots, assigned);
+                            }
+                            stack.push(Value::Bool(to_bool(&v)));
+                            continue;
+                        }
+                    }
+                    let k = Arr::norm_key(&kv);
+                    let borrow;
+                    let root: &Value = match &slots[i] {
+                        Value::Ref(c) => {
+                            borrow = c.borrow();
+                            &*borrow
+                        }
+                        v => v,
+                    };
+                    let b = match root {
                         Value::Array(a) => a.get(&k).map(|v| !matches!(v.deref(), Value::Null)).unwrap_or(false),
                         Value::Str(s) => {
                             let idx = to_i64(&kv);
@@ -5599,7 +5940,7 @@ impl Eval {
                                         match self.vm_chunk_for(
                                             m.body.as_deref().unwrap_or(&[]),
                                             false,
-                                            VmOwner::Method(m.clone()),
+                                            VmOwner::Method(m.clone(), decl_class.clone()),
                                         ) {
                                             Some(cc) if cc.fast_callable => {
                                                 crate::lang::vm::Callee::FastMethod {
@@ -7701,7 +8042,7 @@ impl Eval {
         self.byref_ret.push(m.by_ref_return);
         self.scopes.push(scope);
         if self.vm_enabled {
-            self.vm_next_owner = Some(VmOwner::Method(m.clone()));
+            self.vm_next_owner = Some(VmOwner::Method(m.clone(), decl_class.to_string()));
         }
         let r = self.run_fn_body(m.body.as_deref().unwrap_or(&[]));
         let wb = self.capture_byref(&m.params, byref);
@@ -7888,7 +8229,7 @@ impl Eval {
         self.byref_ret.push(m.by_ref_return);
         self.scopes.push(scope);
         if self.vm_enabled {
-            self.vm_next_owner = Some(VmOwner::Method(m.clone()));
+            self.vm_next_owner = Some(VmOwner::Method(m.clone(), decl_class.to_string()));
         }
         let r = self.run_fn_body(m.body.as_deref().unwrap_or(&[]));
         let wb = self.capture_byref(&m.params, byref);
