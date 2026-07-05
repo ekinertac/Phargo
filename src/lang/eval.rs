@@ -3432,9 +3432,16 @@ impl Eval {
         RunError("__phargo_exit__".into())
     }
 
-    /// Swap unserialize's E:-token placeholder objects for the real enum
-    /// case singletons (class_const caches them, so === identity holds).
-    fn resolve_enum_placeholders(&mut self, v: Value) -> R<Value> {
+    /// Post-unserialize fixups: swap E:-token placeholders for real enum
+    /// case singletons (class_const caches them, so === identity holds), and
+    /// turn unknown/disallowed classes into __PHP_Incomplete_Class objects.
+    /// allowed: None = everything allowed; Some(list) = whitelist (empty =
+    /// allowed_classes:false).
+    fn resolve_enum_placeholders(
+        &mut self,
+        v: Value,
+        allowed: Option<&[String]>,
+    ) -> R<Value> {
         match v {
             Value::Object(rc) => {
                 let (is_ph, class, name) = {
@@ -3457,6 +3464,32 @@ impl Eval {
                     }
                     return Ok(Value::Bool(false));
                 }
+                let permitted = allowed
+                    .map(|list| list.iter().any(|c| c.eq_ignore_ascii_case(&class)))
+                    .unwrap_or(true);
+                if class != "__PHP_Incomplete_Class"
+                    && (!permitted || self.find_class_autoload(&class).is_none())
+                {
+                    // PHP marks the object incomplete: name prop first, then
+                    // the original data props
+                    let mut o = Obj::new("__PHP_Incomplete_Class".to_string());
+                    o.set(
+                        "__PHP_Incomplete_Class_Name",
+                        Value::Str(class.into_bytes()),
+                    );
+                    let props: Vec<(String, Value)> = rc.borrow().props.clone();
+                    for (k, val) in props {
+                        let nv = self.resolve_enum_placeholders(val, allowed)?;
+                        o.set(&k, nv);
+                    }
+                    return Ok(Value::Object(Rc::new(RefCell::new(o))));
+                }
+                // descend into props (nested enums / nested objects)
+                let props: Vec<(String, Value)> = rc.borrow().props.clone();
+                for (k, val) in props {
+                    let nv = self.resolve_enum_placeholders(val, allowed)?;
+                    rc.borrow_mut().set(&k, nv);
+                }
                 Ok(Value::Object(rc))
             }
             Value::Array(a) => {
@@ -3464,7 +3497,7 @@ impl Eval {
                 // re-inserting into the same Arr would hit a bad index
                 let mut out = Arr::new();
                 for (k, val) in a.into_entries() {
-                    let nv = self.resolve_enum_placeholders(val)?;
+                    let nv = self.resolve_enum_placeholders(val, allowed)?;
                     out.insert(k, nv);
                 }
                 Ok(Value::Array(out))
@@ -12508,9 +12541,29 @@ impl Eval {
             }
             "unserialize" => {
                 let bytes = to_bytes(&a(0));
+                // options: ["allowed_classes" => true|false|[names]]
+                let allowed: Option<Vec<String>> = match &a(1) {
+                    Value::Array(opts) => match opts.get(&Key::Str(b"allowed_classes".to_vec())) {
+                        Some(Value::Bool(true)) | None => None,
+                        Some(Value::Bool(false)) => Some(Vec::new()),
+                        Some(Value::Array(list)) => {
+                            // entries may be stringable objects (__toString)
+                            let mut names = Vec::new();
+                            let items: Vec<Value> =
+                                list.entries().iter().map(|(_, v)| v.clone()).collect();
+                            for v in items {
+                                let b = self.stringify(&v)?;
+                                names.push(String::from_utf8_lossy(&b).into_owned());
+                            }
+                            Some(names)
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 let mut pos = 0;
                 let v = php_unserialize(&bytes, &mut pos, 0).unwrap_or(Value::Bool(false));
-                let v = self.resolve_enum_placeholders(v)?;
+                let v = self.resolve_enum_placeholders(v, allowed.as_deref())?;
                 self.apply_wakeup(&v, 0)?;
                 v
             }
