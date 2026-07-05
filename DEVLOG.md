@@ -27,6 +27,30 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-11 — Validation belongs at compile time. Both engines cross 4000.
+
+**Walker 3999, VM 4005 (from 3964/3959).** A run of small rungs — b"1"
+binary-string literals (one lexer arm was an entire "expected RParen,
+found Template" parse cluster), dynamic static calls `C::$m()` (which
+had been silently misparsed as calling a null static prop — an intl
+test only ever passed because three NULLs compare equal), group `use`
+declarations, use-function aliases, enum case props throwing on write,
+enums registering as final, ReflectionClass flags backed by real
+ClassDecl data instead of `return false` stubs, and four property-hook
+declaration fatals with PHP-verified texts.
+
+The structural lesson: the hook/enum validations first ran at
+STATEMENT-EXECUTION time, and the walker dutifully fataled while the
+VM — which compiles hoisted class declarations to no-ops and never
+re-executes them — sailed past and printed nothing. PHP fatals these
+at compile time, before any output. Validation now runs during hoist
+and parks its message in a pending slot the run boundary checks —
+one semantics, both engines, and closer to PHP than the exec-time
+version ever was. (The recurring walker "loss" in these boards is
+bug73837, a test that busy-loops two wall-clock seconds constructing
+DateTimes and oscillates around our step limit — php-src itself tags
+it SKIP_SLOW_TESTS.)
+
 ## 2026-07-10 (later) — Property hooks: get/set as methods in disguise. Both engines cross 18%.
 
 **Walker 3940 → 3964, VM 3934 → 3959 (+25 each).** PHP 8.4's property

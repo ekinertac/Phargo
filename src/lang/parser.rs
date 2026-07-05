@@ -876,6 +876,34 @@ impl Parser {
             let kind = match self.bump() {
                 Kind::Ident(s) if s.eq_ignore_ascii_case("get") => "get",
                 Kind::Ident(s) if s.eq_ignore_ascii_case("set") => "set",
+                Kind::Ident(s) => {
+                    // unknown hook name: record a marker method (bad name
+                    // carried in ret_type) — class registration fatals with
+                    // PHP's message; skip past this hook's body
+                    if matches!(self.kind(), Kind::LParen) {
+                        self.parse_params()?;
+                    }
+                    if self.eat(&Kind::FatArrow) {
+                        self.expr()?;
+                        self.semi()?;
+                    } else if matches!(self.kind(), Kind::LBrace) {
+                        self.block()?;
+                    } else {
+                        self.semi()?;
+                    }
+                    out.push(MethodDecl {
+                        name: format!("__hookbad_{prop}"),
+                        params: Vec::new(),
+                        body: None,
+                        visibility,
+                        is_static: false,
+                        is_abstract: false,
+                        is_final: false,
+                        by_ref_return: false,
+                        ret_type: Some(s),
+                    });
+                    continue;
+                }
                 other => return Err(self.errk("expected get/set hook", &other)),
             };
             let params = if matches!(self.kind(), Kind::LParen) {
@@ -1198,6 +1226,7 @@ impl Parser {
                     visibility,
                     is_static,
                     readonly,
+                    is_final,
                     type_hint: type_hint.clone(),
                 });
                 // PHP 8.4 property hooks: `$x { get => …; set(...) { … } }`.

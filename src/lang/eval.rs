@@ -146,6 +146,9 @@ pub struct Eval {
     /// Any class anywhere declared property hooks (fast global gate: WP and
     /// most code never do, so property access pays one bool check).
     hooks_declared: bool,
+    /// A decl-time fatal detected during hoist (PHP fatals at compile time,
+    /// before any output — the exec path may never run under the VM).
+    pending_decl_fatal: Option<String>,
     /// (object ptr, prop) frames of hooks currently executing — $this->prop
     /// inside a hook reaches the backing store instead of recursing.
     hook_stack: Vec<(usize, String)>,
@@ -2112,6 +2115,7 @@ impl Eval {
             prelude_depth: 0,
             hooks_declared: false,
             hook_stack: Vec::new(),
+            pending_decl_fatal: None,
             autoloaders: Vec::new(),
             autoload_active: HashSet::new(),
             cur_args: Vec::new(),
@@ -2377,6 +2381,10 @@ impl Eval {
         super::value::reset_object_ids();
         crate::pdo::reset();
         e.hoist(program);
+        if let Some(msg) = e.pending_decl_fatal.take() {
+            let _ = e.decl_fatal(&msg);
+            return Ok(e.out);
+        }
         let top_result = if e.vm_enabled {
             match e.vm_chunk_for(program, true, VmOwner::Top) {
                 Some(chunk) => e.run_chunk(&chunk, true).map(|_| Flow::Normal),
@@ -2526,6 +2534,10 @@ impl Eval {
                     self.record_def_ctx(format!("class:{}", c.name.to_ascii_lowercase()), &ns, &uses);
                     if c.methods.iter().any(|m| m.name.starts_with("__hook_")) {
                         self.hooks_declared = true;
+                    }
+                    if self.pending_decl_fatal.is_none() {
+                        self.pending_decl_fatal =
+                            enum_decl_error(&c).or_else(|| self.hook_decl_error(&c));
                     }
                     self.classes.insert(c.name.to_ascii_lowercase(), Rc::new(c));
                     self.method_cache.borrow_mut().clear();
@@ -3066,6 +3078,9 @@ impl Eval {
                 if let Some(msg) = enum_decl_error(&c) {
                     return Err(self.decl_fatal(&msg));
                 }
+                if let Some(msg) = self.hook_decl_error(&c) {
+                    return Err(self.decl_fatal(&msg));
+                }
                 if c.kind == ClassKind::Enum {
                     c.is_final = true; // enums are implicitly final
                 }
@@ -3356,6 +3371,56 @@ impl Eval {
             return Err(self.throw_error("ArgumentCountError", &msg));
         }
         Ok(())
+    }
+
+    /// Property-hook declaration rules (PHP-verified messages): unknown hook
+    /// names, readonly+hooked, by-ref set parameters, final-prop overrides.
+    fn hook_decl_error(&self, c: &ClassDecl) -> Option<String> {
+        for m in &c.methods {
+            if let Some(bad) = m.name.strip_prefix("__hookbad_") {
+                let name = m.ret_type.clone().unwrap_or_default();
+                return Some(format!(
+                    "Unknown hook \"{name}\" for property {}::${bad}, expected \"get\" or \"set\"",
+                    c.name
+                ));
+            }
+            if let Some(p) = m.name.strip_prefix("__hook_set_") {
+                if let Some(first) = m.params.first() {
+                    if first.by_ref {
+                        return Some(format!(
+                            "Parameter ${} of set hook {}::${p} must not be pass-by-reference",
+                            first.name, c.name
+                        ));
+                    }
+                }
+            }
+        }
+        for prop in &c.props {
+            let hooked = c.methods.iter().any(|m| {
+                m.name
+                    .strip_prefix("__hook_get_")
+                    .or_else(|| m.name.strip_prefix("__hook_set_"))
+                    .is_some_and(|p| p == prop.name)
+            });
+            if hooked && prop.readonly {
+                return Some("Hooked properties cannot be readonly".to_string());
+            }
+            // final props from any ancestor cannot be redeclared
+            let mut parent = c.parent.as_ref().map(|n| n.parts.join("\\"));
+            while let Some(pn) = parent {
+                let Some(pc) = self.find_class(&pn) else { break };
+                if let Some(pp) = pc.props.iter().find(|p| p.name == prop.name) {
+                    if pp.is_final {
+                        return Some(format!(
+                            "Cannot override final property {}::${}",
+                            pc.name, prop.name
+                        ));
+                    }
+                }
+                parent = pc.parent.as_ref().map(|n| n.parts.join("\\"));
+            }
+        }
+        None
     }
 
     /// Emit a compile-time-style fatal (no exception object) and halt like

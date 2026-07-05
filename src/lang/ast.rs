@@ -320,6 +320,7 @@ pub struct PropDecl {
     pub visibility: Visibility,
     pub is_static: bool,
     pub readonly: bool,
+    pub is_final: bool,
     pub type_hint: Option<String>,
 }
 
