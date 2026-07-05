@@ -2248,6 +2248,21 @@ impl Eval {
             }
             Value::Object(rc) => {
                 let class = rc.borrow().class.clone();
+                // enum cases serialize as E:"Class:Case"; (PHP 8.1 format)
+                if self
+                    .find_class(&class)
+                    .map(|c| c.kind == ClassKind::Enum)
+                    .unwrap_or(false)
+                {
+                    let name = rc
+                        .borrow()
+                        .get("name")
+                        .map(|v| String::from_utf8_lossy(&to_bytes(v)).into_owned())
+                        .unwrap_or_default();
+                    let tag = format!("{class}:{name}");
+                    out.extend_from_slice(format!("E:{}:\"{tag}\";", tag.len()).as_bytes());
+                    return Ok(());
+                }
                 // __serialize(): produce an O: wrapper around the returned array.
                 if self.find_method(&class, "__serialize").is_some() {
                     let arr = self.call_method(v.clone(), "__serialize", vec![])?;
@@ -3332,6 +3347,47 @@ impl Eval {
         let s = format!("\nFatal error: {msg} in {file} on line {}\n", self.cur_line);
         self.out.extend_from_slice(s.as_bytes());
         RunError("__phargo_exit__".into())
+    }
+
+    /// Swap unserialize's E:-token placeholder objects for the real enum
+    /// case singletons (class_const caches them, so === identity holds).
+    fn resolve_enum_placeholders(&mut self, v: Value) -> R<Value> {
+        match v {
+            Value::Object(rc) => {
+                let (is_ph, class, name) = {
+                    let b = rc.borrow();
+                    (
+                        b.get("__enum_placeholder").is_some(),
+                        b.class.clone(),
+                        b.get("name")
+                            .map(|n| String::from_utf8_lossy(&to_bytes(n)).into_owned())
+                            .unwrap_or_default(),
+                    )
+                };
+                if is_ph {
+                    if self
+                        .find_class(&class)
+                        .map(|c| c.kind == ClassKind::Enum)
+                        .unwrap_or(false)
+                    {
+                        return self.class_const(&class, &name);
+                    }
+                    return Ok(Value::Bool(false));
+                }
+                Ok(Value::Object(rc))
+            }
+            Value::Array(a) => {
+                // rebuild: take_entries leaves the key index stale, so
+                // re-inserting into the same Arr would hit a bad index
+                let mut out = Arr::new();
+                for (k, val) in a.into_entries() {
+                    let nv = self.resolve_enum_placeholders(val)?;
+                    out.insert(k, nv);
+                }
+                Ok(Value::Array(out))
+            }
+            other => Ok(other),
+        }
     }
 
     /// Evaluate with undefined-variable/key warnings suppressed (isset/empty/??/@).
@@ -8184,17 +8240,11 @@ impl Eval {
         if m.body.is_none() {
             return Ok(Value::Null);
         }
-        // enforce only when the receiver IS the prelude class itself:
-        // subclasses may declare their own signatures (and a WP Requests
-        // exception exposed a resolution corner where a subclass ctor call
-        // landed on Exception::__construct and killed the page render)
-        let exact = match &recv {
-            Value::Object(rc) => rc.borrow().class.eq_ignore_ascii_case(decl_class),
-            _ => true,
-        };
-        if exact {
-            self.check_method_sig(decl_class, &m.name, args.len())?;
-        }
+        // PHP enforces internal-method arity through inheritance too
+        // (iterator_062: a subclass of RecursiveIteratorIterator still
+        // errors); the namespace-fallback hazard is handled by omitting the
+        // Exception/Error-family ctor rows from METHOD_SIGS instead.
+        self.check_method_sig(decl_class, &m.name, args.len())?;
         self.enter_call()?;
         self.cur_args.push(Rc::new(args.clone()));
         self.cur_fn.push(m.name.clone());
@@ -12263,6 +12313,7 @@ impl Eval {
                 let bytes = to_bytes(&a(0));
                 let mut pos = 0;
                 let v = php_unserialize(&bytes, &mut pos, 0).unwrap_or(Value::Bool(false));
+                let v = self.resolve_enum_placeholders(v)?;
                 self.apply_wakeup(&v, 0)?;
                 v
             }
@@ -15091,6 +15142,23 @@ fn php_unserialize(b: &[u8], pos: &mut usize, depth: usize) -> Option<Value> {
             }
             *pos += 1; // }
             Some(Value::Array(arr))
+        }
+        b'E' => {
+            *pos += 2; // E:
+            let tlen: usize = std::str::from_utf8(&unser_read_until(b, pos, b':')).ok()?.parse().ok()?;
+            *pos += 1; // "
+            if *pos + tlen > b.len() {
+                return None;
+            }
+            let tag = String::from_utf8_lossy(&b[*pos..*pos + tlen]).into_owned();
+            *pos += tlen + 2; // ";
+            let (class, case) = tag.rsplit_once(':')?;
+            // placeholder: the unserialize builtin swaps this for the real
+            // case singleton (php_unserialize has no evaluator access)
+            let mut o = Obj::new(class.to_string());
+            o.set("name", Value::Str(case.as_bytes().to_vec()));
+            o.set("__enum_placeholder", Value::Bool(true));
+            Some(Value::Object(Rc::new(RefCell::new(o))))
         }
         b'O' => {
             *pos += 2; // O:

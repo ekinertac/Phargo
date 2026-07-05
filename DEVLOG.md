@@ -27,6 +27,29 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-10 — E:"Suit:Hearts", and the flake that was a feature colliding with a policy.
+
+**Walker 3935 → 3940, VM 3930 → 3934.** Enum cases now serialize as
+PHP 8.1's `E:"Class:Case";` and unserialize back through the case
+singleton cache, so `unserialize(serialize($c)) === $c` holds — the
+free-function unserializer plants a placeholder object and the builtin
+swaps it for the real case (it has no evaluator access down there).
+
+The better story is the "cold-start flake": the WordPress page had
+been intermittently collapsing to 1298 bytes on the FIRST run after a
+rebuild, and it looked like a race for three sightings. It wasn't. A
+fresh render runs wp_version_check, whose failing HTTP path constructs
+`WpOrg\Requests\Exception($msg, $type, $data, $code)` — and our
+documented namespace-global-fallback policy resolves that unfound
+class to the prelude `Exception` itself, where the new METHOD_SIGS
+arity check said "at most 3 arguments, 4 given" and killed the page.
+Two features, both individually reasonable, colliding. First fix (only
+enforce on exact receivers) traded the page for iterator_062 — PHP
+really does enforce internal arity through subclasses. The right cut:
+drop the Exception/Error-family constructor rows from the table, keep
+enforcement everywhere else. The generated file documents why those
+rows are deliberately absent.
+
 ## 2026-07-09 (later) — enum(Foo::Bar), and the panic that ate a scoreboard.
 
 **Walker 3894 → 3928, VM 3901 → 3922.** Three rungs in one batch, found

@@ -503,6 +503,9 @@ pub static BUILTIN_SIGS: &[(&str, u8, u8, &[(&str, &str)])] = &[
 ];
 
 // Built-in class methods (declaring class :: lowercase method) -> arity.
+// Exception/Error-family __construct rows are deliberately ABSENT: the
+// namespace global fallback can resolve a namespaced user subclass to the
+// prelude base (WP Requests did), so their arity must stay unenforced.
 // Reflected from PHP 8.5.8; arity-only (prelude impls may
 // declare different defaults internally, so types are NOT checked here).
 pub static METHOD_SIGS: &[(&str, u8, u8)] = &[
@@ -682,7 +685,6 @@ pub static METHOD_SIGS: &[(&str, u8, u8)] = &[
     ("DirectoryIterator::rewind", 0, 0),
     ("DirectoryIterator::seek", 1, 1),
     ("DirectoryIterator::valid", 0, 0),
-    ("Error::__construct", 0, 3),
     ("Error::__tostring", 0, 0),
     ("Error::__wakeup", 0, 0),
     ("Error::getcode", 0, 0),
@@ -692,9 +694,7 @@ pub static METHOD_SIGS: &[(&str, u8, u8)] = &[
     ("Error::getprevious", 0, 0),
     ("Error::gettrace", 0, 0),
     ("Error::gettraceasstring", 0, 0),
-    ("ErrorException::__construct", 0, 6),
     ("ErrorException::getseverity", 0, 0),
-    ("Exception::__construct", 0, 3),
     ("Exception::__tostring", 0, 0),
     ("Exception::__wakeup", 0, 0),
     ("Exception::getcode", 0, 0),
