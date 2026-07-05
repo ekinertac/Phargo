@@ -140,6 +140,9 @@ pub struct Eval {
     /// `static $x = …` storage inside functions/methods, keyed by
     /// (function key, var name). Values persist across calls.
     static_vars: HashMap<(String, String), Value>,
+    /// >0 while executing a prelude-declared body — arity checks against
+    /// PHP's reflected signatures only apply to user-code call sites.
+    prelude_depth: usize,
     /// Autoloaders registered via spl_autoload_register, tried in order when a
     /// class is first touched and unknown.
     autoloaders: Vec<Value>,
@@ -2099,6 +2102,7 @@ impl Eval {
             byref_ret: Vec::new(),
             typed_props_cache: HashMap::new(),
             static_vars: HashMap::new(),
+            prelude_depth: 0,
             autoloaders: Vec::new(),
             autoload_active: HashSet::new(),
             cur_args: Vec::new(),
@@ -3280,6 +3284,40 @@ impl Eval {
                 );
                 return Err(self.throw_error("TypeError", &msg));
             }
+        }
+        Ok(())
+    }
+
+    /// Arity strictness for emulated built-in class methods (METHOD_SIGS,
+    /// reflected from real PHP). Arity only — our prelude impls may declare
+    /// different defaults internally, so parameter types are not checked.
+    fn check_method_sig(&mut self, decl_class: &str, method: &str, argc: usize) -> R<()> {
+        // calls made FROM prelude bodies use our impls' internal calling
+        // conventions — only user-code call sites get PHP's reflected arity
+        if self.prelude_depth > 0 {
+            return Ok(());
+        }
+        thread_local! {
+            static MSIG: std::collections::HashMap<&'static str, (u8, u8)> =
+                crate::lang::builtin_sigs::METHOD_SIGS
+                    .iter()
+                    .map(|(k, min, max)| (*k, (*min, *max)))
+                    .collect();
+        }
+        let key = format!("{}::{}", decl_class, method.to_ascii_lowercase());
+        let Some((min, max)) = MSIG.with(|m| m.get(key.as_str()).copied()) else {
+            return Ok(());
+        };
+        let word = |n: u8| if n == 1 { "argument" } else { "arguments" };
+        if argc < min as usize || argc > max as usize {
+            let msg = if min == max {
+                format!("{key}() expects exactly {min} {}, {argc} given", word(min))
+            } else if argc < min as usize {
+                format!("{key}() expects at least {min} {}, {argc} given", word(min))
+            } else {
+                format!("{key}() expects at most {max} {}, {argc} given", word(max))
+            };
+            return Err(self.throw_error("ArgumentCountError", &msg));
         }
         Ok(())
     }
@@ -4894,7 +4932,14 @@ impl Eval {
             assigned[i] = true;
         }
         let this = Some(recv.clone());
+        let in_prelude = self.prelude_classes.contains(&decl_class.to_ascii_lowercase());
+        if in_prelude {
+            self.prelude_depth += 1;
+        }
         let r = self.run_chunk_inner(cc, &mut slots, &mut assigned, &this);
+        if in_prelude {
+            self.prelude_depth -= 1;
+        }
         self.current_class = prev_class;
         self.called_class = prev_called;
         if let Some((pf, pns, puse)) = prev_df {
@@ -7383,6 +7428,7 @@ impl Eval {
         let quiet_body = self.prelude_fns.contains(&f.name.to_ascii_lowercase());
         if quiet_body {
             self.quiet += 1;
+            self.prelude_depth += 1;
         }
         self.byref_ret.push(f.by_ref_return);
         self.scopes.push(scope);
@@ -7399,6 +7445,7 @@ impl Eval {
         self.byref_ret.pop();
         if quiet_body {
             self.quiet -= 1;
+            self.prelude_depth -= 1;
         }
         if let Some((pf, pns, puse)) = prev_df {
             self.cur_file = pf;
@@ -8098,6 +8145,7 @@ impl Eval {
         if m.body.is_none() {
             return Ok(Value::Null);
         }
+        self.check_method_sig(decl_class, &m.name, args.len())?;
         self.enter_call()?;
         self.cur_args.push(Rc::new(args.clone()));
         self.cur_fn.push(m.name.clone());
@@ -8151,6 +8199,7 @@ impl Eval {
         let quiet_body = self.prelude_classes.contains(&decl_class.to_ascii_lowercase());
         if quiet_body {
             self.quiet += 1;
+            self.prelude_depth += 1;
         }
         self.byref_ret.push(m.by_ref_return);
         self.scopes.push(scope);
@@ -8163,6 +8212,7 @@ impl Eval {
         self.byref_ret.pop();
         if quiet_body {
             self.quiet -= 1;
+            self.prelude_depth -= 1;
         }
         self.current_class = prev_class;
         self.called_class = prev_called;
@@ -8338,6 +8388,7 @@ impl Eval {
         let quiet_body = self.prelude_classes.contains(&decl_class.to_ascii_lowercase());
         if quiet_body {
             self.quiet += 1;
+            self.prelude_depth += 1;
         }
         self.byref_ret.push(m.by_ref_return);
         self.scopes.push(scope);
@@ -8350,6 +8401,7 @@ impl Eval {
         self.byref_ret.pop();
         if quiet_body {
             self.quiet -= 1;
+            self.prelude_depth -= 1;
         }
         self.current_class = prev_class;
         self.called_class = prev_called;
