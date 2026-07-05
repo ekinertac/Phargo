@@ -736,10 +736,11 @@ class ReflectionClass {
     public function implementsInterface($i) { $n = strtolower($i); foreach (class_implements($this->name) as $x) { if (strtolower($x) === $n) return true; } return false; }
     public function isSubclassOf($c) { return is_subclass_of($this->name, $c); }
     public function isInstance($obj) { return is_a($obj, $this->name); }
-    public function isInterface() { return false; }
-    public function isAbstract() { return false; }
-    public function isFinal() { return false; }
-    public function isInstantiable() { return true; }
+    public function isInterface() { return __phargo_class_flag($this->name, "interface"); }
+    public function isAbstract() { return __phargo_class_flag($this->name, "abstract"); }
+    public function isFinal() { return __phargo_class_flag($this->name, "final"); }
+    public function isEnum() { return __phargo_class_flag($this->name, "enum"); }
+    public function isInstantiable() { return !__phargo_class_flag($this->name, "abstract") && !__phargo_class_flag($this->name, "interface") && !__phargo_class_flag($this->name, "enum"); }
     public function getConstants() { return phargo_class_constants($this->name); }
     public function getConstant($n) { $c = phargo_class_constants($this->name); return $c[$n] ?? false; }
     public function hasConstant($n) { return isset(phargo_class_constants($this->name)[$n]); }
@@ -3064,6 +3065,9 @@ impl Eval {
                 let (ns, uses) = (self.cur_ns.clone(), Rc::new(self.use_map.clone()));
                 if let Some(msg) = enum_decl_error(&c) {
                     return Err(self.decl_fatal(&msg));
+                }
+                if c.kind == ClassKind::Enum {
+                    c.is_final = true; // enums are implicitly final
                 }
                 self.record_def_ctx(format!("class:{}", c.name.to_ascii_lowercase()), &ns, &uses);
                 if c.methods.iter().any(|m| m.name.starts_with("__hook_")) {
@@ -6411,6 +6415,17 @@ impl Eval {
                         return Ok(());
                     }
                     let class = rc.borrow().class.clone();
+                    // enum case props are readonly
+                    if self
+                        .find_class(&class)
+                        .map(|c| c.kind == ClassKind::Enum)
+                        .unwrap_or(false)
+                    {
+                        return Err(self.throw_error(
+                            "Error",
+                            &format!("Cannot modify readonly property {class}::${pname}"),
+                        ));
+                    }
                     let val = if self.class_has_typed_props(&class) {
                         self.check_prop_write(&class, &pname, val)?
                     } else {
@@ -11755,6 +11770,21 @@ impl Eval {
                 }
                 Value::Array(arr)
             }
+            "__phargo_class_flag" => {
+                let cn = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                let flag = String::from_utf8_lossy(&to_bytes(&a(1))).into_owned();
+                let v = self
+                    .find_class(&cn)
+                    .map(|c| match flag.as_str() {
+                        "final" => c.is_final,
+                        "abstract" => c.is_abstract,
+                        "interface" => c.kind == ClassKind::Interface,
+                        "enum" => c.kind == ClassKind::Enum,
+                        _ => false,
+                    })
+                    .unwrap_or(false);
+                Value::Bool(v)
+            }
             "phargo_class_constants" => {
                 let cn = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 let mut arr = Arr::new();
@@ -13367,7 +13397,7 @@ impl Eval {
 /// _mb_strlen calls get_option before the DB exists).
 static KNOWN_BUILTINS: &[&str] = &[
     "__dom_parse", "__pdo_close", "__pdo_lastid", "__pdo_open", "__pdo_query",
-    "__phargo_bcscale_of", "__phargo_createfromformat", "__phargo_cur_file",
+    "__phargo_bcscale_of", "__phargo_class_flag", "__phargo_createfromformat", "__phargo_cur_file",
     "__phargo_cur_line", "__phargo_date_tz", "__phargo_mktime_tz", "__phargo_modify",
     "__phargo_strtotime_tz", "__phargo_trace", "__phargo_tz_offset", "__phargo_tz_transitions",
     "__phargo_tz_valid", "abs", "acos", "acosh", "addcslashes", "addslashes", "array_chunk",
