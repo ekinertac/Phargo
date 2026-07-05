@@ -27,6 +27,29 @@ you would never think to write a test for.
 
 ---
 
+## 2026-07-10 (later) — Property hooks: get/set as methods in disguise. Both engines cross 18%.
+
+**Walker 3940 → 3964, VM 3934 → 3959 (+25 each).** PHP 8.4's property
+hooks landed without touching the AST: the parser lowers a hook block
+into synthetic methods (`__hook_get_prop` / `__hook_set_prop`), and
+property access consults them behind a global "any hooks declared?"
+bool — hook-free code (WordPress, 99% of the corpus) pays one branch.
+Backing-store semantics come from a reentrancy guard: while a hook for
+`(object, prop)` runs, `$this->prop` bypasses the hook, which also
+makes `set => expr;` lower to a plain guarded assignment and
+`parent::$prop::get()` lower to a plain guarded read at parse time.
+
+The first board taught the usual lesson in disguise-leakage: synthetic
+methods showed up in `get_class_methods()` (ReflectionClass tests),
+and `abstract protected $foo { get; }` produced an inert hook that
+intercepted the CHILD's plain property with NULL. Hidden from
+listings; abstract hooks are bodyless and skipped by resolution. Also
+recovered en route: the opcache property-hooks test whose loss the
+strictness batch had accepted (hash_hmac now gets 'sha256', not null),
+and the VM's ThisProp ops route through hooks under the same cheap
+gate — the walker and VM printed different answers for a compiled
+method reading a hooked property until they didn't.
+
 ## 2026-07-10 — E:"Suit:Hearts", and the flake that was a feature colliding with a policy.
 
 **Walker 3935 → 3940, VM 3930 → 3934.** Enum cases now serialize as

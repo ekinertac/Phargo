@@ -143,6 +143,12 @@ pub struct Eval {
     /// >0 while executing a prelude-declared body — arity checks against
     /// PHP's reflected signatures only apply to user-code call sites.
     prelude_depth: usize,
+    /// Any class anywhere declared property hooks (fast global gate: WP and
+    /// most code never do, so property access pays one bool check).
+    hooks_declared: bool,
+    /// (object ptr, prop) frames of hooks currently executing — $this->prop
+    /// inside a hook reaches the backing store instead of recursing.
+    hook_stack: Vec<(usize, String)>,
     /// Autoloaders registered via spl_autoload_register, tried in order when a
     /// class is first touched and unknown.
     autoloaders: Vec<Value>,
@@ -2103,6 +2109,8 @@ impl Eval {
             typed_props_cache: HashMap::new(),
             static_vars: HashMap::new(),
             prelude_depth: 0,
+            hooks_declared: false,
+            hook_stack: Vec::new(),
             autoloaders: Vec::new(),
             autoload_active: HashSet::new(),
             cur_args: Vec::new(),
@@ -2515,6 +2523,9 @@ impl Eval {
                         }
                     }
                     self.record_def_ctx(format!("class:{}", c.name.to_ascii_lowercase()), &ns, &uses);
+                    if c.methods.iter().any(|m| m.name.starts_with("__hook_")) {
+                        self.hooks_declared = true;
+                    }
                     self.classes.insert(c.name.to_ascii_lowercase(), Rc::new(c));
                     self.method_cache.borrow_mut().clear();
                 self.funcs_generation += 1;
@@ -3055,6 +3066,9 @@ impl Eval {
                     return Err(self.decl_fatal(&msg));
                 }
                 self.record_def_ctx(format!("class:{}", c.name.to_ascii_lowercase()), &ns, &uses);
+                if c.methods.iter().any(|m| m.name.starts_with("__hook_")) {
+                    self.hooks_declared = true;
+                }
                 self.classes.insert(c.name.to_ascii_lowercase(), Rc::new(c));
                 self.method_cache.borrow_mut().clear();
                 self.funcs_generation += 1;
@@ -3388,6 +3402,35 @@ impl Eval {
             }
             other => Ok(other),
         }
+    }
+
+    /// The __hook_get_/__hook_set_ method for a property access, unless the
+    /// access happens INSIDE that very hook (backing-store access).
+    fn prop_hook(&mut self, rc: &Rc<RefCell<Obj>>, kind: &str, prop: &str) -> Option<String> {
+        if !self.hooks_declared {
+            return None;
+        }
+        let class = rc.borrow().class.clone();
+        let hm = format!("__hook_{kind}_{prop}");
+        match self.find_method(&class, &hm) {
+            // abstract hooks (body None) don't intercept — a child's plain
+            // property satisfies them and reads raw
+            Some((_, m)) if m.body.is_some() => {}
+            _ => return None,
+        }
+        let id = Rc::as_ptr(rc) as *const () as usize;
+        if self.hook_stack.iter().any(|(i, p)| *i == id && p == prop) {
+            return None; // reentrant: raw backing access
+        }
+        Some(hm)
+    }
+
+    fn call_hook(&mut self, rc: &Rc<RefCell<Obj>>, hm: &str, prop: &str, args: Vec<Value>) -> R<Value> {
+        let id = Rc::as_ptr(rc) as *const () as usize;
+        self.hook_stack.push((id, prop.to_string()));
+        let r = self.call_method(Value::Object(rc.clone()), hm, args);
+        self.hook_stack.pop();
+        r
     }
 
     /// Evaluate with undefined-variable/key warnings suppressed (isset/empty/??/@).
@@ -4084,6 +4127,9 @@ impl Eval {
                 let pname = self.prop_name_str(name)?;
                 match &o {
                     Value::Object(rc) => {
+                        if let Some(hm) = self.prop_hook(rc, "get", &pname) {
+                            return self.call_hook(rc, &hm, &pname, vec![]);
+                        }
                         let existing = rc.borrow().get(&pname).cloned();
                         match existing {
                             Some(v) => v,
@@ -6053,6 +6099,19 @@ impl Eval {
                 }
                 Op::LoadThisProp(i) => {
                     let name = &chunk.names[*i as usize];
+                    // property hooks fire from compiled bodies too (cheap
+                    // global bool when no hooks exist anywhere)
+                    if self.hooks_declared {
+                        if let Some(rc) = this_rc {
+                            if let Some(hm) = self.prop_hook(rc, "get", name) {
+                                let rc = rc.clone();
+                                let name = name.clone();
+                                let v = self.call_hook(&rc, &hm, &name, vec![])?;
+                                stack.push(v);
+                                continue;
+                            }
+                        }
+                    }
                     let hit = this_rc
                         .as_ref()
                         .and_then(|rc| rc.borrow().get(name).map(|v| v.deref()));
@@ -6082,6 +6141,13 @@ impl Eval {
                     let val = pop!();
                     if let Some(rc) = this_rc {
                         let name = chunk.names[*i as usize].clone();
+                        if self.hooks_declared {
+                            if let Some(hm) = self.prop_hook(rc, "set", &name) {
+                                let rc = rc.clone();
+                                self.call_hook(&rc, &hm, &name, vec![val])?;
+                                continue;
+                            }
+                        }
                         let class = rc.borrow().class.clone();
                         let val = if self.class_has_typed_props(&class) {
                             self.check_prop_write(&class, &name, val)?
@@ -6340,6 +6406,10 @@ impl Eval {
                 let o = self.eval(obj)?;
                 let pname = self.prop_name_str(name)?;
                 if let Value::Object(rc) = o {
+                    if let Some(hm) = self.prop_hook(&rc, "set", &pname) {
+                        self.call_hook(&rc, &hm, &pname, vec![val])?;
+                        return Ok(());
+                    }
                     let class = rc.borrow().class.clone();
                     let val = if self.class_has_typed_props(&class) {
                         self.check_prop_write(&class, &pname, val)?
@@ -11607,6 +11677,10 @@ impl Eval {
                 for c in self.ancestry(&cn) {
                     for m in &c.methods {
                         if !inside && !matches!(m.visibility, Visibility::Public) {
+                            continue;
+                        }
+                        // synthetic property-hook bodies are not real methods
+                        if m.name.starts_with("__hook_") {
                             continue;
                         }
                         if seen.insert(m.name.to_ascii_lowercase()) {

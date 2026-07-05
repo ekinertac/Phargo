@@ -817,6 +817,90 @@ impl Parser {
     }
 
     /// Consume a balanced `{ … }` block (used to skip property-hook bodies).
+    /// Parse a property-hook block into synthetic __hook_get_/__hook_set_
+    /// methods. Grammar subset: [final] [&] get|set [($param)] followed by
+    /// `=> expr;` or `{ stmts }`. `set => expr;` means "backing = expr".
+    fn parse_prop_hooks(&mut self, prop: &str, visibility: Visibility) -> R<Vec<MethodDecl>> {
+        self.expect(&Kind::LBrace)?;
+        let mut out = Vec::new();
+        while !matches!(self.kind(), Kind::RBrace) {
+            // modifiers we accept and ignore
+            while self.at_kw("final") || self.at_kw("public") || self.at_kw("protected") || self.at_kw("private") {
+                self.bump();
+            }
+            self.eat(&Kind::Amp);
+            let kind = match self.bump() {
+                Kind::Ident(s) if s.eq_ignore_ascii_case("get") => "get",
+                Kind::Ident(s) if s.eq_ignore_ascii_case("set") => "set",
+                other => return Err(self.errk("expected get/set hook", &other)),
+            };
+            let params = if matches!(self.kind(), Kind::LParen) {
+                self.parse_params()?
+            } else if kind == "set" {
+                vec![Param {
+                    name: "value".to_string(),
+                    default: None,
+                    by_ref: false,
+                    variadic: false,
+                    type_hint: None,
+                    promote: None,
+                    readonly: false,
+                }]
+            } else {
+                Vec::new()
+            };
+            let body = if self.eat(&Kind::FatArrow) {
+                let e = self.expr()?;
+                self.semi()?;
+                if kind == "get" {
+                    vec![Stmt::Return(Some(e))]
+                } else {
+                    // set => expr: assign to the backing store ($this->prop
+                    // writes raw under the hook reentrancy guard)
+                    vec![Stmt::Expr(Expr::Assign(
+                        Box::new(Expr::Prop(
+                            Box::new(Expr::Var("this".to_string())),
+                            PropName::Id(prop.to_string()),
+                            false,
+                        )),
+                        Box::new(e),
+                    ))]
+                }
+            } else if matches!(self.kind(), Kind::LBrace) {
+                self.block()?
+            } else {
+                // abstract/interface hook: `get;` — no body; resolution
+                // skips it so a child's plain property reads raw
+                self.semi()?;
+                out.push(MethodDecl {
+                    name: format!("__hook_{kind}_{prop}"),
+                    params,
+                    body: None,
+                    visibility,
+                    is_static: false,
+                    is_abstract: true,
+                    is_final: false,
+                    by_ref_return: false,
+                    ret_type: None,
+                });
+                continue;
+            };
+            out.push(MethodDecl {
+                name: format!("__hook_{kind}_{prop}"),
+                params,
+                body: Some(body),
+                visibility,
+                is_static: false,
+                is_abstract: false,
+                is_final: false,
+                by_ref_return: false,
+                ret_type: None,
+            });
+        }
+        self.expect(&Kind::RBrace)?;
+        Ok(out)
+    }
+
     fn skip_braced_block(&mut self) {
         if !matches!(self.kind(), Kind::LBrace) {
             return;
@@ -1065,17 +1149,28 @@ impl Parser {
                     None
                 };
                 decl.props.push(PropDecl {
-                    name: pname,
+                    name: pname.clone(),
                     default,
                     visibility,
                     is_static,
                     readonly,
                     type_hint: type_hint.clone(),
                 });
-                // PHP 8.4 property hooks: `$x { get => …; set { … } }` — parse-skip
-                // the hook block (the property itself is recorded; hooks are no-ops).
+                // PHP 8.4 property hooks: `$x { get => …; set(...) { … } }`.
+                // Hooks become synthetic methods __hook_get_<prop> /
+                // __hook_set_<prop> — the evaluator routes property access
+                // through them (with a reentrancy guard so $this->prop inside
+                // a hook reaches the backing store). Unparseable hook bodies
+                // fall back to the old parse-skip (hooks silently inert).
                 if matches!(self.kind(), Kind::LBrace) {
-                    self.skip_braced_block();
+                    let save = self.pos;
+                    match self.parse_prop_hooks(&pname, visibility) {
+                        Ok(mut ms) => decl.methods.append(&mut ms),
+                        Err(_) => {
+                            self.pos = save;
+                            self.skip_braced_block();
+                        }
+                    }
                     continue 'members;
                 }
                 if !self.eat(&Kind::Comma) {
@@ -1725,6 +1820,39 @@ impl Parser {
                     // ::$prop  | ::CONST | ::method(...) | ::class | ::{expr}
                     if let Kind::Variable(v) = self.kind().clone() {
                         self.bump();
+                        // parent::$prop::get() / ::set(v) — hook delegation.
+                        // Inside a hook the reentrancy guard makes $this->prop
+                        // reach the backing store, so these rewrite to raw
+                        // property access on $this.
+                        if matches!(self.kind(), Kind::DoubleColon) {
+                            let hook_kind = match self.at(1) {
+                                Kind::Ident(s) if s.eq_ignore_ascii_case("get") || s.eq_ignore_ascii_case("set") => {
+                                    Some(s.to_ascii_lowercase())
+                                }
+                                _ => None,
+                            };
+                            if let Some(hk) = hook_kind {
+                                self.bump(); // ::
+                                self.bump(); // get/set
+                                let args = self.parse_args()?;
+                                let prop = Expr::Prop(
+                                    Box::new(Expr::Var("this".to_string())),
+                                    PropName::Id(v.clone()),
+                                    false,
+                                );
+                                e = if hk == "get" {
+                                    prop
+                                } else {
+                                    let val = args
+                                        .into_iter()
+                                        .next()
+                                        .map(|a| a.value)
+                                        .unwrap_or(Expr::Null);
+                                    Expr::Assign(Box::new(prop), Box::new(val))
+                                };
+                                continue;
+                            }
+                        }
                         e = Expr::StaticProp(Box::new(e), v);
                     } else if matches!(self.kind(), Kind::LBrace) {
                         self.bump();
