@@ -4,13 +4,13 @@
 
 ## Scoreboard
 
-**`.phpt` pass rate: 3875 / 22037  (17.58% of the entire PHP test suite)**
+**`.phpt` pass rate: 3893 / 22037  (17.67% of the entire PHP test suite)**
 
-_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21970): 17.64%. The 67 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
+_This counts only the upstream **php-src** test suite — tests we did **not** write. Among tests the runner can currently grade (21970): 17.72%. The 67 "not-yet-gradeable" tests have no `--EXPECT--`/`--EXPECTF--` (e.g. `--EXPECTREGEX--` or output-less)._
 
 | ✓ pass | ✗ fail | • not-yet-gradeable | total |
 |---:|---:|---:|---:|
-| 3875 | 18095 | 67 | 22037 |
+| 3893 | 18077 | 67 | 22037 |
 
 _Curated smoke tests (dev guards, **not** in the number above): 88/93 passing._
 
@@ -18,16 +18,16 @@ _Curated smoke tests (dev guards, **not** in the number above): 88/93 passing._
 
 | area | ✓ pass | total | % |
 |---|---:|---:|---:|
-| `Zend` | 1372 | 5336 | 25.7% |
-| `ext/standard` | 928 | 3919 | 23.7% |
-| `ext/opcache` | 476 | 925 | 51.5% |
+| `Zend` | 1379 | 5336 | 25.8% |
+| `ext/standard` | 936 | 3919 | 23.9% |
+| `ext/opcache` | 475 | 925 | 51.4% |
 | `ext/dom` | 64 | 870 | 7.4% |
 | `core` | 261 | 869 | 30.0% |
 | `ext/spl` | 153 | 805 | 19.0% |
-| `ext/date` | 193 | 689 | 28.0% |
+| `ext/date` | 195 | 689 | 28.3% |
 | `ext/soap` | 0 | 597 | 0.0% |
 | `ext/phar` | 13 | 576 | 2.3% |
-| `ext/reflection` | 65 | 521 | 12.5% |
+| `ext/reflection` | 64 | 521 | 12.3% |
 | `ext/intl` | 3 | 506 | 0.6% |
 | `ext/mysqli` | 1 | 452 | 0.2% |
 | `ext/mbstring` | 36 | 420 | 8.6% |
@@ -53,7 +53,7 @@ _Curated smoke tests (dev guards, **not** in the number above): 88/93 passing._
 | `ext/pgsql` | 0 | 102 | 0.0% |
 | `ext/gmp` | 0 | 101 | 0.0% |
 | `ext/exif` | 5 | 100 | 5.0% |
-| `ext/json` | 16 | 100 | 16.0% |
+| `ext/json` | 19 | 100 | 19.0% |
 | `ext/sqlite3` | 0 | 98 | 0.0% |
 | `ext/pdo_sqlite` | 8 | 87 | 9.2% |
 | `ext/xsl` | 0 | 81 | 0.0% |

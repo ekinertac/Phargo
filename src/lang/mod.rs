@@ -14,6 +14,7 @@
 //!     source offsets, so nothing is ever re-parsed.
 
 pub mod ast;
+pub mod builtin_sigs;
 pub mod eval;
 pub mod lexer;
 pub mod parser;

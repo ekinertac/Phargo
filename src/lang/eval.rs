@@ -3171,6 +3171,119 @@ impl Eval {
         Ok(())
     }
 
+    /// Emit a PHP deprecation notice (E_DEPRECATED), same channel as warn().
+    fn deprecated(&mut self, msg: &str) -> R<()> {
+        const E_DEPRECATED: i64 = 8192;
+        if self.quiet > 0
+            || self.gen_buf.is_some()
+            || self.error_level & E_DEPRECATED == 0
+            || self.out.len() > MAX_OUTPUT
+        {
+            return Ok(());
+        }
+        let file = self
+            .cur_file
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let s = format!("\nDeprecated: {msg} in {file} on line {}\n", self.cur_line);
+        self.out.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
+
+    /// PHP 8 internal-function argument strictness, driven by the reflected
+    /// signature table (src/lang/builtin_sigs.rs): arity -> ArgumentCountError,
+    /// hard type mismatches (array/object where a scalar is declared) ->
+    /// TypeError, null to a non-nullable parameter -> deprecation notice.
+    /// Deliberately conservative: scalar-to-scalar coercions and numeric-string
+    /// nuances are NOT checked (PHP coerces those in non-strict mode).
+    fn check_builtin_sig(&mut self, name: &str, args: &[Value]) -> R<()> {
+        thread_local! {
+            static SIG_MAP: std::collections::HashMap<&'static str, (u8, u8, &'static [(&'static str, &'static str)])> =
+                crate::lang::builtin_sigs::BUILTIN_SIGS
+                    .iter()
+                    .map(|(n, min, max, ps)| (*n, (*min, *max, *ps)))
+                    .collect();
+        }
+        let Some((min, max, params)) = SIG_MAP.with(|m| m.get(name).copied()) else {
+            return Ok(());
+        };
+        let argc = args.len();
+        let word = |n: u8| if n == 1 { "argument" } else { "arguments" };
+        if argc < min as usize {
+            let msg = if min == max {
+                format!("{name}() expects exactly {min} {}, {argc} given", word(min))
+            } else {
+                format!("{name}() expects at least {min} {}, {argc} given", word(min))
+            };
+            return Err(self.throw_error("ArgumentCountError", &msg));
+        }
+        if max != 255 && argc > max as usize {
+            let msg = if min == max {
+                format!("{name}() expects exactly {max} {}, {argc} given", word(max))
+            } else {
+                format!("{name}() expects at most {max} {}, {argc} given", word(max))
+            };
+            return Err(self.throw_error("ArgumentCountError", &msg));
+        }
+        // reflection says `string` but the runtime quietly accepts objects
+        // here (custom ZPP) — real PHP returns false, no TypeError
+        if matches!(name, "is_subclass_of" | "is_a") {
+            return Ok(());
+        }
+        for (i, p) in params.iter().enumerate() {
+            if i >= argc {
+                break;
+            }
+            let (pname, ty) = (p.0, p.1);
+            if ty.starts_with("REF:") {
+                continue; // by-ref out-params: lvalues, not type-checked here
+            }
+            let nullable = ty.starts_with('?') || ty.contains("null") || ty == "mixed";
+            let parts: Vec<&str> = ty.trim_start_matches('?').split('|').collect();
+            let has = |t: &str| parts.iter().any(|p| p.eq_ignore_ascii_case(t));
+            // any branch we can't reason about disables checking for this param
+            let opaque = has("mixed")
+                || has("iterable")
+                || has("callable")
+                || has("object")
+                || parts.iter().any(|p| p.chars().next().is_some_and(|c| c.is_ascii_uppercase()));
+            if opaque {
+                continue;
+            }
+            let arg = if let Value::Ref(c) = &args[i] { c.borrow().clone() } else { args[i].clone() };
+            let given = match &arg {
+                Value::Array(_) if !has("array") => Some("array".to_string()),
+                Value::Object(rc) => {
+                    let class = rc.borrow().class.clone();
+                    // a string-accepting param takes any object with __toString
+                    if has("string") && self.find_method(&class, "__tostring").is_some() {
+                        None
+                    } else {
+                        Some(class)
+                    }
+                }
+                Value::Closure(_) => Some("Closure".to_string()),
+                Value::Null if !nullable => {
+                    self.deprecated(&format!(
+                        "{name}(): Passing null to parameter #{} (${pname}) of type {ty} is deprecated",
+                        i + 1
+                    ))?;
+                    None
+                }
+                _ => None,
+            };
+            if let Some(g) = given {
+                let msg = format!(
+                    "{name}(): Argument #{} (${pname}) must be of type {ty}, {g} given",
+                    i + 1
+                );
+                return Err(self.throw_error("TypeError", &msg));
+            }
+        }
+        Ok(())
+    }
+
     /// Evaluate with undefined-variable/key warnings suppressed (isset/empty/??/@).
     fn eval_quiet(&mut self, e: &Expr) -> R<Value> {
         self.quiet += 1;
@@ -8839,6 +8952,7 @@ impl Eval {
 // ---- builtin library (starter set) -------------------------------------
 impl Eval {
     fn builtin(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
+        self.check_builtin_sig(name, &args)?;
         let a = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);
         Ok(match name {
             "strlen" => Value::Int(to_bytes(&a(0)).len() as i64),

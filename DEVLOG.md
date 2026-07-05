@@ -27,7 +27,33 @@ you would never think to write a test for.
 
 ---
 
-## 2026-07-08 (later still) — Copy-on-write arrays: 7.3 seconds → 0.77. GOAL HIT.
+## 2026-07-09 — PHP 8's strictness, generated from PHP itself.
+
+**VM 3875 → 3894: internal-function argument strictness, driven by a
+signature table PHP wrote for us.** A `gensigs.php` script reflects
+every builtin we implement (`ReflectionFunction` on 499 names) and
+emits `src/lang/builtin_sigs.rs`; a checker at the dispatcher entry
+then enforces what PHP 8 enforces: too-few/too-many arguments throw
+`ArgumentCountError` ("expects exactly 1 argument, 2 given" — singular
+and all), arrays/objects where scalars are declared throw `TypeError`
+("Argument #1 ($string) must be of type string, array given"), and null
+into a non-nullable parameter emits the 8.1 deprecation notice. Probe
+script output is byte-identical to `php -n`.
+
+The checker is deliberately conservative — it only converts wrong
+silence into right errors. Scalar coercions, numeric-string corners,
+by-ref/`mixed`/`callable`/class-typed params: all skipped. Even so,
+reflection lied twice: `is_subclass_of`/`is_a` declare `string $class`
+but custom ZPP quietly returns false for objects (excluded), and one
+opcache test "regressed" because the new deprecation exposed that our
+engine feeds `hash_hmac` a null where PHP 8.4 property hooks
+(`public $prop { get => 'sha256'; }`) would produce a string — an
+honest loss that names a missing feature, not a checker bug.
+
+Net +21/−2 on the corpus (both losses understood and accepted), zero
+change to the WordPress page bytes. The same generated-table approach
+is queued for prelude class methods (`DateTimeZone::__construct()`
+arity) next.
 
 **The WordPress front page renders in 772 ms.** The "under 1 second"
 milestone fell to a single change: `Arr` became `Rc<ArrData>` with
