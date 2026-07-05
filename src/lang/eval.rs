@@ -9391,7 +9391,24 @@ impl Eval {
                     Value::Int(0)
                 }
             }
-            "is_iterable" => Value::Bool(matches!(a(0), Value::Array(_) | Value::Object(_))),
+            "is_iterable" => Value::Bool(match a(0) {
+                Value::Array(_) => true,
+                Value::Object(rc) => {
+                    let class = rc.borrow().class.clone();
+                    self.instance_of_name(&class, "Traversable")
+                        || self.instance_of_name(&class, "Iterator")
+                        || self.instance_of_name(&class, "IteratorAggregate")
+                }
+                _ => false,
+            }),
+            "is_countable" => Value::Bool(match a(0) {
+                Value::Array(_) => true,
+                Value::Object(rc) => {
+                    let class = rc.borrow().class.clone();
+                    self.instance_of_name(&class, "Countable")
+                }
+                _ => false,
+            }),
             "is_numeric" => Value::Bool(match a(0) {
                 Value::Int(_) | Value::Float(_) => true,
                 Value::Str(s) => is_numeric_str(&s),
@@ -13502,7 +13519,7 @@ static KNOWN_BUILTINS: &[&str] = &[
     "htmlspecialchars_decode", "http_build_query", "http_response_code", "hypot", "idate",
     "ignore_user_abort", "implode", "in_array", "ini_get", "ini_set", "intdiv",
     "interface_exists", "intval", "is_a", "is_array", "is_bool", "is_callable", "is_dir",
-    "is_double", "is_file", "is_float", "is_int", "is_integer", "is_iterable", "is_long",
+    "is_countable", "is_double", "is_file", "is_float", "is_int", "is_integer", "is_iterable", "is_long",
     "is_null", "is_numeric", "is_object", "is_readable", "is_resource", "is_scalar",
     "is_string", "is_subclass_of", "is_writable", "is_writeable", "iterator_to_array", "join",
     "json_decode", "json_encode", "json_last_error", "json_last_error_msg", "key",
