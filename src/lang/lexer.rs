@@ -119,6 +119,19 @@ impl<'a> Lexer<'a> {
             b'$' => self.lex_variable(),
             b'\'' => self.lex_single_quoted(),
             b'"' => self.lex_double_quoted(),
+            // b"..." / b'...' — the (vestigial) binary-string prefix
+            b'b' | b'B' if matches!(self.at(1), Some(b'"')) => {
+                self.pos += 1;
+                self.lex_double_quoted()
+            }
+            b'b' | b'B' if matches!(self.at(1), Some(b'\'')) => {
+                self.pos += 1;
+                self.lex_single_quoted()
+            }
+            b'b' | b'B' if self.at(1) == Some(b'<') && self.src[self.pos + 1..].starts_with(b"<<<") => {
+                self.pos += 1;
+                self.lex_heredoc()
+            }
             _ if self.starts(b"<<<") => self.lex_heredoc(),
             _ if b.is_ascii_digit() => self.lex_number(),
             b'.' if self.at(1).map(|c| c.is_ascii_digit()).unwrap_or(false) => self.lex_number(),
