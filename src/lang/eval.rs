@@ -3036,6 +3036,9 @@ impl Eval {
                     }
                 }
                 let (ns, uses) = (self.cur_ns.clone(), Rc::new(self.use_map.clone()));
+                if let Some(msg) = enum_decl_error(&c) {
+                    return Err(self.decl_fatal(&msg));
+                }
                 self.record_def_ctx(format!("class:{}", c.name.to_ascii_lowercase()), &ns, &uses);
                 self.classes.insert(c.name.to_ascii_lowercase(), Rc::new(c));
                 self.method_cache.borrow_mut().clear();
@@ -3320,6 +3323,15 @@ impl Eval {
             return Err(self.throw_error("ArgumentCountError", &msg));
         }
         Ok(())
+    }
+
+    /// Emit a compile-time-style fatal (no exception object) and halt like
+    /// exit: output already carries the message.
+    fn decl_fatal(&mut self, msg: &str) -> RunError {
+        let file = self.cur_file_str();
+        let s = format!("\nFatal error: {msg} in {file} on line {}\n", self.cur_line);
+        self.out.extend_from_slice(s.as_bytes());
+        RunError("__phargo_exit__".into())
     }
 
     /// Evaluate with undefined-variable/key warnings suppressed (isset/empty/??/@).
@@ -8013,6 +8025,9 @@ impl Eval {
                 return Err(self.throw_error("Error", &format!("Class \"{class}\" not found")))
             }
         };
+        if decl.kind == ClassKind::Enum {
+            return Err(self.throw_error("Error", &format!("Cannot instantiate enum {}", decl.name)));
+        }
         let obj = Rc::new(RefCell::new(Obj::new(decl.name.clone())));
         // initialize declared (instance) properties from the whole hierarchy,
         // base-most first so overrides win.
@@ -9897,7 +9912,10 @@ impl Eval {
             }
             "number_format" => {
                 let n = to_f64(&a(0));
-                let dec = if args.len() > 1 { to_i64(&a(1)).max(0) as usize } else { 0 };
+                // clamp: Rust float formatting panics past ~65k precision
+                // (u16 internal limit); PHP pads zeros to any width — 50k
+                // covers every corpus use with margin
+                let dec = if args.len() > 1 { to_i64(&a(1)).clamp(0, 50_000) as usize } else { 0 };
                 let dp = if args.len() > 2 {
                     String::from_utf8_lossy(&to_bytes(&a(2))).into_owned()
                 } else {
@@ -14318,6 +14336,56 @@ fn format_spec(conv: u8, spec: &str, arg: &Value) -> Vec<u8> {
 }
 
 // ---- var_dump / print_r formatting -------------------------------------
+/// PHP's compile-time enum shape rules (exact message texts verified against
+/// php -n 8.5): properties, case/backing agreement, reserved interfaces.
+fn enum_decl_error(c: &ClassDecl) -> Option<String> {
+    let implements = |what: &str| {
+        c.interfaces
+            .iter()
+            .any(|n| n.parts.last().map(|s| s.eq_ignore_ascii_case(what)).unwrap_or(false))
+    };
+    if c.kind == ClassKind::Enum {
+        if let Some(bt) = &c.enum_backing {
+            let b = bt.to_ascii_lowercase();
+            if b != "int" && b != "string" {
+                return Some(format!("Enum backing type must be int or string, {bt} given"));
+            }
+        }
+        if !c.props.is_empty() {
+            return Some(format!("Enum {} cannot include properties", c.name));
+        }
+        for case in &c.cases {
+            if c.enum_backing.is_some() && case.value.is_none() {
+                return Some(format!(
+                    "Case {} of backed enum {} must have a value",
+                    case.name, c.name
+                ));
+            }
+            if c.enum_backing.is_none() && case.value.is_some() {
+                return Some(format!(
+                    "Case {} of non-backed enum {} must not have a value",
+                    case.name, c.name
+                ));
+            }
+        }
+        for i in ["UnitEnum", "BackedEnum"] {
+            if implements(i) {
+                return Some(format!(
+                    "Enum {} cannot implement previously implemented interface {i}",
+                    c.name
+                ));
+            }
+        }
+    } else {
+        for i in ["UnitEnum", "BackedEnum"] {
+            if implements(i) {
+                return Some(format!("Non-enum class {} cannot implement interface {i}", c.name));
+            }
+        }
+    }
+    None
+}
+
 fn var_dump(ev: &Eval, v: &Value, indent: usize, out: &mut String) {
     var_dump_seen(ev, v, indent, out, &mut Vec::new());
 }
@@ -14365,6 +14433,19 @@ fn var_dump_seen(ev: &Eval, v: &Value, indent: usize, out: &mut String, seen: &m
             if ob.class == "__Stream" {
                 let rid = ob.get("__id").map(to_i64).unwrap_or(0);
                 out.push_str(&format!("{pad}resource({rid}) of type (stream)\n"));
+                return;
+            }
+            // enum cases dump as enum(Class::Name), not as objects
+            if ev
+                .find_class(&ob.class)
+                .map(|c| c.kind == ClassKind::Enum)
+                .unwrap_or(false)
+            {
+                let name = ob
+                    .get("name")
+                    .map(|v| String::from_utf8_lossy(&to_bytes(v)).into_owned())
+                    .unwrap_or_default();
+                out.push_str(&format!("{pad}enum({}::{name})\n", ob.class));
                 return;
             }
             // PHP shows DateTime/DateTimeZone with computed debug props (date /
