@@ -4060,6 +4060,15 @@ impl Eval {
                     return Ok(Value::Null);
                 }
                 let mname = self.prop_name_str(name)?;
+                // first-class callable $obj->m(...): a bound callable. We
+                // return the [obj, method] array form (calls work; var_dump
+                // of the Closure object shape is knowingly approximate).
+                if args.len() == 1 && args[0].name.as_deref() == Some("...") {
+                    let mut arr = Arr::new();
+                    arr.push(o);
+                    arr.push(Value::Str(mname.into_bytes()));
+                    return Ok(Value::Array(arr));
+                }
                 // args evaluate quietly: the callee may declare by-ref out-params
                 // (PHP doesn't warn about fresh vars passed to those)
                 self.quiet += 1;
@@ -4085,6 +4094,17 @@ impl Eval {
             Expr::StaticCall(class, name, args) => {
                 let cname = self.resolve_class_name(class)?;
                 let mname = self.prop_name_str(name)?;
+                // first-class callable C::m(...): "Class::method" callable.
+                // Unknown methods error at creation time, like PHP.
+                if args.len() == 1 && args[0].name.as_deref() == Some("...") {
+                    if self.find_method(&cname, &mname.to_ascii_lowercase()).is_none() {
+                        return Err(self.throw_error(
+                            "Error",
+                            &format!("Call to undefined method {}::{mname}()", display_class(&cname)),
+                        ));
+                    }
+                    return Ok(Value::Str(format!("{cname}::{mname}").into_bytes()));
+                }
                 self.quiet += 1;
                 let evaled = self.eval_args2(args);
                 self.quiet -= 1;
@@ -7243,6 +7263,10 @@ impl Eval {
             Value::Closure(c) => self.call_closure(&c, args),
             Value::Str(s) => {
                 let name = String::from_utf8_lossy(&s).to_ascii_lowercase();
+                // "Class::method" callable strings dispatch statically
+                if let Some((c, m)) = name.split_once("::") {
+                    return self.call_static(c, m, args, None, None);
+                }
                 if let Some(f) = self.funcs.get(&name).cloned() {
                     self.call_user(&f, args, None)
                 } else {
