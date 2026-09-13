@@ -27,6 +27,26 @@ you would never think to write a test for.
 
 ---
 
+## 2026-09-14 — Back after two months: date_parse, and 24 tests that only wanted a deprecation notice.
+
+**Walker 4026 → 4056, VM 4031 → 4061 (+31 each).** The failure
+classifier's top date-area signature turned out to be `strftime()` /
+`gmstrftime()` producing correct output minus PHP 8.1's "deprecated
+since 8.1, use IntlDateFormatter::format() instead" notice on every
+call — one `self.deprecated(...)` line, ~24 tests. The other half:
+`date_parse()` and `date_parse_from_format()` didn't exist. PHP's
+date_parse reports which fields the STRING carried (absent ones are
+`false`), so it can't be derived from a timestamp; a small hand parser
+now covers the ISO shapes the corpus uses, with timelib's quirks where
+cheap (warning positions are one past the last consumed byte, `2006-03`
+gives day 1, `!`/`|` fill epoch defaults, `z` resolves day-of-year).
+Shapes like `2006-12--12` — which timelib reads as December 1st with a
+`-12` UTC offset — are left alone. Also fixed en route: `Y` pads BCE
+years to `-0001`, and the enum "Cannot indirectly modify readonly
+property" wording for reference-take, foreach-by-ref and by-ref
+argument write-back (the latter two paths never reached the property
+check at all).
+
 ## 2026-07-11 — Validation belongs at compile time. Both engines cross 4000.
 
 **Walker 3999, VM 4005 (from 3964/3959).** A run of small rungs — b"1"

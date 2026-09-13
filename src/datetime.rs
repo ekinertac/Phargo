@@ -130,7 +130,7 @@ pub(crate) fn php_date_tz(fmt: &str, ts: i64, zone: Option<&crate::tz::TzData>) 
             continue;
         }
         match c {
-            'Y' => out.push_str(&y.to_string()),
+            'Y' => out.push_str(&if y < 0 { format!("-{:04}", -y) } else { format!("{:04}", y) }),
             'y' => out.push_str(&format!("{:02}", y.rem_euclid(100))),
             'm' => out.push_str(&format!("{m:02}")),
             'n' => out.push_str(&m.to_string()),
@@ -292,6 +292,7 @@ pub(crate) struct ParsedFmt {
     pub off: Option<i64>,      // O/P: fixed UTC offset in seconds
     pub tzname: Option<String>, // e/T: parsed zone identifier
     pub default_epoch: bool,   // saw ! or | → unset fields default to the epoch
+    pub doy: Option<i64>,      // z: 0-based day of year, resolved above
 }
 
 /// `DateTime::createFromFormat` format matcher. Returns None on any mismatch
@@ -380,7 +381,7 @@ pub(crate) fn php_parse_from_format(fmt: &str, input: &str) -> Option<ParsedFmt>
                 digits(&s, &mut j, 6)?;
             }
             'z' => {
-                digits(&s, &mut j, 3)?; // day-of-year: consumed, unused
+                out.doy = Some(digits(&s, &mut j, 3)?);
             }
             'a' | 'A' => {
                 if word(&s, &mut j, "am") || word(&s, &mut j, "a.m.") {
@@ -501,6 +502,15 @@ pub(crate) fn php_parse_from_format(fmt: &str, input: &str) -> Option<ParsedFmt>
     }
     if j < s.len() && !allow_trailing {
         return None; // unconsumed input
+    }
+    // z (0-based day of year) resolves to month/day against the parsed (or
+    // epoch-default) year
+    if let Some(doy) = out.doy {
+        let y = out.y.unwrap_or(1970);
+        let (yy, m, d) = civil_from_days(days_from_civil(y, 1, 1) + doy);
+        out.y = Some(yy);
+        out.mo = Some(m);
+        out.d = Some(d);
     }
     Some(out)
 }
@@ -918,3 +928,186 @@ fn apply_unit(ts: &mut i64, n: i64, unit: &str) -> bool {
     true
 }
 
+
+// ---- date_parse(): component extraction ------------------------------------
+//
+// PHP's date_parse reports which fields the STRING carried (absent ones are
+// `false`), so it can't be derived from a timestamp. This hand parser covers
+// the shapes the corpus exercises (ISO date, optional time with fraction,
+// optional trailing zone) and falls back to "everything set" via strtotime.
+
+#[derive(Default)]
+pub(crate) struct DateParts {
+    pub y: Option<i64>,
+    pub mo: Option<i64>,
+    pub d: Option<i64>,
+    pub h: Option<i64>,
+    pub mi: Option<i64>,
+    pub s: Option<i64>,
+    pub frac: Option<f64>,
+    pub warnings: Vec<(usize, String)>,
+    pub errors: Vec<(usize, String)>,
+    /// (utc offset seconds, zone label, zone_type 1|2|3)
+    pub zone: Option<(i64, String, u8)>,
+}
+
+fn take_digits(b: &[u8], pos: &mut usize, max: usize) -> Option<i64> {
+    let start = *pos;
+    while *pos < b.len() && *pos - start < max && b[*pos].is_ascii_digit() {
+        *pos += 1;
+    }
+    if *pos == start {
+        return None;
+    }
+    std::str::from_utf8(&b[start..*pos]).ok()?.parse().ok()
+}
+
+pub(crate) fn php_date_parse(s: &str) -> DateParts {
+    let mut p = DateParts::default();
+    let b = s.as_bytes();
+    let mut pos = 0;
+    // time-only: HH:MM[:SS[.frac]] — date fields stay false
+    if b.len() >= 4 && b[0].is_ascii_digit() && (b[1] == b':' || (b[1].is_ascii_digit() && b.get(2) == Some(&b':'))) {
+        if let Some(h) = take_digits(b, &mut pos, 2) {
+            if pos < b.len() && b[pos] == b':' {
+                pos += 1;
+                if let Some(mi) = take_digits(b, &mut pos, 2) {
+                    p.h = Some(h);
+                    p.mi = Some(mi);
+                    p.s = Some(0);
+                    p.frac = Some(0.0);
+                    if pos < b.len() && b[pos] == b':' {
+                        pos += 1;
+                        if let Some(sec) = take_digits(b, &mut pos, 2) {
+                            p.s = Some(sec);
+                            if pos < b.len() && b[pos] == b'.' {
+                                let fstart = pos;
+                                pos += 1;
+                                let _ = take_digits(b, &mut pos, 9);
+                                p.frac = std::str::from_utf8(&b[fstart..pos])
+                                    .ok()
+                                    .and_then(|f| format!("0{f}").parse::<f64>().ok());
+                            }
+                        }
+                    }
+                    if pos < b.len() {
+                        p.errors.push((pos, "Unexpected character".to_string()));
+                    } else if h > 23 || mi > 59 || p.s.unwrap_or(0) > 59 {
+                        p.warnings.push((b.len() + 1, "The parsed time was invalid".to_string()));
+                    }
+                    return p;
+                }
+            }
+        }
+        pos = 0;
+    }
+    // YYYY-MM[-DD]
+    let mut got_date = false;
+    if b.len() >= 7 && b[..4].iter().all(|c| c.is_ascii_digit()) && b[4] == b'-' {
+        p.y = take_digits(b, &mut pos, 4);
+        pos += 1; // -
+        p.mo = take_digits(b, &mut pos, 2);
+        if pos < b.len() && b[pos] == b'-' {
+            pos += 1;
+            match take_digits(b, &mut pos, 2) {
+                Some(d) => p.d = Some(d),
+                None => {
+                    p.errors.push((pos, "Unexpected character".to_string()));
+                }
+            }
+        }
+        got_date = p.mo.is_some();
+        if got_date && p.d.is_none() && p.errors.is_empty() {
+            p.d = Some(1);
+        }
+    }
+    if got_date {
+        // optional time: [ T]HH:MM[:SS[.frac]]
+        let save = pos;
+        if pos < b.len() && (b[pos] == b' ' || b[pos] == b'T') {
+            pos += 1;
+            if let Some(h) = take_digits(b, &mut pos, 2) {
+                if pos < b.len() && b[pos] == b':' {
+                    pos += 1;
+                    if let Some(mi) = take_digits(b, &mut pos, 2) {
+                        p.h = Some(h);
+                        p.mi = Some(mi);
+                        p.s = Some(0);
+                        p.frac = Some(0.0);
+                        if pos < b.len() && b[pos] == b':' {
+                            pos += 1;
+                            if let Some(sec) = take_digits(b, &mut pos, 2) {
+                                p.s = Some(sec);
+                                if pos < b.len() && b[pos] == b'.' {
+                                    let fstart = pos;
+                                    pos += 1;
+                                    let _ = take_digits(b, &mut pos, 9);
+                                    p.frac = std::str::from_utf8(&b[fstart..pos])
+                                        .ok()
+                                        .and_then(|f| format!("0{f}").parse::<f64>().ok());
+                                }
+                            }
+                        }
+                    } else {
+                        pos = save;
+                    }
+                } else {
+                    pos = save;
+                }
+            } else {
+                pos = save;
+            }
+        }
+        // optional trailing zone / offset on what remains
+        let rest = s[pos..].trim();
+        if !rest.is_empty() {
+            if let Some(off) = parse_offset_str(rest) {
+                p.zone = Some((off, rest.to_string(), 1));
+                pos = b.len();
+            } else if let Some(off) = abbrev_offset(rest) {
+                p.zone = Some((off, rest.to_uppercase(), 2));
+                pos = b.len();
+            } else if crate::tz::lookup(rest).is_some() || crate::tz::is_utc_name(rest) {
+                p.zone = Some((0, rest.to_string(), 3));
+                pos = b.len();
+            }
+        }
+        if pos < b.len() && p.errors.is_empty() {
+            p.errors.push((pos, "Unexpected character".to_string()));
+        }
+        // calendar validity: PHP warns (not errors) at end-of-string
+        let bad = matches!(p.mo, Some(m) if !(1..=12).contains(&m))
+            || matches!((p.y, p.mo, p.d), (Some(y), Some(m), Some(d)) if (1..=12).contains(&m) && (d < 1 || d > days_in_month(y, m)))
+            || matches!(p.d, Some(0));
+        if bad && p.errors.is_empty() {
+            // timelib reports the position one past the last consumed char
+            p.warnings.push((b.len() + 1, "The parsed date was invalid".to_string()));
+        }
+        let bad_time = matches!(p.h, Some(h) if h > 23)
+            || matches!(p.mi, Some(m) if m > 59)
+            || matches!(p.s, Some(s) if s > 59);
+        if bad_time && p.errors.is_empty() {
+            p.warnings.push((b.len() + 1, "The parsed time was invalid".to_string()));
+        }
+        return p;
+    }
+    // fallback: strtotime-parsable → all fields from the resulting instant
+    match php_strtotime(s, 0) {
+        Some(ts) => {
+            let days = ts.div_euclid(86400);
+            let (y, m, d) = civil_from_days(days);
+            let rem = ts.rem_euclid(86400);
+            p.y = Some(y);
+            p.mo = Some(m);
+            p.d = Some(d);
+            p.h = Some(rem / 3600);
+            p.mi = Some((rem % 3600) / 60);
+            p.s = Some(rem % 60);
+            p.frac = Some(0.0);
+        }
+        None => {
+            p.errors.push((0, "Unexpected character".to_string()));
+        }
+    }
+    p
+}

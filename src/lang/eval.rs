@@ -12371,7 +12371,83 @@ impl Eval {
                     None => Value::Bool(false),
                 }
             }
+            "date_parse" | "date_parse_from_format" => {
+                let parts = if name == "date_parse" {
+                    crate::php_date_parse(&String::from_utf8_lossy(&to_bytes(&a(0))))
+                } else {
+                    let fmt = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
+                    let input = String::from_utf8_lossy(&to_bytes(&a(1))).into_owned();
+                    let mut p = crate::DateParts::default();
+                    match crate::php_parse_from_format(&fmt, &input) {
+                        Some(f) => {
+                            p.y = f.y;
+                            p.mo = f.mo;
+                            p.d = f.d;
+                            p.h = f.h;
+                            p.mi = f.mi;
+                            p.s = f.s;
+                            if f.h.is_some() {
+                                p.mi = p.mi.or(Some(0));
+                                p.s = p.s.or(Some(0));
+                                p.frac = Some(0.0);
+                            }
+                            // `!` / `|`: unparsed fields take epoch defaults
+                            if f.default_epoch {
+                                p.y = p.y.or(Some(1970));
+                                p.mo = p.mo.or(Some(1));
+                                p.d = p.d.or(Some(1));
+                                p.h = p.h.or(Some(0));
+                                p.mi = p.mi.or(Some(0));
+                                p.s = p.s.or(Some(0));
+                                p.frac = p.frac.or(Some(0.0));
+                            }
+                            if let Some(off) = f.off {
+                                p.zone = Some((off, String::new(), 1));
+                            }
+                        }
+                        None => p.errors.push((0, "Unexpected data found.".to_string())),
+                    }
+                    p
+                };
+                let mut arr = Arr::new();
+                let ob = |v: Option<i64>| v.map(Value::Int).unwrap_or(Value::Bool(false));
+                let sk = |s: &str| Key::Str(s.as_bytes().to_vec());
+                arr.insert(sk("year"), ob(parts.y));
+                arr.insert(sk("month"), ob(parts.mo));
+                arr.insert(sk("day"), ob(parts.d));
+                arr.insert(sk("hour"), ob(parts.h));
+                arr.insert(sk("minute"), ob(parts.mi));
+                arr.insert(sk("second"), ob(parts.s));
+                arr.insert(sk("fraction"), parts.frac.map(Value::Float).unwrap_or(Value::Bool(false)));
+                let msgs = |list: &[(usize, String)]| {
+                    let mut m = Arr::new();
+                    for (pos, msg) in list {
+                        m.insert(Key::Int(*pos as i64), Value::Str(msg.clone().into_bytes()));
+                    }
+                    Value::Array(m)
+                };
+                arr.insert(sk("warning_count"), Value::Int(parts.warnings.len() as i64));
+                arr.insert(sk("warnings"), msgs(&parts.warnings));
+                arr.insert(sk("error_count"), Value::Int(parts.errors.len() as i64));
+                arr.insert(sk("errors"), msgs(&parts.errors));
+                arr.insert(sk("is_localtime"), Value::Bool(parts.zone.is_some()));
+                if let Some((off, label, ty)) = &parts.zone {
+                    arr.insert(sk("zone_type"), Value::Int(*ty as i64));
+                    arr.insert(sk("zone"), Value::Int(*off));
+                    arr.insert(sk("is_dst"), Value::Bool(false));
+                    if *ty == 2 {
+                        arr.insert(sk("tz_abbr"), Value::Str(label.clone().into_bytes()));
+                    } else if *ty == 3 {
+                        arr.insert(sk("tz_id"), Value::Str(label.clone().into_bytes()));
+                    }
+                }
+                Value::Array(arr)
+            }
             "strftime" | "gmstrftime" => {
+                // deprecated since 8.1; the corpus expects the notice on every call
+                self.deprecated(&format!(
+                    "Function {name}() is deprecated since 8.1, use IntlDateFormatter::format() instead"
+                ))?;
                 let fmt = String::from_utf8_lossy(&to_bytes(&a(0))).into_owned();
                 let ts = if args.len() > 1 { to_i64(&a(1)) } else { crate::now_unix() };
                 Value::Str(crate::php_strftime(&fmt, ts).into_bytes())
@@ -13641,7 +13717,7 @@ static KNOWN_BUILTINS: &[&str] = &[
     "class_alias", "class_exists", "class_implements", "class_parents", "class_uses",
     "clearstatcache", "closedir", "compact", "constant", "copy", "cos", "cosh", "count",
     "crc32", "ctype_alnum", "ctype_alpha", "ctype_digit", "ctype_space", "current", "date",
-    "date_default_timezone_get", "date_default_timezone_set", "debug_backtrace",
+    "date_default_timezone_get", "date_parse", "date_parse_from_format", "date_default_timezone_set", "debug_backtrace",
     "debug_print_backtrace", "decbin", "dechex", "decoct", "define", "defined", "deg2rad",
     "dirname", "doubleval", "each", "end", "enum_exists", "error_clear_last", "error_get_last",
     "error_log", "error_reporting", "escapeshellarg", "escapeshellcmd", "exec", "exp",
