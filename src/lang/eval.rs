@@ -2876,6 +2876,28 @@ impl Eval {
                 // By-reference iteration over a plain array variable: elements are
                 // promoted to shared Ref cells so writes through the loop var stick.
                 if *by_ref {
+                    // `foreach (... as &$obj->prop)`: binding a reference INTO
+                    // an enum case prop is the "indirect modification" PHP
+                    // forbids (non-enum objects keep the existing fallthrough)
+                    if let Expr::Prop(objexpr, pn, _) = value {
+                        let o = self.eval(objexpr)?;
+                        let pname = self.prop_name_str(pn)?;
+                        if let Value::Object(rc) = &o {
+                            let class = rc.borrow().class.clone();
+                            if self
+                                .find_class(&class)
+                                .map(|c| c.kind == ClassKind::Enum)
+                                .unwrap_or(false)
+                            {
+                                return Err(self.throw_error(
+                                    "Error",
+                                    &format!(
+                                        "Cannot indirectly modify readonly property {class}::${pname}"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                     if let Expr::Var(vname) = value {
                         match array {
                             Expr::Var(aname) if !is_superglobal(aname) => {
@@ -3999,6 +4021,21 @@ impl Eval {
                         let o = self.eval(objexpr)?;
                         let pname = self.prop_name_str(pn)?;
                         if let Value::Object(rc) = o {
+                            let class = rc.borrow().class.clone();
+                            // taking a reference to an enum prop is the
+                            // "indirect modification" PHP forbids
+                            if self
+                                .find_class(&class)
+                                .map(|c| c.kind == ClassKind::Enum)
+                                .unwrap_or(false)
+                            {
+                                return Err(self.throw_error(
+                                    "Error",
+                                    &format!(
+                                        "Cannot indirectly modify readonly property {class}::${pname}"
+                                    ),
+                                ));
+                            }
                             let mut b = rc.borrow_mut();
                             if b.get(&pname).is_none() {
                                 b.set(&pname, Value::Null);
@@ -7842,6 +7879,27 @@ impl Eval {
     fn apply_byref(&mut self, byref: Option<&[Arg]>, wb: Vec<(usize, Value)>) -> R<()> {
         if let Some(args) = byref {
             for (i, v) in wb {
+                // by-ref write-back into an enum case prop: PHP's wording for
+                // this path is "indirectly" (direct writes say "modify")
+                if let Expr::Prop(objexpr, pn, _) = &args[i].value {
+                    let o = self.eval(objexpr)?;
+                    let pname = self.prop_name_str(pn)?;
+                    if let Value::Object(rc) = &o {
+                        let class = rc.borrow().class.clone();
+                        if self
+                            .find_class(&class)
+                            .map(|c| c.kind == ClassKind::Enum)
+                            .unwrap_or(false)
+                        {
+                            return Err(self.throw_error(
+                                "Error",
+                                &format!(
+                                    "Cannot indirectly modify readonly property {class}::${pname}"
+                                ),
+                            ));
+                        }
+                    }
+                }
                 self.assign_to(&args[i].value, v)?;
             }
         }
